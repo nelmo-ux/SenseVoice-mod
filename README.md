@@ -291,6 +291,58 @@ export SENSEVOICE_DEVICE=cuda:0
 fastapi run --port 50000
 ```
 
+### Streaming recognition (CPU)
+
+The `streaming/` package adds real-time recognition on top of the stock model. It accumulates
+features inside a VAD-delimited utterance and re-runs the **full** encoder on every chunk, so it
+does not use truncated attention and does not change `model.py`'s inference behaviour.
+
+Two stages are emitted per utterance:
+
+- **partial** — chunk-driven greedy CTC, published while you are still speaking
+- **final** — a full `model.inference()` pass over the buffered utterance, with ITN and
+  `rich_transcription_postprocess` applied
+
+Microphone demo (needs the optional `sounddevice` extra):
+```shell
+python demo_streaming_mic.py
+```
+
+Replay a wav file at 1x speed instead — no extra dependency required:
+```shell
+python demo_streaming_mic.py --wav runtime/llama.cpp/tests/sample.wav
+```
+
+WebSocket server:
+```shell
+python -m streaming.ws_server --host 127.0.0.1 --port 8000
+```
+Send 16 kHz mono PCM as binary frames; receive `{"type": "partial", "text": ...}` and
+`{"type": "final", "text": ...}` as JSON text frames.
+
+#### Tuning latency
+
+One encoder frame is 60 ms. The two knobs that matter are `--chunk-size` (frames buffered before
+each inference) and `--max-history` (frames of context retained across chunks).
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `--chunk-size` | `12` | 720 ms of audio per inference |
+| `--max-history` | `167` | ~10 s of retained context |
+
+The encoder cost is dominated by a fixed overhead rather than by sequence length — on an Apple M5
+Pro (CPU, 4 threads) one pass takes ~430 ms for 1 s of context and only ~700 ms for 30 s. Measured
+end-to-end with the defaults: partial inference 430–514 ms per chunk, i.e. 720 ms + 514 ms ≈
+**1.23 s** from speech to partial, at 71% CPU duty.
+
+Because of that fixed overhead, **shrinking `--chunk-size` does not make the system meaningfully
+faster** — at `--chunk-size 8` (480 ms) inference still costs ~430–520 ms, which exceeds the
+480 ms chunk period and causes the backlog to grow without bound. Prefer larger chunks if you need
+headroom, not smaller ones.
+
+Threads matter too: 4 is optimal on Apple silicon. Raising `torch.set_num_threads` to 6–12 made
+inference 1.6–3x *slower* in our measurements, because work spills onto the efficiency cores.
+
 ## Finetune
 
 ### Requirements
@@ -444,7 +496,7 @@ python webui.py
 - Sherpa-onnx Deployment Best Practices: Supports using SenseVoice in 10 programming languages: C++, C, Python, C#, Go, Swift, Kotlin, Java, JavaScript, and Dart. Also supports deploying SenseVoice on platforms like iOS, Android, and Raspberry Pi. [Repository](https://k2-fsa.github.io/sherpa/onnx/sense-voice/index.html)
 - [Orca](https://github.com/stablyai/orca) integrates SenseVoice as local, offline speech-to-text through sherpa-onnx, with automatic Chinese, English, Japanese, Korean, and Cantonese detection on macOS, Linux, and Windows. The integration was [merged in #7436](https://github.com/stablyai/orca/pull/7436) and is available in the [v1.4.159-rc.1 prerelease](https://github.com/stablyai/orca/releases/tag/v1.4.159-rc.1); Orca v1.4.158 stable predates it.
 - [SenseVoice.cpp](https://github.com/lovemefan/SenseVoice.cpp). Inference of SenseVoice in pure C/C++ based on GGML, supporting 3-bit, 4-bit, 5-bit, 8-bit quantization, etc. with no third-party dependencies.
-- [streaming-sensevoice](https://github.com/pengzhendong/streaming-sensevoice) processes inference in chunks. To achieve pseudo-streaming, it employs a truncated attention mechanism, sacrificing some accuracy. Additionally, this technology supports CTC prefix beam search and hot-word boosting features.
+- [streaming-sensevoice](https://github.com/pengzhendong/streaming-sensevoice) processes inference in chunks to achieve pseudo-streaming. Earlier revisions relied on a truncated attention mechanism, which sacrificed some accuracy; later revisions instead accumulate features within a VAD-delimited segment and re-run the full encoder on each chunk, avoiding the train/inference mismatch. It also supports CTC prefix beam search and hot-word boosting. Note that it pins `torch<=2.3`, so it cannot be installed alongside this repository's `torch>=2.12.1` requirement.
 - [OmniSenseVoice](https://github.com/lifeiteng/OmniSenseVoice) is optimized for lightning-fast inference and batching process. 
 - [SenseVoice Hotword](https://www.modelscope.cn/models/dengcunqin/SenseVoiceSmall_hotword)，Neural Network Hotword Enhancement，[Contextualized End-to-End Speech Recognition with Contextual Phrase Prediction Network](https://mp.weixin.qq.com/s/1QkIvh8j7rrUjRyWOgAvdA)。
 ## Ecosystem

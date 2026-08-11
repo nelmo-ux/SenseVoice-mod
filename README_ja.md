@@ -246,6 +246,46 @@ export SENSEVOICE_DEVICE=cuda:0
 fastapi run --port 50000
 ```
 
+### ストリーミング認識（CPU）
+
+`streaming/` パッケージは、既存モデルの上にリアルタイム認識を追加します。VADで区切った発話区間内で特徴を蓄積し、チャンクごとに**エンコーダ全体**を再実行します。切り捨て注意機構（truncated attention）は使用せず、`model.py` の推論動作も変更しません。
+
+1発話につき2段階の結果を発行します。
+
+- **partial** — チャンク駆動の greedy CTC。発話中に逐次配信される
+- **final** — 蓄積した発話全体に対する `model.inference()` のフル推論。ITN と `rich_transcription_postprocess` を適用
+
+マイクデモ（optional の `sounddevice` が必要）:
+```shell
+python demo_streaming_mic.py
+```
+
+wavファイルを実時間で流し込むモード（追加依存なしで動作）:
+```shell
+python demo_streaming_mic.py --wav runtime/llama.cpp/tests/sample.wav
+```
+
+WebSocketサーバ:
+```shell
+python -m streaming.ws_server --host 127.0.0.1 --port 8000
+```
+16kHz・モノラルのPCMをバイナリフレームで送信すると、`{"type": "partial", "text": ...}` と `{"type": "final", "text": ...}` がJSONテキストフレームで返ります。
+
+#### 遅延の調整
+
+エンコーダ1フレームは60msです。重要な設定は `--chunk-size`（1回の推論前に蓄積するフレーム数）と `--max-history`（チャンクをまたいで保持する文脈のフレーム数）の2つです。
+
+| 設定 | 既定値 | 意味 |
+|---|---|---|
+| `--chunk-size` | `12` | 1回の推論あたり720msの音声 |
+| `--max-history` | `167` | 約10秒の文脈を保持 |
+
+エンコーダのコストは系列長ではなく**固定オーバーヘッドに支配されます**。Apple M5 Pro（CPU・4スレッド）では、文脈1秒で約430ms、30秒でも約700msでした。既定値でのエンドツーエンド実測は、partial推論が1チャンクあたり430〜514ms、すなわち 720ms + 514ms ≈ **1.23秒** で音声からpartial表示まで到達し、CPU占有率は71%です。
+
+この固定費支配のため、**`--chunk-size` を小さくしても体感は速くなりません**。`--chunk-size 8`（480ms）でも推論は約430〜520msかかり、チャンク周期480msを超えるため処理が追いつかず遅延が累積します。余裕が必要な場合は、小さくするのではなく大きくしてください。
+
+スレッド数も重要で、Appleシリコンでは4が最適です。`torch.set_num_threads` を6〜12に上げると、処理が効率コアへ回るため実測で1.6〜3倍**遅く**なりました。
+
 ## 微調整
 
 ### トレーニング環境のインストール
@@ -354,7 +394,7 @@ python webui.py
 - Sherpa-onnx デプロイメントのベストプラクティス：SenseVoice を10種類のプログラミング言語（C++, C, Python, C#, Go, Swift, Kotlin, Java, JavaScript, Dart）で使用可能。また、iOS, Android, Raspberry Pi などのプラットフォームでも SenseVoice をデプロイできます。[リポジトリ](https://k2-fsa.github.io/sherpa/onnx/sense-voice/index.html)
 - [Orca](https://github.com/stablyai/orca) は sherpa-onnx を通じて SenseVoice のローカル・オフライン音声認識を統合し、macOS、Linux、Windows で中国語、英語、日本語、韓国語、広東語を自動検出します。この統合は [#7436](https://github.com/stablyai/orca/pull/7436) でマージされ、現在は [v1.4.159-rc.1 プレリリース](https://github.com/stablyai/orca/releases/tag/v1.4.159-rc.1) で利用できます。Orca v1.4.158 安定版にはまだ含まれていません。
 - [SenseVoice.cpp](https://github.com/lovemefan/SenseVoice.cpp) GGMLに基づいて純粋なC/C++でSenseVoiceを推測し、3ビット、4ビット、5ビット、8ビット量子化などをサポートし、サードパーティの依存関係はありません。
-- [streaming-sensevoice](https://github.com/pengzhendong/streaming-sensevoice) ストリーム型SenseVoiceは、チャンク（chunk）方式で推論を行います。擬似ストリーミング処理を実現するために、一部の精度を犠牲にして切り捨て注意機構（truncated attention）を採用しています。さらに、この技術はCTCプレフィックスビームサーチ（CTC prefix beam search）とホットワード強化機能もサポートしています。
+- [streaming-sensevoice](https://github.com/pengzhendong/streaming-sensevoice) ストリーム型SenseVoiceは、チャンク（chunk）方式で推論を行い擬似ストリーミングを実現します。初期の版では一部の精度を犠牲にして切り捨て注意機構（truncated attention）を採用していましたが、後の版ではVADで区切った発話区間内で特徴を蓄積し、チャンクごとにエンコーダ全体を再実行する方式に変更され、学習時との不一致を回避しています。さらに、この技術はCTCプレフィックスビームサーチ（CTC prefix beam search）とホットワード強化機能もサポートしています。なお `torch<=2.3` に固定されているため、本リポジトリの `torch>=2.12.1` とは同一環境に共存できません。
 - [OmniSenseVoice](https://github.com/lifeiteng/OmniSenseVoice) は、超高速推論とバッチ処理のために最適化されています。
 - [SenseVoice Hotword](https://www.modelscope.cn/models/dengcunqin/SenseVoiceSmall_hotword)，ニューラルネットワークホットワード強化，[WeNetにおけるCPPNベースのニューラルネットワークホットワード強化のオープンソース](https://mp.weixin.qq.com/s/1QkIvh8j7rrUjRyWOgAvdA)。
 # お問い合わせ
