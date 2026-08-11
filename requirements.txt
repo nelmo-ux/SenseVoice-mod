@@ -1,6 +1,9 @@
 # Keep the default install outside known Dependabot torch alert ranges.
 # For CUDA-specific wheels, install a matching torch/torchaudio pair first.
 torch>=2.12.1
+# Known issue: with torchaudio>=2.11.0, torchaudio.load() raises
+# "ImportError: TorchCodec is required for load_with_torchcodec".
+# This affects api.py:63, which calls torchaudio.load(). Not fixed here.
 torchaudio>=2.11.0
 modelscope
 huggingface
@@ -9,3 +12,29 @@ funasr>=1.3.26
 numpy<=1.26.4
 gradio
 fastapi>=0.111.1
+
+# --- Upper bounds required to keep numpy<=1.26.4 ---
+# funasr pulls in librosa, which transitively requires numba/scipy. Their
+# recent releases require numpy>=2.x and drag numpy up to 2.4.6, breaking the
+# numpy<=1.26.4 pin above. These caps are the last releases that still build
+# against the numpy 1.26 ABI; verified with `pip check` on Python 3.12.
+scipy<1.14
+numba<0.61
+llvmlite<0.44
+scikit-learn<1.6
+umap-learn<0.5.8
+
+# --- Optional: streaming extras (NOT installed by `pip install -r requirements.txt`) ---
+# Core SenseVoice works without these. To enable the streaming demos, run:
+#   pip install websockets sounddevice soundfile
+#
+# websockets   - WebSocket server for streaming/ws_server.py.
+#                Note: currently also pulled in as a funasr transitive dependency.
+# sounddevice  - microphone capture for demo_streaming_mic.py.
+#                This is a genuine extra dependency (not installed by default).
+# soundfile    - audio file loading.
+#                Note: currently also pulled in via funasr.
+#
+# websockets
+# sounddevice
+# soundfile
