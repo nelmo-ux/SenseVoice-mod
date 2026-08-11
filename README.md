@@ -320,6 +320,24 @@ python -m streaming.ws_server --host 127.0.0.1 --port 8000
 Send 16 kHz mono PCM as binary frames; receive `{"type": "partial", "text": ...}` and
 `{"type": "final", "text": ...}` as JSON text frames.
 
+#### Using a local model directory
+
+The default `--model-dir iic/SenseVoiceSmall` downloads from ModelScope on first
+use. Two caveats apply: funasr automatically runs `pip install` on the
+`requirements.txt` bundled inside the model directory, which can override this
+repository's dependency pins, and ModelScope downloads can be unstable on some
+networks. To avoid both, point `--model-dir` at a local copy that does not
+contain a `requirements.txt`:
+
+```shell
+hf download FunAudioLLM/SenseVoiceSmall --local-dir models/SenseVoiceSmall
+rm models/SenseVoiceSmall/requirements.txt
+python demo_streaming_mic.py --wav runtime/llama.cpp/tests/sample.wav --model-dir models/SenseVoiceSmall
+```
+
+`models/` is gitignored. The optional end-to-end tests use the same directory via
+`SENSEVOICE_RUN_MODEL_TESTS=1 SENSEVOICE_MODEL_DIR=models/SenseVoiceSmall pytest tests/test_streaming_model.py`.
+
 #### Tuning latency
 
 One encoder frame is 60 ms. The two knobs that matter are `--chunk-size` (frames buffered before

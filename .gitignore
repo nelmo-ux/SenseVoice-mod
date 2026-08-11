@@ -26,3 +26,4 @@ examples/aishell/llm_asr_nar/*
 .venv/
 venv/
 .pytest_cache/
+models/

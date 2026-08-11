@@ -271,6 +271,18 @@ python -m streaming.ws_server --host 127.0.0.1 --port 8000
 ```
 16kHz・モノラルのPCMをバイナリフレームで送信すると、`{"type": "partial", "text": ...}` と `{"type": "final", "text": ...}` がJSONテキストフレームで返ります。
 
+#### ローカルモデルディレクトリの利用
+
+既定の `--model-dir iic/SenseVoiceSmall` は初回に ModelScope からダウンロードします。この経路には2つの注意点があります。funasr はモデルディレクトリ内に同梱された `requirements.txt` を自動的に `pip install` するため本リポジトリの依存バージョン固定が上書きされる可能性があること、また環境によっては ModelScope からのダウンロードが不安定なことです。どちらも回避するには、`requirements.txt` を含まないローカルコピーを `--model-dir` に指定してください。
+
+```shell
+hf download FunAudioLLM/SenseVoiceSmall --local-dir models/SenseVoiceSmall
+rm models/SenseVoiceSmall/requirements.txt
+python demo_streaming_mic.py --wav runtime/llama.cpp/tests/sample.wav --model-dir models/SenseVoiceSmall
+```
+
+`models/` は gitignore 済みです。オプトインのE2Eテストも同じディレクトリを使えます: `SENSEVOICE_RUN_MODEL_TESTS=1 SENSEVOICE_MODEL_DIR=models/SenseVoiceSmall pytest tests/test_streaming_model.py`
+
 #### 遅延の調整
 
 エンコーダ1フレームは60msです。重要な設定は `--chunk-size`（1回の推論前に蓄積するフレーム数）と `--max-history`（チャンクをまたいで保持する文脈のフレーム数）の2つです。
