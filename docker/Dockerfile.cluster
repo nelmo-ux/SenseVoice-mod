@@ -1,0 +1,305 @@
+# ======================================================
+#   SenseVoice chunk-mask fine-tuning — GPU cluster image
+#   (Slurm + site sbatch wrapper, pulled from site Harbor)
+# ======================================================
+#
+# Build and push (run from this directory; substitute your own hostname and
+# Harbor project for the placeholders — see the FROM below):
+#
+#   docker build --no-cache -t <cluster-registry>/<project>/sensevoice-chunk:24.12-funasr1.4.1-v1 -f Dockerfile.cluster .
+#   docker push <cluster-registry>/<project>/sensevoice-chunk:24.12-funasr1.4.1-v1
+#
+# That tag is the image finetune_chunk_slurm.sh requests, so the two must stay in
+# sync: retagging here without updating the job script leaves jobs pulling the
+# previous image, which fails at pull time if it is gone and — worse — succeeds
+# quietly with stale contents if it is not.
+#
+# The base is the site Harbor mirror of NGC PyTorch, and it is the only tag in
+# that Harbor, so it is not negotiable. It still earns its place: it supplies the
+# CUDA runtime, the driver-matched userspace stack and NCCL.
+#
+# What it does NOT supply is torchaudio. Measured on the pristine base image:
+#
+#   torch          2.6.0a0+df5bbc09d1.nv24.12
+#   torchvision    0.20.0a0
+#   torch_tensorrt 2.6.0a0
+#   (no torchaudio at all)
+#
+# funasr imports torchaudio in 10 modules, and one of them is
+# funasr/frontends/wav_frontend.py doing `torchaudio.compliance.kaldi` — that is
+# the feature-extraction path, not an optional extra. A build that leaves it out
+# dies with `ModuleNotFoundError: No module named 'torchaudio'`.
+#
+# Installing torchaudio *alone* against NGC's torch does not work either. NGC
+# builds torch with a custom ABI and no PyPI torchaudio wheel links against it:
+#
+#   pip install --no-deps torchaudio==2.6.0
+#   OSError: .../torchaudio/lib/libtorchaudio.so: undefined symbol:
+#            _ZNK5torch8autograd4Node4nameEv
+#
+# So this image installs a *matched* torch+torchaudio pair from PyPI and lets it
+# replace NGC's torch. That is not a reproducibility compromise, it is the
+# opposite: torch 2.13.0 / torchaudio 2.11.0 are the exact versions in the
+# project's local .venv that produced the MPS baseline, and they satisfy
+# requirements.txt (`torch>=2.12.1`, `torchaudio>=2.11.0`). NGC's torch 2.6 is
+# *older* than what this project targets, so keeping it would have been the
+# deviation. Verified inside the base image:
+#
+#   torch 2.13.0+cu126 | built cuda 12.6
+#   torchaudio 2.11.0+cu126
+#   fbank OK (98, 80)          <- torchaudio.compliance.kaldi.fbank ran
+#
+# <cluster-registry> is a placeholder and this file will NOT build as written:
+# replace it with the site's registry hostname first. The base is that site's
+# Harbor mirror of NGC PyTorch 24.12, so anyone with direct NGC access can put
+# `nvcr.io` there instead. The image path and tag below are unchanged either way
+# — every measured fact in this file is about nvidia/pytorch:24.12-py3.
+FROM <cluster-registry>/nvidia/pytorch:24.12-py3
+
+# Drop the dead second index before anything installs. Measured from the
+# pristine base image, /etc/pip.conf reads:
+#
+#   [global]
+#   no-cache-dir    = true
+#   index-url       = https://pypi.org/simple
+#   extra-index-url = https://pypi.ngc.nvidia.com
+#   trusted-host    = pypi.ngc.nvidia.com
+#
+# That extra index does not resolve from this cluster, and pip queries every
+# configured index for every package, so each package burns its full DNS retry
+# budget (5 retries, ~16s) before falling back — minutes across this install.
+#
+# The base ships that same dead extra-index-url TWICE: once in /etc/pip.conf and
+# again, with identical contents, in /root/.pip/pip.conf. Rewriting only
+# /etc/pip.conf is therefore not enough, and the build log proved it — that file
+# came out clean (`cat` showed no extra-index-url) and the DNS retries continued
+# anyway on /funasr/ and /torchaudio/. The reason is precedence: the user-level
+# copy outranks the global one, so it reinstates the index that was just removed.
+# The base's own pip.conf header documents the ordering, and pip agrees —
+# OVERRIDE_ORDER = ("global", "user", "site", "env", "env-var"), merged with
+# later sources winning (read from pip 26.1.1's configuration module):
+#
+#   [Priority 1] Site level:   /usr/pip.conf
+#   [Priority 2] User level:   /root/.config/pip/pip.conf , /root/.pip/pip.conf
+#   [Priority 3] Global level: /etc/pip.conf , /etc/xdg/pip/pip.conf
+#
+# Reproduced offline against copies of the real config, monkeypatching pip's
+# config-file discovery and resolving `pip install funasr`:
+#
+#   global stripped, user untouched -> ['https://pypi.ngc.nvidia.com']
+#   both stripped                   -> []
+#
+# So the rewrite below sweeps every path pip may read instead of just one, skips
+# the ones that do not exist, and prints each file it touched so the log proves
+# the removal per file rather than for one file that turned out not to be the
+# decisive one.
+#
+# Config files are the whole story here: the base's environment carries only
+# PIP_BREAK_SYSTEM_PACKAGES=1 and PIP_DEFAULT_TIMEOUT=100, with no
+# PIP_EXTRA_INDEX_URL to account for (measured in the base image).
+#
+# It has to come out of the config files, because neither override reaches them.
+# Resolved offline against a copy of the config above (pip 26.2.1), varying only
+# the environment variable:
+#
+#   PIP_EXTRA_INDEX_URL unset   -> ['https://pypi.ngc.nvidia.com']
+#   PIP_EXTRA_INDEX_URL=""      -> ['https://pypi.ngc.nvidia.com']   (unchanged)
+#   PIP_EXTRA_INDEX_URL=<real>  -> ['<real>']                        (replaced)
+#
+# An empty value is not "clear the list": pip merges config and environment into
+# one dict and then drops falsy entries wholesale ("Make sure we completely
+# remove empty values again", ConfigOptionParser._get_ordered_configuration_items),
+# so the empty override deletes itself and the file's value survives. Prefixing
+# the pip commands below with `PIP_EXTRA_INDEX_URL=` would therefore be an inert
+# incantation that reads like protection. --index-url does not help either: it
+# replaces only the *primary* index, a different option.
+#
+# Setting the variable to a real host does work, but it must not be used here:
+# the torch install below deliberately resolves against ONE index, and adding
+# pypi.org back as an extra index would let the generic (CPU) torch wheel win.
+#
+# index-url and trusted-host are left alone in every file. trusted-host names a
+# host nothing will contact any more, so it is inert on its own — it adds no
+# index, it only would have waived TLS checks for one — and rewriting less of the
+# base's configuration is safer.
+#
+# This is a build-time performance fix ONLY. It cannot change what ends up in the
+# image: the NGC host does not resolve at all, so it can never supply a candidate
+# distribution, and every package resolves to exactly the same wheel with or
+# without it. The only difference is the DNS retry budget no longer being burned
+# once per package.
+#
+# RawConfigParser avoids %-interpolation errors on URLs and handles the base's
+# multi-line (indented continuation) values correctly, as the previous version of
+# this step demonstrated in the build log. The StringIO buffer is passed as a
+# call argument rather than bound as a lambda default, so each file gets a fresh
+# one and their contents cannot bleed into each other.
+#
+# Side effect worth knowing: configparser does not round-trip comments, so each
+# rewritten file loses the base's header — including the precedence table quoted
+# above. That was already true of /etc/pip.conf before, it just applies to more
+# files now. The table is preserved here in this comment for that reason.
+RUN python -c 'import configparser, io, os, pathlib; \
+paths=["/usr/pip.conf", "/root/.config/pip/pip.conf", "/root/.pip/pip.conf", "/etc/pip.conf", "/etc/xdg/pip/pip.conf"]; \
+strip=lambda p: (lambda c, b: (c.read(p), c.has_section("global") and c.remove_option("global", "extra-index-url"), c.write(b), pathlib.Path(p).write_text(b.getvalue())))(configparser.RawConfigParser(), io.StringIO()); \
+found=[p for p in paths if os.path.exists(p)]; \
+[(strip(p), print("--- %s" % p), print(pathlib.Path(p).read_text())) for p in found]; \
+print("stripped extra-index-url from:", found)'
+
+# Constraints never install anything — they only cap what the resolver may
+# choose. With PIP_CONSTRAINT exported, every pip install below is held to these
+# versions even when a transitive dep of funasr innocently asks for a newer one.
+#
+# numpy is pinned to the build the base already ships (measured: 1.26.4), which
+# happens to sit exactly on requirements.txt's `numpy<=1.26.4` ceiling — the two
+# coincide, so there is no conflict to resolve. Because constraints never
+# install, this leaves NGC's own numpy build in place rather than replacing it;
+# it only stops librosa/numba/scipy from dragging numpy to 2.x.
+#
+# torch and torchaudio are pinned to the versions installed below, NOT to the
+# versions the base ships. This is the inversion relative to the previous design:
+# the base's torch is the thing being replaced, so pinning to it would pin to the
+# very build that has no matching torchaudio. `==2.13.0` matches `2.13.0+cu126`
+# — PEP 440 ignores the local segment unless the specifier names one (verified
+# with packaging.specifiers) — so the +cu126 wheels satisfy these pins.
+RUN printf "%s\n" \
+        "torch==2.13.0" \
+        "torchaudio==2.11.0" \
+        "numpy==1.26.4" \
+        > /opt/constraints.txt \
+ && cat /opt/constraints.txt
+
+ENV PIP_CONSTRAINT=/opt/constraints.txt
+
+# The torch pair, from the CUDA 12.6 index only. This is a separate pip
+# invocation from the one below purely because it needs a different index:
+# --index-url *replaces* the primary index, so this command cannot see PyPI and
+# the one below cannot see the pytorch index. Resolving both together would mean
+# offering pip two sources for torch, and the generic PyPI wheel could win.
+#
+# No --no-deps: torch's own CUDA dependencies must come from this index too.
+RUN pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cu126 \
+        torch==2.13.0 \
+        torchaudio==2.11.0
+
+# Both of these hard-pin the torch build that was just replaced, so they are now
+# broken — the resolver says so out loud during the install above:
+#
+#   torchvision 0.20.0a0 requires torch==2.6.0a0+df5bbc09d1.nv24.12,
+#   but you have torch 2.13.0+cu126
+#
+# funasr needs neither. A broken package left in the image is a latent trap for
+# whoever imports it next and gets an ABI error instead of a missing module, and
+# removing them shrinks the image. Done before the funasr install so the resolver
+# never sees their impossible torch pin.
+#
+# No `|| true` is needed for tolerance: pip uninstall warns and exits 0 when a
+# named package is not installed (verified), so this stays a command that can
+# still fail for real reasons.
+RUN pip uninstall -y torchvision torch_tensorrt
+
+# Everything else, from PyPI. Versions match those verified in the project's
+# local .venv, so a job that runs here behaves like a local run. huggingface_hub
+# and modelscope are intentionally unpinned — they are model-download clients,
+# and the constraints file already protects the numerical stack from whatever
+# they drag in.
+#
+# The constraints file is what keeps this step from undoing the step above:
+# funasr depends on torch and torchaudio, and without the pins pip would be free
+# to "helpfully" resolve them from PyPI.
+#
+# No apt layer is needed: the soundfile wheel bundles libsndfile.
+RUN pip install --no-cache-dir \
+        funasr==1.4.1 \
+        soundfile==0.14.0 \
+        py7zr==1.1.3 \
+        huggingface_hub \
+        modelscope
+
+# Fail the build here rather than in a queued job. Cluster turnaround is measured
+# in hours, so an ImportError that surfaces after the scheduler finally starts
+# the job costs a great deal more than a failed build. This layer is what caught
+# the missing torchaudio, so it has earned its keep.
+#
+# `pip check` is deliberately NOT used. It crashes inside this base image before
+# reporting anything: the base ships several .egg distributions (dill,
+# lightning_thunder, igraph, nvfuser, lightning_utilities, texttable, opt_einsum,
+# looseversion) whose wheel tags have 2 components instead of 3, and pip's
+# check_unsupported dies parsing them (ValueError: not enough values to unpack).
+# This reproduces in the pristine base image, so it is an NGC packaging defect
+# and not something our installs introduce. `pip check || true` would be worse
+# than nothing — a check that can never fail still reads as verification — so the
+# dependency-conflict check is done directly against the packages we install,
+# through importlib.metadata, which reads metadata only and never parses wheel
+# tags. Names are compared PEP 503-normalised; requirements guarded by an extra
+# (extras we did not request) are skipped.
+#
+# torch and torchaudio are included in the checked set now that we install them
+# explicitly: they arrive in a *different* pip invocation from funasr, so no
+# single resolver run ever saw both requirement sets, and this is the only thing
+# that would notice the second install having broken the first.
+RUN python -c 'import importlib.metadata as md, re; \
+from packaging.requirements import Requirement; \
+ours=("torch","torchaudio","funasr","soundfile","py7zr","huggingface_hub","modelscope"); \
+norm=lambda n: re.sub("[-_.]+", "-", n).lower(); \
+have={norm(d.metadata["Name"] or ""): d.version for d in md.distributions()}; \
+need=[(p, r) for p in ours for r in [Requirement(s) for s in (md.requires(p) or [])] if not r.marker or r.marker.evaluate({"extra": ""})]; \
+missing=["%s requires %s, which is not installed" % (p, r) for p, r in need if norm(r.name) not in have]; \
+conflict=["%s requires %s, but %s is installed" % (p, r, have[norm(r.name)]) for p, r in need if norm(r.name) in have and not r.specifier.contains(have[norm(r.name)], prereleases=True)]; \
+print("checked %d declared requirements of: %s" % (len(need), ", ".join(ours))); \
+print("\n".join(missing + conflict) or "all declared requirements satisfied"); \
+assert not (missing + conflict), "declared requirements of the installed packages are not satisfied; see the list above."'
+
+# Runtime proof, in the order the failures actually matter:
+#
+#   1. torch.version.cuda is not None — a CPU-only wheel would train at roughly
+#      1/50th speed instead of raising, so this is the failure most worth
+#      catching at build time.
+#   2. torchvision / torch_tensorrt are really gone (see the uninstall above).
+#   3. A real audio round-trip: write a wav with soundfile, read it back, and run
+#      torchaudio.compliance.kaldi.fbank on it. Importing torchaudio is already
+#      the ABI proof — the undefined-symbol failure quoted at the top of this file
+#      surfaces at import — but fbank is funasr's actual feature-extraction entry
+#      point, so it is what an ABI break would silently take out. Expect (98, 80).
+#   4. import funasr.bin.train_ds — the trainer entrypoint the job script
+#      invokes, which proves its whole dependency graph resolves.
+#
+# On step 3: torchaudio 2.11.0 routes torchaudio.load through TorchCodec and
+# raises `ImportError: TorchCodec is required for load_with_torchcodec` when
+# torchcodec is absent. This is the known issue already documented in
+# requirements.txt, and it is pre-existing upstream behaviour, not damage from
+# this image — reproduced on the identical torch 2.13.0 / torchaudio 2.11.0 pair
+# in the project's local .venv. So the decode is branched on torchcodec being
+# importable, and the branch taken is printed rather than hidden: with torchcodec
+# present torchaudio.load is exercised for real, without it soundfile decodes and
+# the log says so. The branch is narrow on purpose — it covers exactly one known
+# condition, and any other failure from torchaudio.load still fails the build.
+# Installing torchcodec would let this be unconditional; it is not installed here
+# because the trainer does not need it (funasr decodes via soundfile) and it
+# would add an unverified FFmpeg dependency to a cluster image.
+RUN python -c 'import importlib.metadata as md, importlib.util as iu, os, tempfile; \
+import numpy as np, soundfile as sf, torch, torchaudio; \
+import torchaudio.compliance.kaldi as kaldi; \
+print("torch", torch.__version__, "| torchaudio", torchaudio.__version__, "| numpy", np.__version__, "| funasr", md.version("funasr")); \
+print("torch.version.cuda:", torch.version.cuda); \
+assert torch.version.cuda, "torch has no CUDA build. A CPU-only wheel was installed instead of the cu126 one; check that the torch install used --index-url https://download.pytorch.org/whl/cu126 and that PIP_CONSTRAINT still pins torch."; \
+gone=[m for m in ("torchvision", "torch_tensorrt") if iu.find_spec(m) is not None]; \
+assert not gone, "still installed after uninstall, and pinned to the replaced NGC torch: %s" % (gone,); \
+sr=16000; \
+wav=(0.1*np.sin(2*np.pi*440*np.arange(sr)/sr)).astype("float32"); \
+p=os.path.join(tempfile.mkdtemp(), "probe.wav"); \
+sf.write(p, wav, sr); \
+codec=iu.find_spec("torchcodec") is not None; \
+print("torchcodec present:", codec, "-> torchaudio.load exercised" if codec else "-> torchaudio.load skipped, soundfile decode used (known TorchCodec issue, see comment)"); \
+x=torchaudio.load(p)[0] if codec else torch.from_numpy(sf.read(p, dtype="float32")[0]).unsqueeze(0); \
+assert tuple(x.shape)==(1, sr), "decoded waveform has unexpected shape %s, expected (1, %d)" % (tuple(x.shape), sr); \
+feat=kaldi.fbank(x, num_mel_bins=80, sample_frequency=sr); \
+print("fbank OK", tuple(feat.shape)); \
+assert feat.shape[0] > 0 and feat.shape[1] == 80, "kaldi.fbank returned %s; funasr feature extraction would be broken." % (tuple(feat.shape),); \
+import funasr.bin.train_ds; \
+print("funasr.bin.train_ds imported OK")'
+
+# The repo itself is bind-mounted at runtime by the job script (#CONTAINER -v),
+# so nothing from it is COPY'd into the image and no credentials are baked in.
+WORKDIR /workspace
