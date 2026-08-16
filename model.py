@@ -851,7 +851,8 @@ class SenseVoiceEncoderSmall(nn.Module):
             - ``feats`` (Tensor): ``(batch, kept, input_size)`` overlap of already
               scaled and position-encoded frames prepended to the next chunk. Starts
               with ``pad_left`` zero frames and holds ``pad_left + pad_right`` frames
-              afterwards.
+              afterwards. That initial length deviates from upstream funasr; see the
+              note below.
             - ``tail_chunk`` (bool): set to ``True`` by the caller before the final
               call to flush the withheld lookahead frames.
 
@@ -872,6 +873,25 @@ class SenseVoiceEncoderSmall(nn.Module):
             ``pad_right == 0``. Combining it with ``pad_left > 0`` also re-appends the
             left-context frames to that cache (upstream funasr behaviour), so prefer
             ``pad_left = 0`` whenever look-back is enabled.
+
+        Note:
+            ``feats`` is seeded with ``pad_left`` zero frames, where upstream funasr
+            (``funasr/models/scama/model.py``, ``init_cache``) seeds
+            ``pad_left + pad_right``. On the very first call nothing has been withheld
+            yet, so upstream's extra ``pad_right`` frames stand for a lookahead that
+            does not exist. They are not merely wasted compute: they enter
+            self-attention and the FSMN convolution, so the first call emits ``stride``
+            frames instead of ``stride - pad_right`` and the stream carries
+            ``pad_right`` phantom output frames for the whole utterance, breaking the
+            one-to-one input/output frame alignment CTC decoding depends on.
+            ``tests/test_chunk_streaming_equivalence.py`` pins this. The raw first
+            layer-0 windows cannot be compared directly, since upstream's is exactly
+            ``pad_right`` frames longer; those surplus leading frames are exactly
+            ``0.0``, and after realigning (dropping them) the two windows are
+            bit-identical for every geometry tested. The resulting output corruption is
+            confined to the first emitted chunk -- it peaks at ``1.514661`` for
+            ``(pad_left, stride, pad_right) = (0, 10, 5)``, and every frame from index
+            ``stride`` onward is bit-identical.
         """
         if stride is None:
             if self.overlap_chunk_cls is None:
