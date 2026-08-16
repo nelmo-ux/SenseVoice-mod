@@ -57,19 +57,24 @@ JSON; only the former is scored.
 from __future__ import annotations
 
 import os
+import sys
 
 # MUST be set before torch is imported, which the local imports below do
 # transitively.  Several ops on the SenseVoice path have no MPS kernel -
 # ``aten::_ctc_loss`` is the one that bites first - and raise
 # NotImplementedError without the CPU fallback.  Setting it in-process rather
 # than documenting it as a shell prerequisite means a caller cannot forget it.
-os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+#
+# Kept to macOS because it is an MPS-only workaround with no business on the
+# CUDA path: no CUDA build of torch runs on darwin, so this guard is exactly
+# "not while running on the GPU cluster", and elsewhere the variable is inert.
+if sys.platform == "darwin":
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import argparse
 import gc
 import glob
 import json
-import sys
 import unicodedata
 import warnings
 from dataclasses import dataclass, field
@@ -632,10 +637,17 @@ def release(recogniser: Optional[CheckpointRecogniser]) -> None:
     """
     if recogniser is None:
         return
+    # Read before the del: which allocator to drain is a property of where this
+    # model ran, not of what the machine happens to offer.  Branching on
+    # availability would have a --device cpu run create a CUDA context on a
+    # shared cluster, which is precisely what declaring 'cpu' promised not to do.
+    device = recogniser.config.device
     del recogniser
     gc.collect()
-    if torch.backends.mps.is_available():
+    if device.startswith("mps") and hasattr(torch, "mps"):
         torch.mps.empty_cache()
+    elif device.startswith("cuda"):
+        torch.cuda.empty_cache()
 
 
 # -------------------------------------------------------------------- geometry
@@ -933,7 +945,23 @@ def print_summary(payload: Dict[str, Any], warnings_: Sequence[str]) -> None:
     print(line)
     print("chunk-gap eval - Japanese-specialised finetune")
     print(line)
-    print(f"device      : {payload['device']}")
+    # The bare line is kept verbatim off CUDA: MPS and CPU have no TF32 mode,
+    # so there is nothing to disclose and the summary stays diffable against
+    # every report produced before precision was recorded.  On CUDA the
+    # arithmetic is the first thing a reader must check, so it rides along.
+    precision = payload.get("precision") or {}
+    device_line = f"device      : {payload['device']}"
+    if str(payload["device"]).startswith("cuda"):
+        device_line += (
+            f"   precision: {precision.get('mode')}"
+            f" (cudnn.allow_tf32={precision.get('cudnn_allow_tf32')}"
+            f" matmul.allow_tf32={precision.get('cuda_matmul_allow_tf32')}"
+            f" float32_matmul={precision.get('float32_matmul_precision')}"
+            f" deterministic={precision.get('cudnn_deterministic')})"
+        )
+    print(device_line)
+    if not precision.get("comparable_to_fp32_baseline", True):
+        print("*** TF32 ON - NOT comparable to the fp32 reference numbers ***")
     print(
         "geometry    : idx{geometry_index} window={window_frames} "
         "stride={stride_frames} pad_left={pad_left_frames} "
@@ -1011,6 +1039,145 @@ def print_summary(payload: Dict[str, Any], warnings_: Sequence[str]) -> None:
 # ----------------------------------------------------------------------- main
 
 
+def _backend_flag(*path: str) -> Optional[bool]:
+    """Read a ``torch.backends`` boolean without assuming it exists.
+
+    The TF32 switches have moved around between torch releases and some are
+    absent from CPU-only builds, so every read is best-effort: a missing or
+    unreadable flag is reported as unknown rather than crashing a run or, worse,
+    being reported as False when nobody checked.
+
+    Args:
+        *path: Attribute names to walk from ``torch.backends``.
+
+    Returns:
+        The flag as a bool, or ``None`` if it does not exist on this build.
+    """
+    node: Any = torch.backends
+    for name in path:
+        try:
+            node = getattr(node, name)
+        except (AttributeError, RuntimeError):
+            return None
+    return bool(node) if isinstance(node, bool) else None
+
+
+def configure_precision(device: str, allow_tf32: bool) -> None:
+    """Pin CUDA arithmetic to fp32 so runs stay comparable to the baseline.
+
+    Only touches global torch state on the CUDA path; MPS and CPU have no TF32
+    mode, and leaving their state alone is what keeps the baseline machine
+    byte-identical to before this function existed.
+
+    On CUDA, torch would otherwise default ``cudnn.allow_tf32`` to True and run
+    the subsampling convolutions in TF32 - roughly 10 bits of mantissa against
+    fp32's 23 - which is a different computation from the one that produced the
+    reference CER, not merely a faster one.  ``cudnn.deterministic`` is pinned
+    for the same reason: a run that cannot be reproduced cannot be compared.
+
+    Args:
+        device: The resolved device string, e.g. ``"cuda"`` or ``"cuda:0"``.
+        allow_tf32: Opt into TF32 anyway.  Faster, and explicitly *not*
+            comparable to the fp32 baseline; the report says so when set.
+    """
+    if not device.startswith("cuda"):
+        return
+
+    cudnn = getattr(torch.backends, "cudnn", None)
+    if cudnn is not None:
+        if hasattr(cudnn, "allow_tf32"):
+            cudnn.allow_tf32 = allow_tf32
+        # Pinned regardless of the TF32 choice: this is about a run being
+        # repeatable, which the escape hatch is not meant to trade away.
+        if hasattr(cudnn, "deterministic"):
+            cudnn.deterministic = True
+
+    matmul = getattr(getattr(torch.backends, "cuda", None), "matmul", None)
+    if matmul is not None and hasattr(matmul, "allow_tf32"):
+        matmul.allow_tf32 = allow_tf32
+
+    # The modern spelling of the same switch.  Set as well as - not instead of -
+    # the flags above, so the arithmetic is pinned even on a build where only
+    # one of the two spellings is present.
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
+
+
+def precision_report(device: str, allow_tf32: bool) -> Dict[str, Any]:
+    """Describe the arithmetic a run actually used, for the JSON report.
+
+    Read after the models are loaded so it reflects the device funasr resolved,
+    not the one requested.  The point is that someone holding two reports can
+    tell whether they are comparable without knowing which machine produced
+    either one.
+
+    Args:
+        device: The resolved device string.
+        allow_tf32: Whether ``--allow-tf32`` was passed.
+
+    Returns:
+        A metadata block; the flags read ``None`` where this torch build does
+        not expose them.
+    """
+    on_cuda = device.startswith("cuda")
+    matmul_precision: Optional[str] = None
+    if hasattr(torch, "get_float32_matmul_precision"):
+        try:
+            matmul_precision = str(torch.get_float32_matmul_precision())
+        except RuntimeError:
+            matmul_precision = None
+
+    if not on_cuda:
+        note = (
+            f"{device} has no TF32 path; all matmuls and convolutions ran in "
+            "fp32, as they did for the reference numbers"
+        )
+    elif allow_tf32:
+        note = (
+            "TF32 ENABLED via --allow-tf32: convolutions and matmuls ran at "
+            "reduced precision.  These numbers are NOT comparable to the fp32 "
+            "baseline"
+        )
+    else:
+        note = (
+            "TF32 disabled explicitly; CUDA ran in fp32 to stay comparable to "
+            "the fp32 baseline"
+        )
+
+    return {
+        "mode": "tf32" if (on_cuda and allow_tf32) else "fp32",
+        "comparable_to_fp32_baseline": not (on_cuda and allow_tf32),
+        "allow_tf32_requested": allow_tf32,
+        "cudnn_allow_tf32": _backend_flag("cudnn", "allow_tf32"),
+        "cuda_matmul_allow_tf32": _backend_flag("cuda", "matmul", "allow_tf32"),
+        "cudnn_deterministic": _backend_flag("cudnn", "deterministic"),
+        "float32_matmul_precision": matmul_precision,
+        "note": note,
+    }
+
+
+def default_device() -> str:
+    """Pick the device to decode on when ``--device`` is not given.
+
+    Deliberately never ``"cuda"``.  The published numbers were measured on
+    Apple MPS in fp32, and CUDA changes the arithmetic under you: torch
+    defaults ``cudnn.allow_tf32`` to True, so SenseVoice's subsampling
+    convolutions would run in TF32 where the Mac ran fp32.  If merely landing
+    on a CUDA box flipped the default, the exact command line that produced
+    the baseline would silently produce numbers that are not comparable to it.
+    So CUDA is opt-in via ``--device cuda``, which is also the point where
+    :func:`configure_precision` can pin the arithmetic back to fp32.
+
+    ``"mps"`` is kept as the darwin default - unchanged from before, so the
+    baseline machine is unaffected - and everything else gets ``"cpu"``, the
+    only device those machines can actually offer now that CUDA is explicit.
+
+    Returns:
+        ``"mps"`` on macOS, otherwise ``"cpu"``.
+    """
+    return "mps" if sys.platform == "darwin" else "cpu"
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse the command line.
 
@@ -1050,9 +1217,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        default="mps",
-        choices=("mps", "cpu"),
-        help="torch device (default: mps)",
+        default=default_device(),
+        choices=("cuda", "mps", "cpu"),
+        help=(
+            "torch device (default: mps on macOS, else cpu).  'cuda' is never "
+            "implicit - ask for it - and when asked for it runs in fp32 unless "
+            "--allow-tf32 is given.  Bare 'cuda' means device 0; select another "
+            "with CUDA_VISIBLE_DEVICES, as this is a single-process evaluation"
+        ),
+    )
+    parser.add_argument(
+        "--allow-tf32",
+        action="store_true",
+        help=(
+            "let CUDA use TF32 for convolutions and matmuls.  Faster, and NOT "
+            "numerically comparable to the fp32 reference numbers; the report "
+            "records the run as such.  No effect off CUDA"
+        ),
     )
     parser.add_argument("--out", type=Path, default=None, help="write the JSON report here")
     parser.add_argument(
@@ -1218,6 +1399,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     config, geometry = build_config(args)
+    # Before any model is built, since these are global torch switches that the
+    # first forward pass would otherwise bake in at their permissive defaults.
+    configure_precision(config.device, args.allow_tf32)
     val_clips, ja_clips, reference_clips = collect_clips(args, report)
     all_clips = [*val_clips, *ja_clips, *reference_clips]
     if not all_clips:
@@ -1274,6 +1458,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     payload: Dict[str, Any] = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "device": config.device,
+        # Read here rather than at configure time so it reports the device
+        # funasr resolved, and so a report is self-describing: two CER numbers
+        # are only comparable if this block matches.
+        "precision": precision_report(config.device, args.allow_tf32),
         "geometry": geometry,
         "scoring": {
             "cer": "corpus-level Levenshtein over NFKC-normalised characters",
