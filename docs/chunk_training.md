@@ -495,11 +495,12 @@ All eight checkpoints beat the MPS baseline's 0.1739 chunk CER on this subset.
 The top candidates were then re-scored on the **complete 5,194-clip val set**.
 These are the numbers to quote:
 
-| model | chunk CER | full CER | gap | chunk vs full |
-|---|---|---|---|---|
-| base (published) | 0.4024 | 0.1781 | 0.2243 | 0.3284 |
-| LR 2e-4, epoch 4 | **0.1679** | 0.1584 | **0.0095** | — |
-| LR 6e-4, epoch 4 | 0.1687 | **0.1550** | 0.0138 | 0.0831 |
+| model | chunk CER | full CER | gap |
+|---|---|---|---|
+| base (published) | 0.4024 | 0.1781 | 0.2243 |
+| LR 2e-4, epoch 4 | **0.1679** | 0.1584 | **0.0095** |
+| LR 6e-4, epoch 4 | 0.1687 | **0.1550** | 0.0138 |
+| LR 6e-4, epoch 3 | 0.1718 | 0.1616 | 0.0102 |
 
 Against the base model on the same val set — the only strictly like-for-like
 comparison available — **chunk CER falls 58 % relative** (0.4024 → 0.1679) and
@@ -515,10 +516,18 @@ selection sweep as a filter, not as a verdict**, and re-score finalists on the
 whole set before claiming a winner. The square-root LR scaling neither helped
 nor hurt at this batch size.
 
-The two differ in *where* they are better, and that is a real choice rather than
-noise: 2e-4 has the smaller chunk-vs-full gap (0.0095), 6e-4 retains more
-full-attention quality (0.1550 vs 0.1584). Selection on chunk CER alone picks
-2e-4 by a hair; picking 6e-4 to minimise forgetting is equally defensible.
+The subset misled on the gap as well: it made LR 6e-4 epoch 3 look like the
+smallest-gap checkpoint by a clear margin (0.0079), and on the full set that
+checkpoint is worse than the adopted one on every measure (0.1718 / 0.1616 /
+0.0102). Two independent claims from the same 800 clips both failed to
+replicate, which is the strongest argument here for scoring finalists on the
+whole set.
+
+The two epoch-4 checkpoints differ in *where* they are better, and that much is
+a real choice rather than noise: 2e-4 has the smaller chunk-vs-full gap
+(0.0095), 6e-4 retains more full-attention quality (0.1550 vs 0.1584).
+Selection on chunk CER alone picks 2e-4 by a hair; picking 6e-4 to minimise
+forgetting is equally defensible.
 
 **Adopted: LR 2e-4, epoch 4.** Two reasons. The pre-registered selection metric
 is chunk CER (`eval_chunk_gap.py` records it as `ja_val_chunk_cer` in every
