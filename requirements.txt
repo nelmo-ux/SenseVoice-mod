@@ -38,3 +38,13 @@ umap-learn<0.5.8
 # websockets
 # sounddevice
 # soundfile
+
+# --- Optional: VN dataset preparation (NOT installed by default) ---
+# Only scripts/prepare_vn_data.py needs this. To build the fine-tuning corpus:
+#   pip install py7zr
+#
+# py7zr - extracts the password-protected .7z archives in-process.  The 7z CLI
+#         is deliberately not used: its argv would expose the archive password
+#         to every user on the machine via `ps` for the whole extraction.
+#         None of its dependencies touch numpy, so the ceiling above holds.
+# py7zr

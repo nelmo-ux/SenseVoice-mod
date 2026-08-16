@@ -29,3 +29,6 @@ venv/
 models/
 data/smoke/
 data/smoke_*.jsonl
+# VisualNovel finetuning corpus: downloaded archives, extracted/resampled audio
+# and generated manifests. Licensed for local use only - never commit.
+data/vn/
