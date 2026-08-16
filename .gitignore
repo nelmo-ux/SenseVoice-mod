@@ -27,6 +27,8 @@ examples/aishell/llm_asr_nar/*
 venv/
 .pytest_cache/
 models/
+.env
+.env.*
 data/smoke/
 data/smoke_*.jsonl
 # VisualNovel finetuning corpus: downloaded archives, extracted/resampled audio
