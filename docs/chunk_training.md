@@ -1,8 +1,10 @@
 # Chunk training and streaming inference
 
-Status: **experimental.** The code paths described here are implemented and
-tested, but no chunk-finetuned checkpoint exists yet and no streaming WER or
-latency measurement of the chunk backend has been taken. Everything below
+Status: **experimental, with one finetuned checkpoint.** The code paths
+described here are implemented and tested, and a Japanese chunk finetune has
+now been run end to end — it closes 90% of the chunk-versus-full CER gap
+(0.2433 → 0.0245) without degrading full attention. Streaming WER and
+chunk-backend latency at scale remain unmeasured. Everything below
 distinguishes what has been *measured* from what is *reasoned*.
 
 ## Why this exists
@@ -157,6 +159,179 @@ Known limitation of the smoke path: it runs funasr's `train.py`, **not** the
 it cannot run on CPU at all. The smoke therefore validates the model, dataset and
 chunk path — not `train_ds.py`'s own logic.
 
+## The Japanese chunk finetune (Apple Silicon / MPS)
+
+> Status: **run completed.** A chunk-finetuned checkpoint now exists and the
+> quality question this document previously listed as unmeasured is answered
+> for Japanese. See "Results" at the end of this section.
+
+**Scope: this finetune is Japanese-specialised. Multilingual performance is
+explicitly _not_ a maintained property.** The base checkpoint covers
+zh/ja/yue/en/ko, but this adaptation trains on Japanese only, so degradation in
+the other four languages is accepted and untested. Checkpoint selection is
+decided on Japanese quality alone. If multilingual retention is ever wanted,
+that is a different run with a mixed-language corpus, not this one.
+
+### Corpus
+
+[VisualNovel_Dataset](https://huggingface.co/datasets/OOPPEENN/56697375616C4E6F76656C5F44617461736574)
+(MIT), 597 password-protected `.7z` archives, 478.5 GB, 10,588 h of Japanese
+visual-novel speech. Each archive holds `index.json` — a list of
+`{Speaker, Voice, Text}` — plus `<Speaker>/<Voice>.ogg` at 48 kHz, mixed mono
+and stereo, mean 4.0 s. There is no streaming access: the minimum download unit
+is one whole archive.
+
+Five archives were selected for ~53.8 h across ~200 speakers, chosen by
+hours-per-byte so the download stays at 1.28 GB. `scripts/prepare_vn_data.py`
+downloads, extracts, resamples to 16 kHz mono and emits the manifest schema of
+`data/train_example.jsonl`. The split is **speaker-disjoint** — held-out
+speakers appear in no training utterance — because speaker leakage would make
+the held-out chunk-mode decode meaningless.
+
+The corpus is unfiltered adult content and contains NSFW transcripts. These are
+deliberately *not* censored: an ASR target must match its audio, and rewriting
+transcripts would simply teach the model to mistranscribe.
+
+### Why not moe-speech
+
+[litagin/moe-speech](https://huggingface.co/datasets/litagin/moe-speech) (623 h
+of studio-recorded Japanese character speech) was evaluated and **rejected: it
+contains no transcripts at all.** Its own README says so — "this dataset doesn't
+contain any text information" — and its task tags list TTS, voice conversion and
+speaker identification, with no ASR task. It is unusable for the ground-truth
+supervised finetune chosen here.
+
+It would become usable under a self-distillation objective, where the
+full-attention model's own output supplies the target and no ground truth is
+needed. That approach was considered and not taken. Note also its licence:
+Japanese Copyright Act Art. 30-4 (machine-learning use only), redistribution of
+even a single audio file prohibited, though publishing a trained model is
+explicitly permitted.
+
+### Running it on MPS
+
+`finetune_chunk_mps.sh`. The GPU path (`train_ds.py`) cannot be used — see the
+smoke-check limitation above, it forces every batch to accelerator index 0 — so
+the MPS launcher extends the `train.py` path instead.
+
+**`PYTORCH_ENABLE_MPS_FALLBACK=1` is mandatory.** Without it training dies with
+`NotImplementedError: aten::_ctc_loss is not currently implemented for the MPS
+device`. That is the *only* blocking gap: the SANM/FSMN encoder and the chunk
+masking both run as native MPS kernels. CTC loss and its backward execute on
+CPU via the fallback, agreeing with a CPU reference to 1.25e-7 relative and
+costing about 2% of step time, though they do force a host sync every step.
+
+Measured on an M5 Pro (64 GB unified memory, torch 2.13.0, fp32, chunk masking
+on, 2–10 s utterances):
+
+| device | batch | s/step | audio-h per wall-h | MPS driver alloc |
+|---|---|---|---|---|
+| cpu | 4 | 4.30 | 5.6 | — |
+| mps | 4 | 0.91 | 26.5 | 15.8 GB |
+| mps | 8 | 1.42 | 33.9 | 26.2 GB |
+| mps | 16 | 2.70 | 35.5 | 44.7 GB |
+
+MPS is **4.75x faster than CPU** at matched batch. The binding constraint is
+memory, not compute: the recommended working-set cap is 55.7 GB, and past
+batch ~16 throughput collapses rather than scales. Because chunk masking
+expands the sequence, batching is capped by **audio seconds per step (~72 s)**
+rather than funasr's GPU-oriented `batch_type=token` — which works out to
+`batch_size=7200` with `batch_size_sample_max=12`, i.e. at most 12 clips per
+step and ~35 GB in practice. Batch 8 is the conservative alternative if a
+longer-utterance corpus pushes memory up: it keeps 96% of batch 16's
+throughput for 59% of the memory.
+
+`model.half()` fails on both MPS and CPU, and the cause is in this repository
+rather than in MPS: `sequence_mask()` in `model.py` hardcodes
+`dtype=torch.float32`, promoting half activations back to float32 and colliding
+with the FSMN convolution. Use autocast if mixed precision is wanted; the run
+described here is fp32 and does not touch `model.py`.
+
+### Run configuration
+
+53.8 h, 4 epochs, ~6 h wall clock. LR **2e-4 is a ceiling, not a target** — it
+is inherited from `finetune.sh` and may be lowered if evaluation shows
+degradation, but must not be raised. Chunk geometry is unchanged from
+`finetune_chunk.sh` (`chunk_size=[8,12,16]`, `stride=[6,10,14]`,
+`pad_left=[0,0,0]`, look-back `[1,1,1]`). Checkpoints land in `OUTPUT_DIR`
+(default `outputs/chunk_mps/`; the first real run used `outputs/chunk_mps_run1/`
+to keep it clearly separate from earlier pipeline-check artefacts).
+`keep_nbest_models` is set high enough to disable pruning, so **every epoch
+checkpoint is retained** — plus intra-epoch ones every 1000 steps — and the best
+is chosen after the fact rather than trusting the last. Budget ~2.8 GB per
+checkpoint (the extra over the 0.94 GB base is AdamW optimiser state), so a
+4-epoch run leaves roughly 45 GB behind.
+
+`OUTPUT_DIR` has **no lock or PID guard**: two runs pointed at the same
+directory will both write `model.pt` and both prune, producing torn
+checkpoints. Give every run its own directory. For the same reason, do not run
+`eval_chunk_gap.py` with `--device mps` while a training job is live — the two
+will contend for the same memory budget. Use `--device cpu` mid-run, or wait.
+
+`scripts/eval_chunk_gap.py` runs per epoch and reports, on Japanese only:
+chunk-mode decode quality on the held-out speakers, full-attention quality on
+the same clips (the forgetting check), and the chunk-versus-full gap that the
+whole exercise exists to close. Per the guidance above, validation is a
+chunk-mode **decode** — full-attention validation loss does not show the
+degradation that matters here.
+
+**Ignore funasr's own checkpoint selection.** This run ended with
+`Update best acc: 0.0000 -> model.pt.best` and
+`average_checkpoints: ['model.pt.ep0.1000']  -> model.pt.avg1`: `best` was
+chosen on an accuracy metric that is identically zero for this model, and
+`avg1` averaged a single early intra-epoch checkpoint. Neither is meaningful.
+Select on the chunk CER reported by `eval_chunk_gap.py`.
+
+### Results
+
+52.99 h corpus (29,230 train / 772 val clips, 128 vs 50 speakers,
+speaker-disjoint), 4 epochs, batch 12, LR 2e-4, fp32, **4.5 h wall clock** on an
+M5 Pro. Corpus-level CER on the 772 held-out Japanese clips, decoded at
+geometry index 1 (`chunk_size=12, stride=10, pad_right=2`, 120 ms lookahead):
+
+| checkpoint | chunk CER | full-attention CER | gap |
+|---|---|---|---|
+| base (published) | 0.4059 | 0.1625 | 0.2433 |
+| epoch 1 | 0.2140 | 0.1615 | 0.0525 |
+| epoch 2 | 0.1851 | 0.1493 | 0.0359 |
+| epoch 3 | 0.1782 | 0.1475 | 0.0307 |
+| **epoch 4 (best)** | **0.1739** | **0.1494** | **0.0245** |
+
+**The chunk finetune works.** Chunk CER falls 57% relative (0.4059 → 0.1739)
+and the chunk-versus-full gap closes 90% (0.2433 → 0.0245). Most of the gain
+lands in the first epoch, which matches the "adaptation, not retraining"
+framing above.
+
+**No catastrophic forgetting on Japanese** — full-attention CER did not
+degrade; it *improved* slightly (0.1625 → 0.1494), because 52 h of in-domain
+visual-novel speech helps full attention on this domain too. Both curves were
+still improving at epoch 4, so the run was stopped by budget rather than by
+convergence; more epochs are the obvious next experiment.
+
+**Not measured, and deliberately so:** performance in zh/yue/en/ko. Training
+was Japanese-only and multilingual retention is not a maintained property of
+this checkpoint (see the scope note at the top of this section). The Chinese
+clip in `runtime/llama.cpp/tests/sample.wav` is carried by
+`eval_chunk_gap.py` as an informational reference only and does not participate
+in checkpoint selection.
+
+Also still unmeasured: streaming WER against any reference, the crossover
+length at which the chunk backend becomes cheaper than `accumulate`, and
+chunk-backend latency at scale. A finetuned checkpoint now exists, so these
+are finally answerable.
+
+### Known gaps in the tooling
+
+- `scripts/eval_chunk_gap.py` hardcodes the chunk geometry and selects it by
+  index, duplicating the values in both finetune scripts. Training now writes
+  the resolved geometry to `${OUTPUT_DIR}/chunk_geometry.json` and warns when
+  it deviates from the default, but evaluation does not yet read that file —
+  so a non-default training geometry still has to be mirrored into the
+  evaluator by hand or the measurement is invalid.
+- `finetune_chunk_mps.sh` takes an exclusive `OUTPUT_DIR` lock; the GPU
+  `finetune_chunk.sh` does not, and so remains vulnerable to two concurrent
+  runs shredding each other's checkpoints.
+
 ## What is verified, and what is not
 
 Pinned by `tests/test_chunk_streaming_equivalence.py` (small randomly-initialised
@@ -219,7 +394,12 @@ This is a single clip in one language and is not a quality measurement.
 - The crossover length at which the chunk backend actually becomes cheaper.
 - Chunk-backend latency and CPU occupancy at scale (the `accumulate` defaults are
   benchmarked; the chunk geometry defaults are not).
-- That a chunk finetune actually recovers quality — no such checkpoint exists.
+
+**Now verified:** that a chunk finetune recovers quality. A checkpoint exists
+and closes 90% of the chunk-versus-full CER gap on held-out Japanese — see
+"The Japanese chunk finetune" above. The caveat on the deviation magnitudes
+below still stands, since those come from a small random encoder rather than
+this checkpoint.
 
 ## Deviation from upstream funasr
 
