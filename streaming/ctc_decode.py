@@ -11,16 +11,53 @@ batching and file writing) and without pulling in an external decoder package.
 from __future__ import annotations
 
 import re
-from typing import Any, List
+from typing import Any, List, Sequence, Union
 
 import torch
 
-__all__ = ["ctc_greedy_token_ids", "ctc_greedy_decode", "strip_rich_tags"]
+__all__ = [
+    "collapse_token_ids",
+    "ctc_greedy_token_ids",
+    "ctc_greedy_decode",
+    "strip_rich_tags",
+]
 
 #: Matches a single ``<|...|>`` rich tag.  The character class ``[^|]*`` keeps
 #: the match non-greedy *and* prevents it from spanning the ``|`` of a later
 #: tag, so ``<|a|><|b|>`` is removed as two separate tags.
 _RICH_TAG_RE = re.compile(r"<\|[^|]*\|>")
+
+
+def collapse_token_ids(
+    frame_ids: Union[Sequence[int], "torch.Tensor"],
+    blank_id: int = 0,
+) -> List[int]:
+    """Apply the CTC collapse rule to one utterance's per-frame argmax ids.
+
+    Split out of :func:`ctc_greedy_token_ids` so a caller that already holds
+    the per-frame ids can collapse them without keeping the ``(T, V)``
+    log-probabilities around.  The CTC head is applied frame by frame, so a
+    streaming decoder can throw the logits away as soon as it has argmaxed
+    them and still collapse the whole utterance exactly - which is what
+    ``streaming.chunk_backend`` does.
+
+    Args:
+        frame_ids: Per-frame token ids for a *single* utterance, in time order,
+            as a 1-D tensor or any sequence of ints.
+        blank_id: Vocabulary index of the CTC blank symbol.
+
+    Returns:
+        The ids with consecutive duplicates merged and blanks removed.
+    """
+    if len(frame_ids) == 0:
+        return []
+    ids = (
+        frame_ids
+        if isinstance(frame_ids, torch.Tensor)
+        else torch.as_tensor(frame_ids, dtype=torch.long)
+    )
+    ids = torch.unique_consecutive(ids, dim=-1)
+    return ids[ids != blank_id].tolist()
 
 
 def ctc_greedy_token_ids(
@@ -54,10 +91,7 @@ def ctc_greedy_token_ids(
     if ctc_logits.size(0) == 0:
         return []
 
-    yseq = ctc_logits.argmax(dim=-1)
-    yseq = torch.unique_consecutive(yseq, dim=-1)
-    mask = yseq != blank_id
-    return yseq[mask].tolist()
+    return collapse_token_ids(ctc_logits.argmax(dim=-1), blank_id=blank_id)
 
 
 def ctc_greedy_decode(

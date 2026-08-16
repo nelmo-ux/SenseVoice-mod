@@ -1,22 +1,23 @@
 """Chunk-driven streaming inference for SenseVoiceSmall.
 
-Design: *accumulate inside the VAD segment, re-run the whole encoder per chunk.*
-
-SenseVoiceSmall is a non-autoregressive CTC model whose encoder uses full
-(non-causal) SANM attention, so there is no incremental state to carry between
-chunks.  Rather than approximating one with truncated attention, this module
-keeps the exact offline computation and simply repeats it as audio arrives:
+This module owns everything that is the same whatever recognition strategy is
+in use, and delegates the strategy itself to a *backend*
+(``streaming.backends``) selected by :attr:`StreamingConfig.backend`:
 
 1.  Audio pushed through :meth:`StreamingSenseVoice.push_audio` is fed to a
     streaming frontend (``WavFrontendOnline``) which emits LFR/CMVN encoder
-    frames (60 ms each) as soon as enough samples are buffered.
-2.  Every time ``chunk_size`` new frames have accumulated, the *whole* window of
-    accumulated frames - prefixed with the four query embeddings the model
-    expects - is run through ``SenseVoiceEncoderSmall.forward`` and decoded with
-    greedy CTC, producing one ``partial`` result.
+    frames (60 ms each) as soon as enough samples are buffered.  The frames go
+    straight to the backend.
+2.  Every time ``chunk_size`` new frames have accumulated, the backend produces
+    one ``partial`` result.  How it does so is its business:
+    :class:`~streaming.backends.AccumulateBackend` (the default) re-runs the
+    *whole* encoder over a growing window, while
+    :class:`~streaming.chunk_backend.ChunkBackend` feeds each frame once into
+    the encoder's SCAMA-style streaming cache.
 3.  When the segment ends (``is_last=True``) the *raw waveform* of the whole
     segment is handed to ``SenseVoiceSmall.inference`` for a full-quality pass
     (ITN, rich-transcription post-processing), producing one ``final`` result.
+    This pass is backend-independent and is always the authoritative result.
 
 The streaming frontend is configured from the offline one with ``dither=0.0``;
 under that setting its output is bit-identical to a single offline
@@ -29,14 +30,24 @@ The module targets CPU: no CUDA-specific code paths are used.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
 
+# ``_SegmentState`` moved to ``backends`` with the accumulate strategy that owns
+# most of its fields; it is re-exported here because it is still *this* class's
+# per-segment state, and callers (and tests) reach for it at its historical
+# home.
+from .backends import (  # noqa: F401 - re-export
+    AccumulateBackend,
+    StreamingBackend,
+    _SegmentState,
+    encode_window,
+)
+from .chunk_backend import ChunkBackend
 from .config import StreamingConfig
-from .ctc_decode import ctc_greedy_decode, strip_rich_tags
 
 __all__ = ["StreamingResult", "StreamingSenseVoice"]
 
@@ -70,39 +81,15 @@ class StreamingResult:
     end_ms: float
 
 
-@dataclass
-class _SegmentState:
-    """Mutable per-segment state, reset by :meth:`StreamingSenseVoice.reset`."""
-
-    #: Encoder frames of the *current window* only, shape ``(T, D)``.
-    features: Optional[torch.Tensor] = None
-    #: Frames at the front of ``features`` already covered by ``last_raw_text``.
-    decoded_frames: int = 0
-    #: Raw decode of the current window as of the last inference.
-    last_raw_text: str = ""
-    #: Display text of every window already retired by the history cap.
-    confirmed_text: str = ""
-    #: Raw text (tags kept) of every window already retired by the history cap.
-    confirmed_raw: str = ""
-    #: New frames accumulated since the last inference.
-    pending_frames: int = 0
-    #: Total encoder frames produced in this segment.
-    total_frames: int = 0
-    #: Raw waveform of the segment, kept for the final full-quality pass.
-    waveform: List[np.ndarray] = field(default_factory=list)
-    #: Total samples pushed in this segment.
-    total_samples: int = 0
-    #: ``WavFrontendOnline`` streaming cache.
-    frontend_cache: Dict[str, Any] = field(default_factory=dict)
-    #: Set once ``is_last=True`` has flushed the frontend.
-    finished: bool = False
-
-
 class StreamingSenseVoice:
     """Chunk-driven streaming recogniser around ``SenseVoiceSmall``.
 
     One instance handles one segment at a time; call :meth:`reset` at every VAD
     speech onset and drive it with :meth:`push_audio`.
+
+    The recognition strategy is chosen by ``config.backend``; everything else -
+    the frontend, the retained waveform, the ``end_ms`` clock and the final
+    full-quality pass - is the same either way.
 
     The instance is *not* thread-safe: ``push_audio`` mutates the accumulated
     feature window and the frontend cache.
@@ -173,17 +160,56 @@ class StreamingSenseVoice:
             upsacle_samples=frontend.upsacle_samples,
         )
 
+    @property
+    def _backend(self) -> StreamingBackend:
+        """The recognition strategy, built on first use.
+
+        Built lazily rather than in :meth:`__init__` so that construction and
+        :meth:`reset` share one selection path, and so that a subclass which
+        replaces the weight-loading ``__init__`` (the test suite does exactly
+        that) still gets a working backend from nothing but ``config``.
+        """
+        backend = getattr(self, "_backend_impl", None)
+        if backend is None:
+            backend = self._build_backend()
+            self._backend_impl = backend
+        return backend
+
+    def _build_backend(self) -> StreamingBackend:
+        """Instantiate the backend named by ``config.backend``.
+
+        The accumulate backend is handed :meth:`_encode_and_decode` rather than
+        the model itself, which keeps model loading on this side of the seam
+        and lets a subclass swap the encoder pass out.
+
+        Returns:
+            A :class:`~streaming.backends.StreamingBackend`.
+
+        Raises:
+            ValueError: If ``config.backend`` names no known strategy.  Normally
+                unreachable, since ``config.validate()`` rejects it first.
+        """
+        if self.config.backend == "accumulate":
+            return AccumulateBackend(self.config, self._encode_and_decode)
+        if self.config.backend == "chunk":
+            return ChunkBackend(
+                self.config, self.model, self.tokenizer, self.device
+            )
+        raise ValueError(f"unknown backend: {self.config.backend!r}")
+
     # ------------------------------------------------------------- public API
 
     def reset(self) -> None:
         """Drop all segment state, ready for a new utterance.
 
         Clears the accumulated encoder frames, the confirmed-prefix text, the
-        streaming frontend cache and the retained waveform.  Intended to be
-        called on every VAD speech onset.
+        streaming frontend cache and the retained waveform, and hands the
+        backend the fresh state so it can drop whatever it carries of its own.
+        Intended to be called on every VAD speech onset.
         """
         self._state = _SegmentState()
         self._online_frontend.init_cache(self._state.frontend_cache)
+        self._backend.reset(self._state)
 
     def push_audio(
         self, samples: "np.ndarray", is_last: bool = False
@@ -223,22 +249,24 @@ class StreamingSenseVoice:
             if state.total_frames > 0:
                 # No partial here: the final pass covers the same audio with a
                 # better decode, and an extra encoder pass would only delay it.
-                state.pending_frames = 0
+                self._backend.discard_pending()
                 results.append(self._infer_final())
             return results
 
-        if state.pending_frames >= self.config.chunk_size:
-            # One inference per call, however many chunks arrived: every pass
-            # decodes the *whole* window, so running it twice back to back would
-            # burn a second encoder pass on an identical hypothesis.
-            state.pending_frames = 0
+        if self._backend.should_emit_partial():
+            # At most one partial per call, however many chunks arrived: the
+            # backend consumes every pending frame in one go.
             results.append(self._infer_partial())
         return results
 
     # ------------------------------------------------------------- frontend
 
     def _extract_frames(self, samples: "np.ndarray", is_last: bool) -> None:
-        """Push samples through the streaming frontend and accumulate frames.
+        """Push samples through the streaming frontend and hand on the frames.
+
+        Frame *extraction* is backend-independent - both strategies consume the
+        same 60 ms LFR/CMVN frames in the same order - so it stays here and the
+        frames are forwarded to the backend, which decides what to do with them.
 
         Args:
             samples: 1-D float32 audio for this call (possibly empty).
@@ -265,51 +293,8 @@ class StreamingSenseVoice:
             return
 
         new_frames = feats[0].to(torch.float32)
-        if state.features is None:
-            state.features = new_frames.clone()
-        else:
-            state.features = torch.cat((state.features, new_frames), dim=0)
-        state.pending_frames += new_frames.shape[0]
+        self._backend.accept_frames(new_frames)
         state.total_frames += new_frames.shape[0]
-
-    # -------------------------------------------------------------- history
-
-    def _apply_history_cap(self) -> None:
-        """Enforce ``config.max_history`` by retiring the oldest window.
-
-        Strategy: **non-overlapping windows with a confirmed prefix.**  When the
-        accumulated frames would exceed ``max_history``, the decode of the
-        previous window is frozen into ``confirmed_text`` and *exactly* the
-        frames that window covered are dropped; the next window restarts from
-        the frames that arrived after it.  Later partials are rendered as
-        ``confirmed_text + <current window decode>``.
-
-        Every frame therefore contributes to exactly one decode - no text is
-        duplicated across the boundary and none is lost.
-
-        Limitation: because the windows do not overlap, the encoder loses all
-        acoustic context across the cut.  A word straddling the boundary can be
-        split into two fragments (or mis-recognised), and the rich tags of the
-        retired window stay frozen in the confirmed prefix even if later audio
-        would have changed them.  The ``final`` result is unaffected: it is
-        produced by a full pass over the whole retained waveform.
-        """
-        state = self._state
-        max_history = self.config.max_history
-        if state.features is None or state.features.shape[0] <= max_history:
-            return
-
-        if state.decoded_frames > 0:
-            state.confirmed_text += strip_rich_tags(state.last_raw_text)
-            state.confirmed_raw += state.last_raw_text
-            state.features = state.features[state.decoded_frames :].clone()
-        state.decoded_frames = 0
-        state.last_raw_text = ""
-
-        # A single push larger than the cap (or an undecoded overflow) can still
-        # leave the window too long: keep the most recent frames.
-        if state.features.shape[0] > max_history:
-            state.features = state.features[-max_history:].clone()
 
     # ------------------------------------------------------------- inference
 
@@ -330,19 +315,12 @@ class StreamingSenseVoice:
         return self._state.total_samples * 1000.0 / self.config.sample_rate
 
     def _infer_partial(self) -> StreamingResult:
-        """Run one chunk-driven encoder pass and build a ``partial`` result.
+        """Ask the backend for the current hypothesis and time-stamp it.
 
         Returns:
             The ``partial`` result for the audio accumulated so far.
         """
-        self._apply_history_cap()
-        state = self._state
-        raw_window = self._encode_and_decode(state.features)
-        state.last_raw_text = raw_window
-        state.decoded_frames = 0 if state.features is None else state.features.shape[0]
-
-        raw_text = state.confirmed_raw + raw_window
-        text = state.confirmed_text + strip_rich_tags(raw_window)
+        text, raw_text = self._backend.emit_partial()
         return StreamingResult(
             type="partial",
             text=text,
@@ -354,10 +332,11 @@ class StreamingSenseVoice:
     def _encode_and_decode(self, features: Optional[torch.Tensor]) -> str:
         """Encode one feature window and greedily decode it.
 
-        The four query embeddings are prepended exactly as
-        ``SenseVoiceSmall.inference`` does: ``textnorm`` first (+1), then
-        ``language`` and the event/emotion pair (+3), giving the frame order
-        ``[language, event, emotion, textnorm, speech...]``.
+        The seam between the loaded model and
+        :class:`~streaming.backends.AccumulateBackend`: it binds
+        :func:`~streaming.backends.encode_window` to this instance's model,
+        tokenizer and device, so the backend can stay free of model loading.
+        Overriding it replaces the encoder pass wholesale.
 
         Args:
             features: Encoder frames of the current window, shape ``(T, D)``.
@@ -366,47 +345,9 @@ class StreamingSenseVoice:
             The raw decoded text, rich tags included; ``""`` for an empty
             window.
         """
-        if features is None or features.shape[0] == 0:
-            return ""
-
-        model = self.model
-        with torch.inference_mode():
-            speech = features.unsqueeze(0).to(self.device)
-
-            language = self.config.language
-            language_id = model.lid_dict.get(language, 0)
-            language_query = model.embed(
-                torch.LongTensor([[language_id]]).to(speech.device)
-            )
-            textnorm = "withitn" if self.config.use_itn else "woitn"
-            textnorm_query = model.embed(
-                torch.LongTensor([[model.textnorm_dict[textnorm]]]).to(speech.device)
-            )
-            event_emo_query = model.embed(torch.LongTensor([[1, 2]]).to(speech.device))
-
-            # SenseVoiceEncoderSmall.forward scales its input in place
-            # (``xs_pad *= output_size ** 0.5``).  torch.cat allocates a fresh
-            # tensor, so the accumulated ``features`` are never touched - feeding
-            # the cached tensor directly would inflate it by 22.6x per chunk.
-            speech = torch.cat(
-                (language_query, event_emo_query, textnorm_query, speech), dim=1
-            )
-            speech_lengths = torch.tensor(
-                [speech.shape[1]], dtype=torch.int32, device=speech.device
-            )
-
-            encoder_out, encoder_out_lens = model.encoder(speech, speech_lengths)
-            if isinstance(encoder_out, tuple):
-                encoder_out = encoder_out[0]
-
-            ctc_logits = model.ctc.log_softmax(encoder_out)
-            if self.config.ban_emo_unk:
-                ctc_logits[:, :, model.emo_dict["unk"]] = -float("inf")
-
-            logits_2d = ctc_logits[0, : int(encoder_out_lens[0].item()), :]
-            return ctc_greedy_decode(
-                logits_2d, self.tokenizer, blank_id=model.blank_id
-            )
+        return encode_window(
+            self.model, self.tokenizer, self.config, features, self.device
+        )
 
     def _infer_final(self) -> StreamingResult:
         """Run the full-quality pass over the retained waveform.

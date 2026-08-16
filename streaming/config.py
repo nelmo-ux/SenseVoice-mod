@@ -15,10 +15,12 @@ docstring for the numbers behind each one.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Tuple
 
 __all__ = [
     "MS_PER_FRAME",
     "NUM_QUERY_FRAMES",
+    "SUPPORTED_BACKENDS",
     "VAD_STREAMING_CHUNK_LIMIT_MS",
     "StreamingConfig",
 ]
@@ -37,6 +39,11 @@ NUM_QUERY_FRAMES: int = 4
 #: ``False`` for ``chunk_size >= 15000``, which makes every call a complete
 #: utterance.  :attr:`StreamingConfig.vad_chunk_ms` must stay below it.
 VAD_STREAMING_CHUNK_LIMIT_MS: float = 15000.0
+
+#: Recognition strategies :class:`StreamingConfig.backend` may name.  See
+#: ``streaming.backends`` for the protocol they implement and
+#: ``streaming.chunk_backend`` for the SCAMA-style one.
+SUPPORTED_BACKENDS: Tuple[str, ...] = ("accumulate", "chunk")
 
 
 @dataclass
@@ -81,7 +88,41 @@ class StreamingConfig:
         non-streaming semantics at ``chunk_size >= 15000`` ms, so the value
         must stay well below that.
 
+    Chunk-backend geometry (``backend = "chunk"`` only).  **These defaults are
+    not measured.**  Every number above comes from a benchmark; the four fields
+    below do not - no streaming WER or latency measurement of the chunk backend
+    exists yet.  They mirror the middle entry of the dynamic chunk-mask
+    configuration the model is finetuned with in ``finetune_chunk.sh``
+    (``chunk_size=[8,12,16]``, ``stride=[6,10,14]``, ``pad_left=[0,0,0]``,
+    ``encoder_att_look_back_factor=[1,1,1]``), on the reasoning that decoding
+    should use a geometry the encoder was actually trained on.  Treat them as a
+    starting point to benchmark, not as a tuned optimum:
+
+    ``chunk_pad_left = 0`` / ``chunk_stride = 10`` / ``chunk_pad_right = 2``
+        The training entry ``chunk_size=12, stride=10, pad_left=0`` (so
+        ``pad_right = 12 - 10 - 0 = 2``).  ``pad_left = 0`` is also what
+        ``SenseVoiceEncoderSmall.init_chunk_cache`` recommends whenever
+        encoder look-back is on.  The two lookahead frames cost 120 ms of
+        added latency (:attr:`chunk_lookahead_ms`).
+
+    ``chunk_encoder_look_back = 1``
+        One previous chunk of encoder self-attention context, matching
+        ``encoder_att_look_back_factor=1`` in training.  It requires
+        ``chunk_pad_right >= 1``.
+
+    Note:
+        ``chunk_size`` is *not* the encoder's chunk width.  It is the emission
+        cadence - how many new encoder frames must arrive before a partial is
+        produced - and it applies to both backends.  The chunk backend's
+        encoder window is ``chunk_pad_left + chunk_stride + chunk_pad_right``,
+        which is stepped several times per emitted partial when the two differ.
+
     Attributes:
+        backend: Recognition strategy, one of :data:`SUPPORTED_BACKENDS`.
+            ``"accumulate"`` re-runs the full encoder over a growing window
+            (the default, and the only path with measured numbers);
+            ``"chunk"`` feeds each frame once into the encoder's streaming
+            cache.
         chunk_size: Encoder frames accumulated before each inference.
         max_history: Encoder frames retained as context across chunks.
         sample_rate: Input audio sample rate in Hz (the model expects 16 kHz).
@@ -94,8 +135,20 @@ class StreamingConfig:
         vad_model: FunASR VAD model id used for endpointing.
         vad_chunk_ms: Chunk length passed to the VAD, in milliseconds.  It is
             *not* derived from ``chunk_size``: see above.
+        chunk_pad_left: Left-context frames the chunk backend carries over from
+            the previous encoder window.
+        chunk_stride: Frames committed per ``forward_chunk`` call - exactly how
+            many new frames the chunk backend feeds the encoder each step.
+        chunk_pad_right: Lookahead frames the encoder sees but withholds from
+            its output until the next step; the source of the backend's added
+            latency.
+        chunk_encoder_look_back: Previous chunks the encoder self-attention may
+            attend to through the per-layer key/value cache.  ``0`` keeps
+            attention inside the current window, ``-1`` keeps every past chunk,
+            and any non-zero value requires ``chunk_pad_right >= 1``.
     """
 
+    backend: str = "accumulate"
     chunk_size: int = 12
     max_history: int = 167
     sample_rate: int = 16000
@@ -107,6 +160,10 @@ class StreamingConfig:
     num_threads: int = 4
     vad_model: str = "fsmn-vad"
     vad_chunk_ms: float = 480.0
+    chunk_pad_left: int = 0
+    chunk_stride: int = 10
+    chunk_pad_right: int = 2
+    chunk_encoder_look_back: int = 1
 
     @property
     def chunk_ms(self) -> float:
@@ -123,15 +180,46 @@ class StreamingConfig:
         """Audio duration of the retained encoder history, in milliseconds."""
         return self.max_history * MS_PER_FRAME
 
+    @property
+    def chunk_lookahead_ms(self) -> float:
+        """Latency the configured chunk geometry implies, in milliseconds.
+
+        Under the chunk backend a frame is only emitted once its
+        ``chunk_pad_right`` successors have been fed, so this is how far behind
+        the audio clock that backend's partials necessarily run.
+
+        The value is pure geometry: it is derived from ``chunk_pad_right``
+        alone and never consults :attr:`backend`, so it keeps describing what
+        the ``chunk_*`` fields *configure* even while ``backend ==
+        "accumulate"`` - a backend that reads none of them and adds no
+        lookahead of its own.  It is ``0.0`` exactly when
+        ``chunk_pad_right == 0``.
+        """
+        return self.chunk_pad_right * MS_PER_FRAME
+
     def validate(self) -> None:
         """Check that the configuration is internally consistent.
 
         Raises:
-            ValueError: If any field is out of range, if ``max_history`` is
-                smaller than ``chunk_size`` (the history must hold at least the
-                chunk currently being decoded), or if ``vad_chunk_ms`` is
-                outside the range in which FunASR treats the input as a stream.
+            ValueError: If any field is out of range, if ``backend`` is not one
+                of :data:`SUPPORTED_BACKENDS`, if ``max_history`` is smaller
+                than ``chunk_size`` (the history must hold at least the chunk
+                currently being decoded), if the chunk geometry is one
+                ``SenseVoiceEncoderSmall.init_chunk_cache`` would reject, or if
+                ``vad_chunk_ms`` is outside the range in which FunASR treats
+                the input as a stream.
+
+        Note:
+            The chunk geometry is checked here as well as in
+            ``init_chunk_cache`` so that a typo fails at construction time,
+            with a message naming the config field, rather than on the first
+            chunk of audio.  Both checks encode the same rules.
         """
+        if self.backend not in SUPPORTED_BACKENDS:
+            raise ValueError(
+                f"backend must be one of {SUPPORTED_BACKENDS}, got "
+                f"{self.backend!r}"
+            )
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size must be >= 1, got {self.chunk_size}")
         if self.max_history < self.chunk_size:
@@ -162,4 +250,28 @@ class StreamingConfig:
             raise ValueError(
                 f"vad_chunk_ms must be < {VAD_STREAMING_CHUNK_LIMIT_MS} to keep "
                 f"the VAD in streaming mode, got {self.vad_chunk_ms}"
+            )
+        if self.chunk_stride < 1:
+            raise ValueError(f"chunk_stride must be >= 1, got {self.chunk_stride}")
+        if self.chunk_pad_left < 0:
+            raise ValueError(
+                f"chunk_pad_left must be >= 0, got {self.chunk_pad_left}"
+            )
+        if self.chunk_pad_right < 0:
+            raise ValueError(
+                f"chunk_pad_right must be >= 0, got {self.chunk_pad_right}"
+            )
+        if self.chunk_encoder_look_back < -1:
+            raise ValueError(
+                "chunk_encoder_look_back must be >= -1 (-1 keeps every past "
+                f"chunk, 0 disables look-back), got {self.chunk_encoder_look_back}"
+            )
+        if self.chunk_encoder_look_back != 0 and self.chunk_pad_right < 1:
+            # The encoder builds its attention cache by dropping the last
+            # ``pad_right`` frames of the window, so at ``pad_right == 0`` the
+            # cache it would keep is empty.
+            raise ValueError(
+                "chunk_encoder_look_back != 0 requires chunk_pad_right >= 1, "
+                f"got chunk_encoder_look_back={self.chunk_encoder_look_back} "
+                f"and chunk_pad_right={self.chunk_pad_right}"
             )
