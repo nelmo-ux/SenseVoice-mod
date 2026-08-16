@@ -1,0 +1,1344 @@
+#!/usr/bin/env python3
+"""Compare a chunk-finetuned SenseVoiceSmall checkpoint against the base model.
+
+Run once per epoch to pick the best checkpoint::
+
+    .venv/bin/python scripts/eval_chunk_gap.py \\
+        --checkpoint outputs/chunk_mps/model.pt.ep2 \\
+        --limit 20 --out outputs/chunk_mps/eval_ep2.json
+
+The fine-tune is **Japanese-specialised**.  Checkpoint selection is decided by
+Japanese quality alone; multilingual retention is explicitly *not* a maintained
+property of this run, so the Chinese clip is measured but reported as reference
+only (see :data:`REFERENCE_ONLY_NOTE`).
+
+Three Japanese measurements
+---------------------------
+
+1.  **Chunk-mode partial quality.**  ``data/vn/val.jsonl`` decoded through the
+    real streaming path (``streaming.chunk_backend.ChunkBackend`` driven by
+    ``streaming.streaming_model.StreamingSenseVoice``) with the chunk geometry
+    the model is finetuned with, scored against the manifest's ``target``.
+    ``docs/chunk_training.md`` is explicit that validation must be chunk-mode
+    *decoding*, not full-attention val loss, which is why nothing here reads a
+    loss.
+
+2.  **Forgetting check.**  The same Japanese clips decoded with **full
+    attention** (``SenseVoiceSmall.inference``).  A finetune that trades offline
+    quality for streaming quality shows up here as a rising full-attention CER
+    relative to the base model.
+
+3.  **Chunk-vs-full gap.**  Closing this gap is the entire point of the
+    finetune, so it is reported for both models: as ``chunk CER - full CER``
+    against the reference, and as a direct ``CER(full decode, chunk decode)``
+    which needs no reference and so also works on the untranscribed clips.
+
+Clips without a reference transcript
+------------------------------------
+
+``ja.mp3`` (the model-bundled Japanese sample, resolved out of the HuggingFace
+snapshot cache) and ``runtime/llama.cpp/tests/sample.wav`` (Chinese) have no
+ground truth.  For those the **base model's own full-attention output is the
+reference**, so the number reported is *drift* from the base model rather than
+accuracy.  Drift on the Chinese clip is informational only.
+
+Two chunk decodes per clip
+--------------------------
+
+``chunk`` is the complete chunk-mode decode, tail flushed, covering every frame
+- the fair thing to compare against the full-attention decode of the same
+audio.  ``chunk_last_partial`` is the last partial a user would actually have
+seen mid-stream; it stops short of the tail (up to ``chunk_size - 1`` buffered
+frames plus ``pad_right`` withheld ones), so its CER carries deletions that are
+an artefact of where the stream was cut, not a quality signal.  Both are in the
+JSON; only the former is scored.
+"""
+
+from __future__ import annotations
+
+import os
+
+# MUST be set before torch is imported, which the local imports below do
+# transitively.  Several ops on the SenseVoice path have no MPS kernel -
+# ``aten::_ctc_loss`` is the one that bites first - and raise
+# NotImplementedError without the CPU fallback.  Setting it in-process rather
+# than documenting it as a shell prerequisite means a caller cannot forget it.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+import argparse
+import gc
+import glob
+import json
+import sys
+import unicodedata
+import warnings
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+
+# The repo root has to be importable before the local imports below: this file
+# lives in ``scripts/`` but ``model`` and ``streaming`` sit at the root.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from streaming.backends import _SegmentState  # noqa: E402
+from streaming.config import StreamingConfig  # noqa: E402
+from streaming.ctc_decode import strip_rich_tags  # noqa: E402
+from streaming.streaming_model import StreamingSenseVoice  # noqa: E402
+
+__all__ = ["main"]
+
+#: The dynamic chunk-mask configuration used in training (``finetune_chunk.sh``).
+#: Evaluation decodes with one of *these* geometries so the encoder is asked for
+#: a computation it was actually trained on.  ``pad_right`` is implied:
+#: ``chunk_size - stride - pad_left``.
+TRAINING_CHUNK_CONFIG: Dict[str, Tuple[int, ...]] = {
+    "chunk_size": (8, 12, 16),
+    "stride": (6, 10, 14),
+    "pad_left": (0, 0, 0),
+    "encoder_att_look_back_factor": (1, 1, 1),
+}
+
+#: Which entry of :data:`TRAINING_CHUNK_CONFIG` to decode with by default.  The
+#: middle one (720 ms window, 600 ms commit, 120 ms lookahead) is also what
+#: ``StreamingConfig``'s chunk defaults mirror.
+DEFAULT_GEOMETRY_INDEX = 1
+
+DEFAULT_BASE_DIR = REPO_ROOT / "models" / "SenseVoiceSmall"
+DEFAULT_VAL_JSONL = REPO_ROOT / "data" / "vn" / "val.jsonl"
+DEFAULT_ZH_CLIP = REPO_ROOT / "runtime" / "llama.cpp" / "tests" / "sample.wav"
+
+#: Where the model-bundled sample clips land.  The snapshot hash changes
+#: whenever the model is re-pulled, so it is globbed rather than hardcoded.
+JA_CLIP_GLOB = (
+    "~/.cache/huggingface/hub/models--FunAudioLLM--SenseVoiceSmall"
+    "/snapshots/*/example/ja.mp3"
+)
+
+REFERENCE_ONLY_NOTE = (
+    "reference only, not a selection criterion: this finetune is "
+    "Japanese-specialised and Chinese retention is not a maintained property"
+)
+
+#: Stripped before scoring.  CER over Japanese and Chinese is conventionally
+#: computed without punctuation or spacing, and the references in the manifest
+#: carry neither reliably, so scoring them would measure transcription
+#: convention rather than recognition.  ``--keep-punctuation`` turns this off.
+_PUNCTUATION = frozenset(
+    "、。，．,.!?！？;；:：…‥・「」『』()（）[]{}〈〉《》"
+    "\"'`|/\\-‐—―~〜_＿*＊&＆%％#＃@＠+＋=＝<>＜＞"
+)
+
+
+# --------------------------------------------------------------------- scoring
+
+
+def levenshtein(reference: Sequence[Any], hypothesis: Sequence[Any]) -> int:
+    """Edit distance between two sequences.
+
+    Args:
+        reference: The ground-truth sequence (characters or word tokens).
+        hypothesis: The predicted sequence.
+
+    Returns:
+        The minimum number of insertions, deletions and substitutions turning
+        ``hypothesis`` into ``reference``.
+    """
+    if not reference:
+        return len(hypothesis)
+    if not hypothesis:
+        return len(reference)
+
+    previous = list(range(len(hypothesis) + 1))
+    for i, ref_item in enumerate(reference, start=1):
+        current = [i]
+        for j, hyp_item in enumerate(hypothesis, start=1):
+            current.append(
+                min(
+                    previous[j] + 1,  # deletion from the reference
+                    current[j - 1] + 1,  # insertion into the reference
+                    previous[j - 1] + (ref_item != hyp_item),  # substitution
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
+def normalize_chars(text: str, keep_punctuation: bool = False) -> str:
+    """Reduce decoded or reference text to the character sequence CER scores.
+
+    Rich tags go first (``<|ja|><|NEUTRAL|><|Speech|><|woitn|>`` and friends are
+    model metadata, not transcription), then NFKC folds the full-width/half-width
+    distinction, then whitespace is dropped entirely - Japanese and Chinese
+    references are not consistently spaced and the model does not emit spaces
+    the same way twice.
+
+    Args:
+        text: Raw decoded or reference text.
+        keep_punctuation: Keep punctuation instead of stripping it.
+
+    Returns:
+        The normalised character string.
+    """
+    text = strip_rich_tags(text)
+    text = unicodedata.normalize("NFKC", text)
+    text = "".join(ch for ch in text if not ch.isspace())
+    if not keep_punctuation:
+        text = "".join(ch for ch in text if ch not in _PUNCTUATION)
+    return text
+
+
+def normalize_words(text: str, keep_punctuation: bool = False) -> List[str]:
+    """Tokenise text for WER on whitespace.
+
+    Note:
+        WER is near-meaningless for Japanese and Chinese, which are unsegmented -
+        a whole utterance is usually one "word", so WER saturates near 1.0 and
+        moves in steps of 1/n.  It is reported because it is cheap and because
+        the manifest may one day carry spaced text, but **CER is the metric to
+        read** and the only one selection keys off.
+
+    Args:
+        text: Raw decoded or reference text.
+        keep_punctuation: Keep punctuation instead of treating it as a separator.
+
+    Returns:
+        The whitespace-separated tokens.
+    """
+    text = strip_rich_tags(text)
+    text = unicodedata.normalize("NFKC", text)
+    if not keep_punctuation:
+        text = "".join(" " if ch in _PUNCTUATION else ch for ch in text)
+    return text.split()
+
+
+def pair_cer(reference: str, hypothesis: str, keep_punctuation: bool = False) -> float:
+    """CER of one hypothesis against one reference.
+
+    Args:
+        reference: Ground-truth text.
+        hypothesis: Predicted text.
+        keep_punctuation: Passed to :func:`normalize_chars`.
+
+    Returns:
+        ``edits / len(reference)``, or ``0.0`` when both normalise to empty and
+        ``1.0`` when only the reference does (any output against no reference is
+        wholly insertion).  Not clamped to 1.0 otherwise: a hypothesis longer
+        than its reference can legitimately exceed it.
+    """
+    ref = normalize_chars(reference, keep_punctuation)
+    hyp = normalize_chars(hypothesis, keep_punctuation)
+    if not ref:
+        return 0.0 if not hyp else 1.0
+    return levenshtein(ref, hyp) / len(ref)
+
+
+def corpus_metrics(
+    pairs: Sequence[Tuple[str, str]],
+    keep_punctuation: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Aggregate CER/WER over a set of (reference, hypothesis) pairs.
+
+    Args:
+        pairs: ``(reference, hypothesis)`` per clip.
+        keep_punctuation: Passed through to the normalisers.
+
+    Returns:
+        ``None`` for an empty input, else a dict with ``cer`` (corpus-level:
+        total edits over total reference characters - the headline number, since
+        it weights clips by length), ``mean_cer`` (unweighted mean over clips,
+        which a single short clip can dominate), ``wer``, and the counts behind
+        them.
+    """
+    if not pairs:
+        return None
+
+    char_edits = char_len = word_edits = word_len = 0
+    per_clip: List[float] = []
+    for reference, hypothesis in pairs:
+        ref_chars = normalize_chars(reference, keep_punctuation)
+        hyp_chars = normalize_chars(hypothesis, keep_punctuation)
+        edits = levenshtein(ref_chars, hyp_chars)
+        char_edits += edits
+        char_len += len(ref_chars)
+        per_clip.append(pair_cer(reference, hypothesis, keep_punctuation))
+
+        ref_words = normalize_words(reference, keep_punctuation)
+        hyp_words = normalize_words(hypothesis, keep_punctuation)
+        word_edits += levenshtein(ref_words, hyp_words)
+        word_len += len(ref_words)
+
+    return {
+        "cer": char_edits / char_len if char_len else 0.0,
+        "mean_cer": sum(per_clip) / len(per_clip),
+        "wer": word_edits / word_len if word_len else 0.0,
+        "num_clips": len(pairs),
+        "ref_chars": char_len,
+        "char_edits": char_edits,
+        "ref_words": word_len,
+        "word_edits": word_edits,
+    }
+
+
+# ------------------------------------------------------------------- clip I/O
+
+
+@dataclass
+class EvalClip:
+    """One audio file to decode.
+
+    Attributes:
+        key: Short identifier, used in the report.
+        path: Absolute path to the audio.
+        reference: Ground-truth transcript, or ``None`` when the clip has none
+            (in which case the base model's full-attention decode stands in).
+        language: SenseVoice language tag for the decode prompt.
+        use_itn: Whether to ask for inverse text normalisation.
+        scope: ``"japanese"`` for clips on the selection axis, ``"reference"``
+            for informational ones.
+    """
+
+    key: str
+    path: Path
+    reference: Optional[str]
+    language: str
+    use_itn: bool
+    scope: str = "japanese"
+
+
+@dataclass
+class ClipDecode:
+    """Everything one model produced for one clip.
+
+    Attributes:
+        full: Full-attention decode (``SenseVoiceSmall.inference``), raw.
+        chunk: Complete chunk-mode decode, tail flushed, raw.
+        chunk_last_partial: The last partial emitted before the stream ended;
+            display text, tags already stripped by the backend.
+    """
+
+    full: str
+    chunk: str
+    chunk_last_partial: str
+
+
+_LANGUAGE_FIELDS = ("text_language", "lang")
+
+
+def _manifest_language(record: Dict[str, Any], default: str) -> str:
+    """Read the language tag out of a manifest record.
+
+    Args:
+        record: One decoded JSONL line.
+        default: Fallback when the record carries no usable tag.
+
+    Returns:
+        A bare SenseVoice language code such as ``"ja"``.
+    """
+    for field_name in _LANGUAGE_FIELDS:
+        value = record.get(field_name)
+        if isinstance(value, str) and value:
+            return value.strip().strip("<>|") or default
+    return default
+
+
+def load_val_clips(
+    path: Path,
+    limit: Optional[int],
+    default_language: str,
+    default_use_itn: bool,
+) -> Tuple[List[EvalClip], List[str]]:
+    """Read the held-out manifest.
+
+    Decoding follows the manifest's own conventions where it states them
+    (``text_language``, ``with_or_wo_itn``), so the hypothesis is produced under
+    the same convention the ``target`` was written under.
+
+    Args:
+        path: Path to ``val.jsonl``.
+        limit: Keep only the first ``limit`` usable clips, or ``None`` for all.
+        default_language: Language tag for records that do not state one.
+        default_use_itn: ITN setting for records that do not state one.
+
+    Returns:
+        ``(clips, warnings)``.  ``clips`` is empty and ``warnings`` explains why
+        if the file is missing or unusable - a parallel job generates it, so its
+        absence is expected rather than an error.
+    """
+    if not path.exists():
+        return [], [
+            f"val manifest not found: {path} - Japanese val metrics skipped, "
+            "so this run produces NO checkpoint-selection signal"
+        ]
+
+    clips: List[EvalClip] = []
+    notes: List[str] = []
+    with path.open(encoding="utf-8") as handle:
+        for lineno, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                notes.append(f"{path}:{lineno}: unparseable JSON ({exc.msg}), skipped")
+                continue
+
+            source = record.get("source")
+            target = record.get("target")
+            if not source or target is None:
+                notes.append(f"{path}:{lineno}: missing 'source' or 'target', skipped")
+                continue
+            audio = Path(source)
+            if not audio.is_absolute():
+                audio = (REPO_ROOT / audio).resolve()
+            if not audio.exists():
+                notes.append(f"{path}:{lineno}: audio not found ({audio}), skipped")
+                continue
+
+            itn = record.get("with_or_wo_itn")
+            clips.append(
+                EvalClip(
+                    key=str(record.get("key") or f"val_{lineno:05d}"),
+                    path=audio,
+                    reference=str(target),
+                    language=_manifest_language(record, default_language),
+                    use_itn=(
+                        "withitn" in itn if isinstance(itn, str) else default_use_itn
+                    ),
+                )
+            )
+            if limit is not None and len(clips) >= limit:
+                break
+
+    if not clips and not notes:
+        notes.append(f"{path} contained no usable records")
+    return clips, notes
+
+
+def resolve_ja_clip(explicit: Optional[Path]) -> Tuple[Optional[Path], List[str]]:
+    """Locate the model-bundled Japanese sample.
+
+    Args:
+        explicit: A path given on the command line, which wins if it exists.
+
+    Returns:
+        ``(path, warnings)``; ``path`` is ``None`` when the clip cannot be found,
+        which happens when the HuggingFace snapshot has not been pulled.
+    """
+    if explicit is not None:
+        if explicit.exists():
+            return explicit, []
+        return None, [f"--ja-clip not found: {explicit}, skipped"]
+
+    matches = sorted(glob.glob(os.path.expanduser(JA_CLIP_GLOB)))
+    if not matches:
+        return None, [
+            "bundled ja.mp3 not found under "
+            f"{JA_CLIP_GLOB} - skipped; pull the HuggingFace snapshot or pass "
+            "--ja-clip to include it"
+        ]
+    return Path(matches[-1]), []
+
+
+def load_audio(path: Path, sample_rate: int) -> np.ndarray:
+    """Decode an audio file to mono float32 at ``sample_rate``.
+
+    librosa is used rather than soundfile so that mp3 works alongside wav.  Its
+    PySoundFile/audioread deprecation warning on mp3 is suppressed: it is
+    harmless and this script's stdout is meant to be scanned and diffed across
+    epochs.
+
+    Args:
+        path: Audio file, any format librosa can open.
+        sample_rate: Target rate; the model expects 16 kHz.
+
+    Returns:
+        A 1-D float32 array.
+
+    Raises:
+        RuntimeError: If the file cannot be decoded, naming the file - a silent
+            skip would quietly shrink the evaluation set.
+    """
+    import librosa
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            samples, _ = librosa.load(str(path), sr=sample_rate, mono=True)
+    except Exception as exc:  # noqa: BLE001 - re-raised with the filename
+        raise RuntimeError(f"could not decode {path}: {exc}") from exc
+    return np.ascontiguousarray(samples, dtype=np.float32)
+
+
+# ------------------------------------------------------------------ recogniser
+
+
+class CheckpointRecogniser(StreamingSenseVoice):
+    """``StreamingSenseVoice`` that can load weights from an arbitrary file.
+
+    The base ``__init__`` hardcodes ``from_pretrained(model=model_dir)``, which
+    always picks up ``<model_dir>/model.pt``; a finetuned checkpoint lives
+    somewhere else entirely.  funasr's loader honours an explicit ``init_param``
+    over the one it derives from the model directory, so this overrides
+    ``__init__`` - the extension point the base class documents for a subclass
+    that replaces weight loading - to pass it through.  Everything after the
+    load is the base class's own code, so the frontend, the backend selection
+    and the streaming path are the production ones.
+
+    Args:
+        model_dir: Base model directory, source of the config, CMVN and BPE.
+        config: Streaming tunables; ``backend`` must be ``"chunk"`` for the
+            chunk measurements to mean anything.
+        checkpoint: Finetuned ``model.pt``; ``None`` loads the base weights.
+    """
+
+    def __init__(
+        self,
+        model_dir: Path,
+        config: StreamingConfig,
+        checkpoint: Optional[Path] = None,
+    ) -> None:
+        self.config = config
+        self.config.validate()
+
+        from model import SenseVoiceSmall
+
+        load_kwargs: Dict[str, Any] = {
+            "model": str(model_dir),
+            "device": config.device,
+        }
+        if checkpoint is not None:
+            load_kwargs["init_param"] = str(checkpoint)
+        model, kwargs = SenseVoiceSmall.from_pretrained(**load_kwargs)
+        model.eval()
+
+        self.model = model
+        self.kwargs: Dict[str, Any] = kwargs
+        self.frontend = kwargs["frontend"]
+        self.tokenizer = kwargs["tokenizer"]
+
+        # funasr silently downgrades to CPU when the requested accelerator is
+        # unavailable.  Believe the loader, not the request, so the config, the
+        # backend's device and the report all agree on where this actually ran.
+        resolved = str(kwargs.get("device", config.device))
+        if resolved != config.device:
+            print(
+                f"[warn] requested device {config.device!r} unavailable; "
+                f"running on {resolved!r}",
+                file=sys.stderr,
+            )
+            self.config.device = resolved
+        self.device = torch.device(resolved)
+
+        torch.set_num_threads(self.config.num_threads)
+        self._online_frontend = self._build_online_frontend()
+        self._state = _SegmentState()
+        self.reset()
+
+    # ------------------------------------------------------------------ decode
+
+    def decode_full(self, samples: np.ndarray) -> str:
+        """Decode with full attention, the offline path.
+
+        Mirrors ``StreamingSenseVoice._full_inference``: the build kwargs go in
+        *under* the explicit arguments so a checkpoint that ships e.g.
+        ``language`` in its config cannot collide with the one chosen here.
+
+        Args:
+            samples: 1-D float32 16 kHz audio.
+
+        Returns:
+            Raw text with rich tags intact; the scorer strips them.
+        """
+        call_kwargs: Dict[str, Any] = {
+            **self.kwargs,
+            "data_in": [torch.from_numpy(samples)],
+            "language": self.config.language,
+            "use_itn": self.config.use_itn,
+            "ban_emo_unk": self.config.ban_emo_unk,
+            "key": ["eval"],
+            "fs": self.config.sample_rate,
+        }
+        with torch.inference_mode():
+            results, _ = self.model.inference(**call_kwargs)
+        return results[0].get("text", "") if results else ""
+
+    def decode_chunk(self, samples: np.ndarray) -> Tuple[str, str]:
+        """Decode through the streaming chunk path.
+
+        Audio is pushed one emission cadence at a time, exactly as a live
+        session would, so the partial schedule is the real one.  The stream is
+        deliberately **not** ended with ``push_audio(is_last=True)``: that runs
+        the backend-independent full-quality pass, which is the very
+        full-attention decode this is being compared against.  Instead the
+        frontend is flushed directly and the backend asked for one last partial,
+        which releases its buffered frames and withheld lookahead.
+
+        Args:
+            samples: 1-D float32 16 kHz audio.
+
+        Returns:
+            ``(complete decode, last mid-stream partial)``.  The first covers
+            every frame; the second is what a user would have seen at the moment
+            the audio stopped, and stops short of the tail.
+        """
+        self.reset()
+        last_partial = ""
+        block = self.config.chunk_samples
+        for start in range(0, len(samples), block):
+            for result in self.push_audio(samples[start : start + block], is_last=False):
+                last_partial = result.text
+
+        self._extract_frames(np.zeros(0, dtype=np.float32), is_last=True)
+        self._state.finished = True
+        complete, _ = self._backend.emit_partial()
+        return complete, last_partial
+
+    def decode_clip(self, clip: EvalClip, samples: np.ndarray) -> ClipDecode:
+        """Run both decodes for one clip under that clip's conventions.
+
+        Args:
+            clip: The clip, whose ``language`` and ``use_itn`` are applied to
+                both decodes so the hypothesis matches the reference convention.
+            samples: Its audio.
+
+        Returns:
+            The decodes.
+        """
+        self.config.language = clip.language
+        self.config.use_itn = clip.use_itn
+        chunk, last_partial = self.decode_chunk(samples)
+        return ClipDecode(
+            full=self.decode_full(samples),
+            chunk=chunk,
+            chunk_last_partial=last_partial,
+        )
+
+
+def release(recogniser: Optional[CheckpointRecogniser]) -> None:
+    """Drop a loaded model and its accelerator memory.
+
+    Both models are ~234M parameters; they are loaded one at a time so a run
+    never needs to hold two.
+
+    Args:
+        recogniser: The recogniser to release; ``None`` is a no-op.
+    """
+    if recogniser is None:
+        return
+    del recogniser
+    gc.collect()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+
+# -------------------------------------------------------------------- geometry
+
+
+def build_config(args: argparse.Namespace) -> Tuple[StreamingConfig, Dict[str, Any]]:
+    """Build the streaming config for the chosen training geometry.
+
+    Args:
+        args: Parsed command line.
+
+    Returns:
+        ``(config, description)`` where ``description`` records the geometry in
+        the report, including the training configuration it was taken from.
+
+    Raises:
+        SystemExit: Via ``argparse`` bounds, not here; an out-of-range index is
+            rejected by the parser.
+    """
+    index = args.geometry_index
+    width = TRAINING_CHUNK_CONFIG["chunk_size"][index]
+    stride = TRAINING_CHUNK_CONFIG["stride"][index]
+    pad_left = TRAINING_CHUNK_CONFIG["pad_left"][index]
+    look_back = TRAINING_CHUNK_CONFIG["encoder_att_look_back_factor"][index]
+    pad_right = width - stride - pad_left
+
+    config = StreamingConfig(
+        backend="chunk",
+        device=args.device,
+        language=args.language,
+        use_itn=args.use_itn,
+        # Emission cadence, not the encoder window: partials come out every
+        # ``chunk_size`` new frames.  Tying it to the training window width
+        # keeps one partial per encoder window.
+        chunk_size=width,
+        chunk_pad_left=pad_left,
+        chunk_stride=stride,
+        chunk_pad_right=pad_right,
+        chunk_encoder_look_back=look_back,
+    )
+    config.validate()
+
+    description = {
+        "geometry_index": index,
+        "window_frames": width,
+        "stride_frames": stride,
+        "pad_left_frames": pad_left,
+        "pad_right_frames": pad_right,
+        "encoder_look_back": look_back,
+        "lookahead_ms": config.chunk_lookahead_ms,
+        "training_config": {k: list(v) for k, v in TRAINING_CHUNK_CONFIG.items()},
+    }
+    return config, description
+
+
+# --------------------------------------------------------------------- report
+
+
+@dataclass
+class Report:
+    """Collects non-fatal problems so they reach both stdout and the JSON.
+
+    A clip that cannot be read or decoded is skipped rather than aborting the
+    run - a per-epoch harness that dies on one bad file is worse than one that
+    reports 6 clips out of 7 and says so.
+    """
+
+    warnings: List[str] = field(default_factory=list)
+
+    def warn(self, message: str) -> None:
+        """Record a message for both the JSON and stdout.
+
+        Args:
+            message: What went wrong or was skipped.
+        """
+        self.warnings.append(message)
+
+
+def _delta(new: Optional[float], old: Optional[float]) -> Optional[float]:
+    """Fine-tuned minus base, guarding missing values.
+
+    Args:
+        new: Fine-tuned value.
+        old: Base value.
+
+    Returns:
+        The difference, or ``None`` if either side is missing.  Negative is an
+        improvement for every metric in this report.
+    """
+    if new is None or old is None:
+        return None
+    return new - old
+
+
+def summarise_val(
+    clips: Sequence[EvalClip],
+    decodes: Dict[str, Dict[str, ClipDecode]],
+    keep_punctuation: bool,
+) -> Dict[str, Any]:
+    """Score the referenced Japanese val clips for every loaded model.
+
+    Args:
+        clips: The val clips, each carrying a reference transcript.
+        decodes: ``{model_name: {clip_key: ClipDecode}}``.
+        keep_punctuation: Passed to the scorers.
+
+    Returns:
+        Per-model ``chunk`` / ``full`` / gap metrics plus the base-vs-finetuned
+        deltas.  Empty dict when there are no clips.
+    """
+    if not clips:
+        return {}
+
+    per_model: Dict[str, Any] = {}
+    for name, by_key in decodes.items():
+        chunk_pairs = [(c.reference or "", by_key[c.key].chunk) for c in clips]
+        partial_pairs = [
+            (c.reference or "", by_key[c.key].chunk_last_partial) for c in clips
+        ]
+        full_pairs = [(c.reference or "", by_key[c.key].full) for c in clips]
+        # Reference-free view of the same gap: how far the chunk decode strays
+        # from this model's own full-attention decode.
+        gap_pairs = [(by_key[c.key].full, by_key[c.key].chunk) for c in clips]
+
+        chunk = corpus_metrics(chunk_pairs, keep_punctuation)
+        full = corpus_metrics(full_pairs, keep_punctuation)
+        per_model[name] = {
+            "chunk": chunk,
+            "chunk_last_partial": corpus_metrics(partial_pairs, keep_punctuation),
+            "full": full,
+            "chunk_minus_full_cer": _delta(chunk["cer"], full["cer"]),
+            "chunk_vs_full_cer": corpus_metrics(gap_pairs, keep_punctuation)["cer"],
+        }
+
+    result: Dict[str, Any] = {"per_model": per_model}
+    if "base" in per_model and "finetuned" in per_model:
+        base, tuned = per_model["base"], per_model["finetuned"]
+        result["delta"] = {
+            "chunk_cer": _delta(tuned["chunk"]["cer"], base["chunk"]["cer"]),
+            "full_cer": _delta(tuned["full"]["cer"], base["full"]["cer"]),
+            "chunk_minus_full_cer": _delta(
+                tuned["chunk_minus_full_cer"], base["chunk_minus_full_cer"]
+            ),
+            "chunk_vs_full_cer": _delta(
+                tuned["chunk_vs_full_cer"], base["chunk_vs_full_cer"]
+            ),
+        }
+    return result
+
+
+def summarise_unreferenced(
+    clip: EvalClip,
+    decodes: Dict[str, Dict[str, ClipDecode]],
+    keep_punctuation: bool,
+) -> Dict[str, Any]:
+    """Score one clip that has no ground truth.
+
+    The base model's full-attention decode stands in for the reference, so
+    ``drift_cer`` measures how far the finetune moved this clip's offline
+    transcript - not how correct either transcript is.
+
+    Args:
+        clip: The clip.
+        decodes: ``{model_name: {clip_key: ClipDecode}}``.
+        keep_punctuation: Passed to the scorers.
+
+    Returns:
+        Per-model chunk-vs-full gaps, the drift, and the decodes themselves.
+    """
+    base = decodes["base"][clip.key]
+    entry: Dict[str, Any] = {
+        "key": clip.key,
+        "path": str(clip.path),
+        "language": clip.language,
+        "reference_source": "base model full-attention decode (no ground truth)",
+        "per_model": {},
+    }
+    for name, by_key in decodes.items():
+        decode = by_key[clip.key]
+        entry["per_model"][name] = {
+            "full": decode.full,
+            "chunk": decode.chunk,
+            "chunk_last_partial": decode.chunk_last_partial,
+            "chunk_vs_full_cer": pair_cer(decode.full, decode.chunk, keep_punctuation),
+        }
+
+    if "finetuned" in decodes:
+        tuned = decodes["finetuned"][clip.key]
+        entry["drift_cer_vs_base_full"] = pair_cer(base.full, tuned.full, keep_punctuation)
+        entry["gap_delta"] = _delta(
+            entry["per_model"]["finetuned"]["chunk_vs_full_cer"],
+            entry["per_model"]["base"]["chunk_vs_full_cer"],
+        )
+    else:
+        entry["drift_cer_vs_base_full"] = 0.0
+        entry["gap_delta"] = None
+    return entry
+
+
+def build_examples(
+    clips: Sequence[EvalClip],
+    decodes: Dict[str, Dict[str, ClipDecode]],
+    count: int,
+) -> List[Dict[str, Any]]:
+    """Pick a few clips to show side by side for eyeballing.
+
+    Args:
+        clips: Candidate clips, in manifest order.
+        decodes: ``{model_name: {clip_key: ClipDecode}}``.
+        count: How many to include.
+
+    Returns:
+        One row per clip with the reference and both models' decodes.
+    """
+    examples: List[Dict[str, Any]] = []
+    for clip in list(clips)[:count]:
+        row: Dict[str, Any] = {
+            "key": clip.key,
+            "scope": clip.scope,
+            "reference": clip.reference,
+        }
+        for name, by_key in decodes.items():
+            decode = by_key[clip.key]
+            row[f"{name}_full"] = decode.full
+            row[f"{name}_chunk"] = decode.chunk
+            row[f"{name}_chunk_last_partial"] = decode.chunk_last_partial
+        examples.append(row)
+    return examples
+
+
+# --------------------------------------------------------------------- stdout
+
+
+def _fmt(value: Optional[float], width: int = 9) -> str:
+    """Format a metric for the fixed-width summary.
+
+    Args:
+        value: The metric, or ``None`` when it was not computed.
+        width: Column width.
+
+    Returns:
+        A right-aligned string; ``"-"`` for ``None``.
+    """
+    return f"{'-':>{width}}" if value is None else f"{value:>{width}.4f}"
+
+
+def _signed(value: Optional[float], width: int = 9) -> str:
+    """Format a delta with an explicit sign.
+
+    Args:
+        value: The delta, or ``None``.
+        width: Column width.
+
+    Returns:
+        A right-aligned signed string; ``"-"`` for ``None``.
+    """
+    return f"{'-':>{width}}" if value is None else f"{value:>+{width}.4f}"
+
+
+def _clip_line(clip: Dict[str, Any]) -> str:
+    """One summary line for a clip that has no ground truth.
+
+    Args:
+        clip: An entry produced by :func:`summarise_unreferenced`.
+
+    Returns:
+        A line giving the drift from the base model's offline transcript and the
+        chunk-vs-full gap of each model that was run.
+    """
+    gaps = " ".join(
+        f"{name}={_fmt(values['chunk_vs_full_cer'], 0)}"
+        for name, values in clip["per_model"].items()
+    )
+    return (
+        f"{clip['key']:<22}drift vs base full = "
+        f"{_fmt(clip['drift_cer_vs_base_full'], 0)}   chunk-vs-full gap: {gaps}"
+    )
+
+
+def print_summary(payload: Dict[str, Any], warnings_: Sequence[str]) -> None:
+    """Print the compact per-epoch summary.
+
+    Leads with the Japanese metrics, because those alone decide which checkpoint
+    wins, and ends with a single named selection number so successive epochs can
+    be diffed by eye or by ``grep``.
+
+    Args:
+        payload: The assembled report.
+        warnings_: Messages collected during the run.
+    """
+    geometry = payload["geometry"]
+    models = payload["models"]
+    line = "=" * 68
+
+    print(line)
+    print("chunk-gap eval - Japanese-specialised finetune")
+    print(line)
+    print(f"device      : {payload['device']}")
+    print(
+        "geometry    : idx{geometry_index} window={window_frames} "
+        "stride={stride_frames} pad_left={pad_left_frames} "
+        "pad_right={pad_right_frames} look_back={encoder_look_back} "
+        "({lookahead_ms:.0f} ms lookahead)".format(**geometry)
+    )
+    print(f"base        : {models['base']['dir']}")
+    print(f"finetuned   : {models['finetuned']['checkpoint'] or '(none - base only)'}")
+
+    val = payload["japanese"]["val"]
+    print()
+    print("-- JAPANESE (selection axis) " + "-" * 39)
+    metrics = val.get("metrics", {}).get("per_model")
+    if not metrics:
+        print(f"val set     : {val['jsonl']} - UNAVAILABLE, no selection signal")
+    else:
+        print(f"val set     : {val['jsonl']}  ({val['num_clips']} clips)")
+        delta = val["metrics"].get("delta", {})
+        base = metrics["base"]
+        # Left as ``None`` when no checkpoint was given, so the column reads "-"
+        # rather than repeating the base numbers under a "finetuned" heading.
+        tuned = metrics.get("finetuned")
+        print(f"{'':22}{'base':>9}{'finetuned':>11}{'delta':>10}")
+        rows = (
+            ("chunk CER", lambda m: m["chunk"]["cer"], "chunk_cer"),
+            ("full-attn CER", lambda m: m["full"]["cer"], "full_cer"),
+            (
+                "chunk-full gap",
+                lambda m: m["chunk_minus_full_cer"],
+                "chunk_minus_full_cer",
+            ),
+            (
+                "chunk vs full CER",
+                lambda m: m["chunk_vs_full_cer"],
+                "chunk_vs_full_cer",
+            ),
+            ("chunk WER", lambda m: m["chunk"]["wer"], None),
+        )
+        for label, pick, delta_key in rows:
+            delta_value = delta.get(delta_key) if delta_key else None
+            print(
+                f"{label:<22}{_fmt(pick(base))}"
+                f"{_fmt(pick(tuned) if tuned else None, 11)}"
+                f"{_signed(delta_value, 10)}"
+            )
+        print("  (full-attn CER is the forgetting check: Japanese only)")
+
+    for clip in payload["japanese"]["clips"]:
+        print(_clip_line(clip) + "   (informational)")
+
+    reference_only = payload.get("reference_only", {}).get("clips", [])
+    if reference_only:
+        print()
+        print("-- REFERENCE ONLY (not a selection criterion) " + "-" * 22)
+        print(f"   {REFERENCE_ONLY_NOTE}")
+        for clip in reference_only:
+            print(_clip_line(clip))
+
+    selection = payload["selection"]
+    print()
+    print(line)
+    if selection["value"] is None:
+        print(f"BEST-CHECKPOINT SIGNAL: unavailable - {selection['note']}")
+    else:
+        print(
+            f"BEST-CHECKPOINT SIGNAL: {selection['metric']} = "
+            f"{selection['value']:.4f}  (lower is better)"
+        )
+    print(line)
+
+    for message in warnings_:
+        print(f"[warn] {message}", file=sys.stderr)
+
+
+# ----------------------------------------------------------------------- main
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse the command line.
+
+    Args:
+        argv: Argument vector, defaulting to ``sys.argv[1:]``.
+
+    Returns:
+        The parsed namespace.
+    """
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="finetuned model.pt; omit to evaluate the base model alone",
+    )
+    parser.add_argument(
+        "--base",
+        type=Path,
+        default=DEFAULT_BASE_DIR,
+        help=f"base model directory (default: {DEFAULT_BASE_DIR})",
+    )
+    parser.add_argument(
+        "--val-jsonl",
+        type=Path,
+        default=DEFAULT_VAL_JSONL,
+        help=f"held-out Japanese manifest (default: {DEFAULT_VAL_JSONL})",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="evaluate only the first N val clips, for fast per-epoch runs",
+    )
+    parser.add_argument(
+        "--device",
+        default="mps",
+        choices=("mps", "cpu"),
+        help="torch device (default: mps)",
+    )
+    parser.add_argument("--out", type=Path, default=None, help="write the JSON report here")
+    parser.add_argument(
+        "--geometry-index",
+        type=int,
+        default=DEFAULT_GEOMETRY_INDEX,
+        choices=range(len(TRAINING_CHUNK_CONFIG["chunk_size"])),
+        help=(
+            "which finetune_chunk.sh chunk geometry to decode with "
+            f"(default: {DEFAULT_GEOMETRY_INDEX}, the 720 ms window)"
+        ),
+    )
+    parser.add_argument(
+        "--language",
+        default="ja",
+        help="SenseVoice language tag for clips whose manifest omits one",
+    )
+    parser.add_argument(
+        "--use-itn",
+        action="store_true",
+        help=(
+            "request inverse text normalisation; off by default because the "
+            "manifest targets are plain text and ITN punctuation would be "
+            "scored as insertions"
+        ),
+    )
+    parser.add_argument(
+        "--keep-punctuation",
+        action="store_true",
+        help="score punctuation instead of stripping it before CER/WER",
+    )
+    parser.add_argument(
+        "--ja-clip",
+        type=Path,
+        default=None,
+        help="Japanese sample clip; defaults to the bundled ja.mp3 if present",
+    )
+    parser.add_argument(
+        "--zh-clip",
+        type=Path,
+        default=DEFAULT_ZH_CLIP,
+        help="Chinese reference-only clip (informational, never a selection criterion)",
+    )
+    parser.add_argument(
+        "--num-examples",
+        type=int,
+        default=5,
+        help="side-by-side example decodes to include in the report (default: 5)",
+    )
+    return parser.parse_args(argv)
+
+
+def collect_clips(
+    args: argparse.Namespace, report: Report
+) -> Tuple[List[EvalClip], List[EvalClip], List[EvalClip]]:
+    """Assemble every clip to decode.
+
+    Args:
+        args: Parsed command line.
+        report: Collects warnings about anything skipped.
+
+    Returns:
+        ``(val_clips, ja_clips, reference_clips)``.
+    """
+    val_clips, notes = load_val_clips(
+        args.val_jsonl, args.limit, args.language, args.use_itn
+    )
+    for note in notes:
+        report.warn(note)
+
+    ja_clips: List[EvalClip] = []
+    ja_path, ja_notes = resolve_ja_clip(args.ja_clip)
+    for note in ja_notes:
+        report.warn(note)
+    if ja_path is not None:
+        ja_clips.append(
+            EvalClip(
+                key="ja.mp3",
+                path=ja_path,
+                reference=None,
+                language="ja",
+                use_itn=args.use_itn,
+            )
+        )
+
+    reference_clips: List[EvalClip] = []
+    if args.zh_clip is not None and args.zh_clip.exists():
+        reference_clips.append(
+            EvalClip(
+                key="zh_sample.wav",
+                path=args.zh_clip,
+                reference=None,
+                language="auto",
+                use_itn=args.use_itn,
+                scope="reference",
+            )
+        )
+    elif args.zh_clip is not None:
+        report.warn(f"Chinese reference clip not found: {args.zh_clip}, skipped")
+
+    return val_clips, ja_clips, reference_clips
+
+
+def decode_all(
+    model_dir: Path,
+    checkpoint: Optional[Path],
+    config: StreamingConfig,
+    clips: Sequence[EvalClip],
+    audio: Dict[str, np.ndarray],
+    report: Report,
+) -> Dict[str, ClipDecode]:
+    """Load one model, decode every clip with it, then release it.
+
+    Args:
+        model_dir: Base model directory.
+        checkpoint: Finetuned weights, or ``None`` for the base model.
+        config: Streaming configuration; mutated per clip for language/ITN.
+        clips: Clips to decode.
+        audio: Pre-decoded waveforms keyed by clip key.
+        report: Collects per-clip failures.
+
+    Returns:
+        ``{clip_key: ClipDecode}``, omitting clips whose decode raised.
+    """
+    recogniser = CheckpointRecogniser(model_dir, config, checkpoint)
+    decodes: Dict[str, ClipDecode] = {}
+    try:
+        for index, clip in enumerate(clips, start=1):
+            label = "base" if checkpoint is None else "finetuned"
+            print(
+                f"  [{label}] {index}/{len(clips)} {clip.key}",
+                end="\r",
+                file=sys.stderr,
+            )
+            try:
+                decodes[clip.key] = recogniser.decode_clip(clip, audio[clip.key])
+            except Exception as exc:  # noqa: BLE001 - one bad clip must not kill the run
+                report.warn(f"{label}: decode failed for {clip.key}: {exc}")
+        print(" " * 72, end="\r", file=sys.stderr)
+    finally:
+        release(recogniser)
+    return decodes
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Run the evaluation.
+
+    Args:
+        argv: Argument vector, defaulting to ``sys.argv[1:]``.
+
+    Returns:
+        Process exit code: ``0`` on success, ``1`` when nothing could be
+        evaluated at all.
+    """
+    args = parse_args(argv)
+    report = Report()
+
+    if not args.base.exists():
+        print(f"base model directory not found: {args.base}", file=sys.stderr)
+        return 1
+    if args.checkpoint is not None and not args.checkpoint.exists():
+        print(f"checkpoint not found: {args.checkpoint}", file=sys.stderr)
+        return 1
+
+    config, geometry = build_config(args)
+    val_clips, ja_clips, reference_clips = collect_clips(args, report)
+    all_clips = [*val_clips, *ja_clips, *reference_clips]
+    if not all_clips:
+        print("nothing to evaluate: no val manifest and no sample clips", file=sys.stderr)
+        for message in report.warnings:
+            print(f"[warn] {message}", file=sys.stderr)
+        return 1
+
+    # Decoded once and shared by both models, so the two see bit-identical
+    # input and any difference is the weights.
+    audio: Dict[str, np.ndarray] = {}
+    usable: List[EvalClip] = []
+    for clip in all_clips:
+        try:
+            audio[clip.key] = load_audio(clip.path, config.sample_rate)
+        except RuntimeError as exc:
+            report.warn(str(exc))
+            continue
+        usable.append(clip)
+    val_clips = [c for c in val_clips if c.key in audio]
+    ja_clips = [c for c in ja_clips if c.key in audio]
+    reference_clips = [c for c in reference_clips if c.key in audio]
+    if not usable:
+        print("nothing to evaluate: no clip could be decoded", file=sys.stderr)
+        for message in report.warnings:
+            print(f"[warn] {message}", file=sys.stderr)
+        return 1
+
+    decodes: Dict[str, Dict[str, ClipDecode]] = {
+        "base": decode_all(args.base, None, config, usable, audio, report)
+    }
+    if args.checkpoint is not None:
+        decodes["finetuned"] = decode_all(
+            args.base, args.checkpoint, config, usable, audio, report
+        )
+
+    # A clip only counts if every loaded model decoded it, so the columns of the
+    # comparison are always over the same set.
+    complete = {c.key for c in usable if all(c.key in d for d in decodes.values())}
+    val_clips = [c for c in val_clips if c.key in complete]
+    ja_clips = [c for c in ja_clips if c.key in complete]
+    reference_clips = [c for c in reference_clips if c.key in complete]
+
+    val_metrics = summarise_val(val_clips, decodes, args.keep_punctuation)
+    selection_value = (
+        val_metrics["per_model"]
+        .get("finetuned", val_metrics["per_model"].get("base", {}))
+        .get("chunk", {})
+        .get("cer")
+        if val_metrics
+        else None
+    )
+
+    payload: Dict[str, Any] = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "device": config.device,
+        "geometry": geometry,
+        "scoring": {
+            "cer": "corpus-level Levenshtein over NFKC-normalised characters",
+            "punctuation": "kept" if args.keep_punctuation else "stripped",
+            "whitespace": "stripped",
+            "rich_tags": "stripped",
+            "wer_note": (
+                "whitespace tokens; near-meaningless for unsegmented Japanese "
+                "and Chinese - read CER"
+            ),
+        },
+        "models": {
+            "base": {"dir": str(args.base), "checkpoint": None},
+            "finetuned": {
+                "dir": str(args.base),
+                "checkpoint": str(args.checkpoint) if args.checkpoint else None,
+            },
+        },
+        "japanese": {
+            "note": "the selection axis: checkpoint choice keys off these numbers only",
+            "val": {
+                "jsonl": str(args.val_jsonl),
+                "num_clips": len(val_clips),
+                "metrics": val_metrics,
+            },
+            "clips": [
+                summarise_unreferenced(c, decodes, args.keep_punctuation)
+                for c in ja_clips
+            ],
+        },
+        "reference_only": {
+            "note": REFERENCE_ONLY_NOTE,
+            "clips": [
+                summarise_unreferenced(c, decodes, args.keep_punctuation)
+                for c in reference_clips
+            ],
+        },
+        "selection": {
+            "metric": "ja_val_chunk_cer",
+            "value": selection_value,
+            "model": "finetuned" if args.checkpoint else "base",
+            "note": (
+                "corpus CER of the complete chunk-mode decode on the held-out "
+                "Japanese val set; lower is better"
+                if selection_value is not None
+                else "no Japanese val set was available"
+            ),
+        },
+        "examples": build_examples(
+            [*val_clips, *ja_clips, *reference_clips], decodes, args.num_examples
+        ),
+        "warnings": report.warnings,
+    }
+
+    print_summary(payload, report.warnings)
+
+    if args.out is not None:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        print(f"\nwrote {args.out}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
