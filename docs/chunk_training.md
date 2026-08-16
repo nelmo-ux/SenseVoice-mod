@@ -332,6 +332,280 @@ are finally answerable.
   `finetune_chunk.sh` does not, and so remains vulnerable to two concurrent
   runs shredding each other's checkpoints.
 
+## The 300-hour cluster finetune (H100 / Slurm)
+
+> Status: **runs completed.** Two full training runs finished on an H100 NVL
+> cluster and both beat the MPS baseline's chunk CER. See "Results" below.
+
+Same scope note as the MPS section: **Japanese-specialised, multilingual
+retention is not a maintained property.**
+
+`finetune_chunk_slurm.sh` is the cluster sibling of `finetune_chunk_mps.sh`. It
+follows the GPU path of `finetune_chunk.sh` (torchrun onto funasr's
+`bin/train_ds.py`) and keeps the same chunk geometry, `OUTPUT_DIR` lock and
+preflight, so the two runs stay comparable.
+
+### Cluster facts you cannot guess
+
+Every item here was found by a job failing, and none of it is discoverable from
+the site documentation. If you are adapting this to another Slurm site, these
+are the assumptions to re-test rather than inherit.
+
+- **The scheduler discards the batch script's exit code.** A job whose entire
+  body is `exit 42` is recorded by `sacct` as `COMPLETED ExitCode 0:0`. *Every*
+  job reports success, including one that crashed in its first minute. Job state
+  is therefore worthless as a success signal. `finetune_chunk_slurm.sh` writes
+  `${OUTPUT_DIR}/.job_status` and ends its log with `SENSEVOICE_JOB_OK` or
+  `SENSEVOICE_JOB_FAILED rc=<n>`; those are the only trustworthy outcomes. This
+  is also why `scripts/submit_chunk_chain.sh` chains with `afterany` — `afterok`
+  would fire unconditionally and hide a failed link.
+- **`/data` is unusable as a container mount point.** The site mounts a local
+  scratch filesystem (`/dev/md0`) there *after* the bind mounts are applied, so
+  a `-v host:/data` silently resolves to someone else's data. It fails
+  invisibly: the directory exists, is readable, and lists plausible content. The
+  corpus is mounted at `/corpus` for this reason.
+- **`SLURM_*` variables are unset inside the container**, so GPU count is
+  derived from `CUDA_VISIBLE_DEVICES` (which *is* set) and never from
+  `SLURM_GPUS_PER_TASK`. Ordinary environment variables *do* reach the
+  container, so `SMOKE=1 sbatch ...` works; script *arguments* do not.
+- **Slurm executes a spool copy of the batch script**, so `BASH_SOURCE[0]`
+  points at `/tmp/slurm/...`, not the repo. Export `WORKSPACE=/workspace`.
+- **The manifest stores absolute container paths.** Changing the mount point
+  means regenerating the manifests, not just remounting.
+- The site `sbatch` is a wrapper that reads `#SBATCH --container=` and
+  `#CONTAINER` lines and docker-pulls the image before submitting. The verified
+  GRES syntax is `--gpus-per-task=N` with `--nodes=1 --ntasks=1`.
+
+### Image
+
+`docker/Dockerfile.cluster`, built on the site's NGC PyTorch mirror.
+
+**The NGC base ships no torchaudio at all**, and funasr needs it
+(`funasr/frontends/wav_frontend.py` imports `torchaudio.compliance.kaldi`).
+Installing torchaudio alone against NGC's torch fails at load time —
+`libtorchaudio.so: undefined symbol: _ZNK5torch8autograd4Node4nameEv` — because
+NGC builds torch with a custom ABI that no PyPI torchaudio wheel links against.
+The image therefore installs a **matched PyPI pair**, `torch==2.13.0` +
+`torchaudio==2.11.0` (cu126), replacing NGC's torch. This is not a compromise:
+those are the versions in the project's own `.venv` that produced the MPS
+baseline, and they satisfy `requirements.txt`, whereas NGC's torch 2.6 is
+*older* than what this project targets. NGC's `torchvision` and `torch_tensorrt`
+are uninstalled because they hard-pin the replaced torch.
+
+Two base-image quirks are worked around: `pip check` crashes on malformed
+`.egg` wheel tags (reproduced in the pristine image), so a targeted
+`importlib.metadata` requirement check replaces it; and a dead
+`extra-index-url` costs ~16 s of DNS retries per package, so it is stripped from
+**all five** pip config paths — the base ships the same dead index twice, and
+the user-level copy outranks the global one.
+
+The build verifies `torch.version.cuda`, `kaldi.fbank`, and
+`import funasr.bin.train_ds`. That last check is what caught the missing
+torchaudio, before any job was queued.
+
+### Corpus
+
+300.0 h drawn from the same VisualNovel_Dataset, 24 archives (11.9 GB) across
+**22 studios**. Studio diversity was the selection criterion rather than
+hours-per-byte: filling the budget from the top of an alphabetical listing
+collapses onto two or three studios and narrows speaker, direction and recording
+variety. The 5 archives of the 53.8 h MPS corpus are included, so this corpus is
+a strict superset of the baseline's.
+
+| | clips | hours |
+|---|---|---|
+| train | 196,047 | 282.93 |
+| val | 5,194 | 7.48 |
+
+The split is speaker-disjoint, verified independently of the script by reading
+the emitted manifests: **0 speaker overlap** (450 train / 409 val speakers) and
+**0 audio-path overlap**. 4.7 % of val transcripts also occur in train — these
+are frequent short utterances ("はい", "ええ"), not leakage, since audio and
+speakers are disjoint; they make the CER slightly easier and are noted here
+rather than removed.
+
+`--limit-hours 300` cut the corpus at exactly 300.000 h, skipping 12,997
+surplus clips. `dropped_missing_audio: 14,112` is an upstream dataset property,
+not a truncated extraction: every one of the 24 archives was verified with 7z
+entry count == on-disk file count (delta 0).
+
+Fingerprints of the manifests these runs used:
+
+```
+train.jsonl     ba360aee120794e301e86477c98ba7b59c6cc8ce02c13508f2a0b7cde021d3d6
+val.jsonl       a4e3167e56d09f954b46addb58a793d4dc9502f45e297a9ba29ef246038c190e
+manifest.json   30adf4d284f6982c9b2d7b9072b3ed1534e48966503fefd21bf99fed6d9d52c0
+```
+
+### Run configuration
+
+Batch size has **two** limits and the smaller one binds. With `BATCH_TOKENS`
+6000 and `MAX_SAMPLES_PER_STEP` 12, a mean clip of 5.20 s (520 units) means
+12 clips ≈ 6,240 units — the two are already balanced, so raising
+`BATCH_TOKENS` alone changes nothing at all. Both must move together.
+
+Measured on one H100 NVL (94 GB), on the real corpus:
+
+| tokens / samples | step time | peak VRAM | throughput |
+|---|---|---|---|
+| 24,000 / 48 | 0.19 s | 32.3 GB (34 %) | 1,263× realtime |
+| 48,000 / 96 | 0.30 s | 72.9 GB (78 %) | 1,600× realtime |
+
+Doubling the batch bought 27 % throughput — already well into diminishing
+returns — while leaving little headroom for an outlier batch of long clips, so
+**24,000 / 48** was chosen. One epoch is ~15 min on a single GPU; a 4-epoch run
+on 2 GPUs takes **~45 min**. The 24 h wall clock and the resume-chain machinery
+built for this run were never needed.
+
+`warmup_steps` deserves attention. It is inherited from the base model's
+`config.yaml` as 25,000, and `warmuplr` is Noam-style — it peaks at
+`warmup` then decays as `step^-0.5`. The MPS run's 12,720 total steps never
+reached the peak, so it effectively trained on a linear ramp topping out near
+1.0e-4 rather than at its nominal 2e-4. These runs set
+`WARMUP_STEPS=680` (~8 % of 8,488 steps) so the schedule actually peaks and
+decays.
+
+**The learning rate was chosen by measurement, not by rule.** Because a run
+costs under an hour, two conditions were trained in parallel within the QOS
+budget: LR 2e-4 (baseline-equivalent) and LR 6e-4 (square-root scaling of the
+8× larger effective batch). Square root, not linear scaling, because the failure
+mode to fear when adapting a pretrained checkpoint is catastrophic forgetting;
+linear scaling would have suggested 3.2e-3.
+
+### Results
+
+Corpus-level CER on held-out Japanese, geometry index 1
+(`chunk_size=12, stride=10, pad_right=2`, 120 ms lookahead), decoded in fp32
+with TF32 explicitly disabled (`allow_tf32=false`, `cudnn.deterministic=true`)
+so the numbers are comparable with the fp32 baseline. Selection sweep, 800 clips
+of the val set, identical subset for every checkpoint:
+
+| run | checkpoint | chunk CER | full CER | gap |
+|---|---|---|---|---|
+| base (published) | — | 0.3880 | 0.1663 | 0.2217 |
+| LR 6e-4 | **epoch 4 (best)** | **0.1624** | **0.1489** | 0.0135 |
+| LR 6e-4 | epoch 3 | 0.1648 | 0.1569 | 0.0079 |
+| LR 2e-4 | epoch 4 (best) | 0.1655 | 0.1521 | 0.0134 |
+| LR 2e-4 | epoch 2 | 0.1656 | 0.1533 | 0.0123 |
+| LR 2e-4 | epoch 3 | 0.1680 | 0.1570 | 0.0110 |
+| LR 6e-4 | epoch 2 | 0.1717 | 0.1613 | 0.0104 |
+
+All eight checkpoints beat the MPS baseline's 0.1739 chunk CER on this subset.
+
+The top candidates were then re-scored on the **complete 5,194-clip val set**.
+These are the numbers to quote:
+
+| model | chunk CER | full CER | gap | chunk vs full |
+|---|---|---|---|---|
+| base (published) | 0.4024 | 0.1781 | 0.2243 | 0.3284 |
+| LR 2e-4, epoch 4 | **0.1679** | 0.1584 | **0.0095** | — |
+| LR 6e-4, epoch 4 | 0.1687 | **0.1550** | 0.0138 | 0.0831 |
+
+Against the base model on the same val set — the only strictly like-for-like
+comparison available — **chunk CER falls 58 % relative** (0.4024 → 0.1679) and
+**the chunk-versus-full gap closes 96 %** (0.2243 → 0.0095).
+
+**The two learning rates are indistinguishable, and the 800-clip sweep said
+otherwise.** On the subset, 6e-4 led 2e-4 by 1.9 % relative; on the full set the
+order reverses and the margin is 0.5 % (0.1679 vs 0.1687). A 0.5 % gap is not
+something 800 clips can resolve, so the subset ranking between these two was
+noise — it was adequate for separating good checkpoints from bad (the spread
+there was 0.1624–0.1717) but not for splitting the top two. **Treat the
+selection sweep as a filter, not as a verdict**, and re-score finalists on the
+whole set before claiming a winner. The square-root LR scaling neither helped
+nor hurt at this batch size.
+
+The two differ in *where* they are better, and that is a real choice rather than
+noise: 2e-4 has the smaller chunk-vs-full gap (0.0095), 6e-4 retains more
+full-attention quality (0.1550 vs 0.1584). Selection on chunk CER alone picks
+2e-4 by a hair; picking 6e-4 to minimise forgetting is equally defensible.
+
+**Adopted: LR 2e-4, epoch 4.** Two reasons. The pre-registered selection metric
+is chunk CER (`eval_chunk_gap.py` records it as `ja_val_chunk_cer` in every
+report), and switching criteria *after* seeing the results — immediately after
+a subset ranking had already misled us once — is how a tie gets talked into
+whichever answer is convenient. And the product metric here is streaming
+quality, which the smaller chunk-vs-full gap serves directly. The full-CER
+advantage of 6e-4 is real but small enough to accept.
+
+**No catastrophic forgetting.** Full-attention CER at the adopted checkpoint is
+0.1584 against the base model's 0.1781 on the same val set. Streaming quality
+did not come out of offline quality.
+
+Extract the deployable weights with:
+
+```
+python scripts/extract_weights.py <output_dir>/model.pt.ep4 weights_ep4.pt
+```
+
+which drops optimizer state (2,679 MiB → 893 MiB) and writes a flat
+`OrderedDict` matching the published `model.pt` key-for-key, so it is a drop-in
+replacement.
+
+**No catastrophic forgetting.** Full-attention CER at the winning checkpoint is
+0.1489, better than the base model's 0.1663 and marginally better than the MPS
+baseline's 0.1494. The chunk-mode gain did not come out of offline quality.
+
+Note that epoch 3 of the LR 6e-4 run has the *smallest* gap (0.0079) but a worse
+full CER. Selection is on chunk CER, which is the quantity that matters for
+streaming; the gap is diagnostic, not the objective.
+
+### How this compares to the MPS baseline
+
+The two numbers are **not measured on the same val set** — each is the held-out
+val of its own corpus, and the 300 h val is larger and drawn from 22 studios
+rather than 5. Treat the comparison as directional. The differences that matter:
+
+| | MPS baseline | cluster run |
+|---|---|---|
+| corpus | 53.8 h, 5 archives | 300.0 h, 24 archives, 22 studios |
+| val | 772 clips | 5,194 clips |
+| device / precision | MPS, fp32 | H100 NVL, bf16 |
+| effective batch | 6,000 units | 48,000 units (2 GPUs × 24,000) |
+| total steps | 12,720 | 8,488 |
+| warmup | 25,000 (never reached; effective peak ~1.0e-4) | 680 (peaks, then decays) |
+| LR | 2e-4 | 2e-4 and 6e-4 compared |
+| wall clock | 4.5 h | ~45 min per condition |
+
+An earlier plan to re-score the winning checkpoint on the *old* 772-clip val was
+abandoned after measurement: because the new corpus is a superset, **547 of
+those 772 clips (70.9 %) are in the new training set**. Scoring there would have
+been scoring on training data.
+
+### Known gaps from this run
+
+- **`avg_nbest_model` and `keep_nbest_models` conflict.** Pruning runs before
+  averaging, so the averager looks for a checkpoint that pruning already
+  deleted, logs `No checkpoints found for averaging`, and produces no
+  `model.pt.avg1`. Reproduced identically in the smoke run and both full runs.
+  Weights are recovered with `scripts/extract_weights.py` instead
+  (2,679 MiB → 893 MiB, optimizer state dropped).
+- `eval_chunk_gap.py` re-scores the base model once per checkpoint, roughly
+  doubling sweep time. A cached base result or a multi-checkpoint mode would
+  halve it.
+- The `#CONTAINER` mount lines and the image reference in
+  `finetune_chunk_slurm.sh` cannot be environment variables: the site wrapper
+  parses them as text before bash runs. They are the only settings in that file
+  which are not overridable, and they ship as placeholders (see below).
+
+### Adapting this to your site
+
+Four lines in `finetune_chunk_slurm.sh` and one in `docker/Dockerfile.cluster`
+carry placeholders and **must be edited before first use**:
+
+| placeholder | what it is | where to get it |
+|---|---|---|
+| `<cluster-registry>` | registry hostname the site's `sbatch` wrapper pulls from | your cluster's container registry (this site mirrors NGC there); `nvcr.io` works for the base image if you have NGC access directly |
+| `<project>` | registry namespace you can push to | your registry account |
+| `<user>` | filesystem account owning `/home/share/<user>` | `whoami` on the login node |
+
+The real values for the runs reported here are internal to the cluster and are
+deliberately not published: this repository is public, and an internal hostname
+paired with a valid account identifier is attack surface that buys an outside
+reader nothing. `finetune_chunk_slurm.sh` fails in preflight — through the same
+`FAIL:` path and job-status sentinel as every other check — if the placeholders
+are still unedited, rather than letting you discover it after a queue wait.
+
 ## What is verified, and what is not
 
 Pinned by `tests/test_chunk_streaming_equivalence.py` (small randomly-initialised
