@@ -98,6 +98,14 @@ Usage
 -----
     python scripts/prepare_vn_data.py                     # full ~54 h corpus
     python scripts/prepare_vn_data.py --limit-hours 0.5   # quick trial slice
+    python scripts/prepare_vn_data.py --list-archives     # inventory, then exit
+
+``--list-archives`` is a pure query: it lists every ``.7z`` in the dataset repo
+with its size and a running cumulative total, then exits without downloading,
+extracting or converting anything.  It is how a larger corpus is scoped -- pick
+archives off the listing until the cumulative column reaches the size you want
+and feed those paths back in via ``--archives`` (``--list-format plain`` emits
+exactly that, shell-quoted, one per line).
 """
 
 from __future__ import annotations
@@ -108,6 +116,8 @@ import multiprocessing as mp
 import os
 import random
 import re
+import shlex
+import shutil
 import sys
 import time
 import unicodedata
@@ -132,6 +142,12 @@ HF_TOKEN_FILE = Path.home() / ".cache" / "huggingface" / "token"
 ARCHIVE_PASSWORD_ENV = "VN_ARCHIVE_PASSWORD"
 ARCHIVE_PASSWORD_FILE = Path.home() / ".cache" / "sensevoice" / "vn_archive_password"
 
+# Written into <out-dir>/raw/<stem>/ once an archive has been extracted in full.
+# A dotfile so it can never be mistaken for dataset content: every later stage
+# reads the archive's own index.json, and find_index_json only ever descends
+# into *directories*, so nothing walks this file into a manifest.
+EXTRACT_MARKER_NAME = ".extract_complete"
+
 DEFAULT_ARCHIVES: tuple[str, ...] = (
     "GalGame/Studio e.go!_Meguru Sekai de Towanaru Chikai o!.7z",
     "GalGame/GIGA_Ai Kiss 2.7z",
@@ -141,6 +157,11 @@ DEFAULT_ARCHIVES: tuple[str, ...] = (
 )
 
 DEFAULT_OUT_DIR = REPO_ROOT / "data" / "vn"
+
+# ``--list-format`` defaults to None rather than to this value so that passing
+# it without ``--list-archives`` -- where it would do nothing -- is detectable
+# and can be rejected instead of silently ignored.
+DEFAULT_LIST_FORMAT = "text"
 
 SAMPLE_RATE = 16_000
 MIN_SECONDS = 0.5
@@ -765,6 +786,23 @@ def fmt_duration(seconds: float) -> str:
     return f"{hours}h{minutes:02d}m"
 
 
+def fmt_bytes(num_bytes: float) -> str:
+    """Human-readable byte count, e.g. ``783.8MiB`` / ``1.2GiB``.
+
+    Deliberately contains **no space** between the number and the unit so that
+    the ``--list-archives`` table stays splittable on whitespace: the archive
+    path is the last column and is the only field allowed to contain spaces,
+    which keeps ``awk '{print $2}'`` (bytes) and ``cut``/``awk`` on the path
+    working on the same lines.
+    """
+    size = float(max(0.0, num_bytes))
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024.0:
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024.0
+    return f"{size:.1f}TiB"
+
+
 def eta(done: int, total: int, started: float) -> str:
     if done <= 0:
         return "?"
@@ -773,7 +811,7 @@ def eta(done: int, total: int, started: float) -> str:
 
 
 # --------------------------------------------------------------------------
-# Download
+# HuggingFace auth (shared by the repo listing and the downloader)
 # --------------------------------------------------------------------------
 def read_hf_token() -> str:
     """Load the HF token from the environment or the CLI cache.
@@ -792,6 +830,153 @@ def read_hf_token() -> str:
         f"no HuggingFace token found (checked $HF_TOKEN and {HF_TOKEN_FILE}); "
         "run `huggingface-cli login` first"
     )
+
+
+# --------------------------------------------------------------------------
+# Repo listing (--list-archives)
+# --------------------------------------------------------------------------
+def list_repo_archives(token: str) -> list[tuple[str, int]]:
+    """Every ``.7z`` in ``HF_REPO`` as ``(path, size_bytes)``, sorted by path.
+
+    Uses the Hub API rather than the raw ``resolve/`` URLs the downloader
+    speaks, because only the tree endpoint reports sizes.  Authentication is
+    the *same* token ``read_hf_token`` supplies to the downloader -- the repo
+    is gated, so an anonymous listing 404s.
+
+    ``expand=False`` is deliberate and was verified against the installed
+    huggingface_hub (1.27): the tree endpoint already returns ``size`` on every
+    ``RepoFile``, and ``expand=True`` only adds ``last_commit``/``security`` at
+    the cost of switching to a 50-entries-per-page crawl of a repo this large.
+    Folder entries carry ``size=None`` and are filtered out here.
+    """
+    try:
+        from huggingface_hub import HfApi  # noqa: PLC0415 - listing path only
+        from huggingface_hub.errors import (  # noqa: PLC0415
+            GatedRepoError,
+            HfHubHTTPError,
+            RepositoryNotFoundError,
+        )
+    except ImportError as error:
+        raise SystemExit(
+            "huggingface_hub is required for --list-archives "
+            "(pip install huggingface_hub)"
+        ) from error
+
+    try:
+        entries = HfApi().list_repo_tree(
+            HF_REPO,
+            repo_type="dataset",
+            recursive=True,
+            expand=False,
+            token=token,
+        )
+        archives = [
+            (entry.path, int(entry.size))
+            for entry in entries
+            if getattr(entry, "size", None) is not None
+            and entry.path.lower().endswith(".7z")
+        ]
+    except (GatedRepoError, RepositoryNotFoundError):
+        # A gated repo the token cannot see answers 404, not 403, so these two
+        # are the same actionable situation from the caller's side.
+        raise SystemExit(
+            f"cannot list {HF_REPO}: access denied or repo not found.  This "
+            "dataset is gated -- accept its terms at "
+            f"https://huggingface.co/datasets/{HF_REPO} using the same account "
+            "the token belongs to, then re-run `huggingface-cli login`."
+        ) from None
+    except HfHubHTTPError as error:
+        detail = str(error).replace(token, "***")
+        raise SystemExit(f"failed to list {HF_REPO}: {detail[:400]}") from None
+    except Exception as error:  # noqa: BLE001 - clean, secret-free message
+        # Scrub defensively: transport errors can echo the request that carried
+        # the Authorization header.
+        detail = str(error).replace(token, "***")
+        raise SystemExit(
+            f"failed to list {HF_REPO}: {type(error).__name__}: {detail[:400]}"
+        ) from None
+
+    archives.sort(key=lambda item: item[0])
+    return archives
+
+
+def print_archive_listing(
+    archives: Sequence[tuple[str, int]],
+    list_format: str = "text",
+) -> None:
+    """Print the archive inventory to stdout.
+
+    ``plain`` emits shell-quoted paths only, so the picked subset can be pasted
+    straight after ``--archives``; the paths contain spaces ("GIGA_Ai Kiss
+    2.7z"), so bare output could not survive word splitting.
+
+    ``text`` is the table used to *choose* that subset: every row carries the
+    exact byte count, a human-readable size and the running cumulative total,
+    so a "first N archives under X GB" cut is read straight off the page.
+    Header and summary lines start with ``#`` so ``grep -v '^#'`` leaves pure
+    data, and the path is the final, whitespace-containing column.
+    """
+    if list_format == "plain":
+        for path, _ in archives:
+            print(shlex.quote(path))
+        return
+
+    total = sum(size for _, size in archives)
+    print(f"# {HF_REPO}")
+    print(f"# {'idx':>3}  {'bytes':>13}  {'size':>9}  {'cumulative':>10}  path")
+    cumulative = 0
+    for index, (path, size) in enumerate(archives, start=1):
+        cumulative += size
+        print(
+            f"{index:>5}  {size:>13}  {fmt_bytes(size):>9}  "
+            f"{fmt_bytes(cumulative):>10}  {path}"
+        )
+    print(f"# {len(archives)} archives, {total} bytes total ({fmt_bytes(total)})")
+
+
+# --------------------------------------------------------------------------
+# Download
+# --------------------------------------------------------------------------
+def check_archive_basenames(remote_paths: Sequence[str]) -> None:
+    """Refuse an ``--archives`` list whose entries share a local filename.
+
+    Every stage downstream keys an archive by its *basename*: the download
+    writes ``<out-dir>/archives/<name>``, extraction unpacks to
+    ``<out-dir>/raw/<stem>`` and the manifest records ``<stem>`` as the title.
+    Two repo paths with the same basename therefore collapse onto one local
+    file, and because :func:`download_archive` returns early for a file that is
+    already present, the second archive silently resolves to the first one's
+    contents -- a different corpus than was asked for, with a manifest
+    fingerprint that says otherwise.  ``--list-archives`` spans the whole repo,
+    so pasting paths off it can reach this; ``DEFAULT_ARCHIVES`` cannot.
+
+    Failing here rather than slugifying the local name is deliberate: a
+    slugified layout would not match the archives already on disk, so it would
+    silently re-download an existing corpus instead of resuming it.
+
+    Args:
+        remote_paths: The resolved ``--archives`` list, repo-relative.
+
+    Raises:
+        SystemExit: If two or more entries share a basename, naming them.
+    """
+    by_name: dict[str, list[str]] = {}
+    for remote in remote_paths:
+        by_name.setdefault(Path(remote).name, []).append(remote)
+
+    collisions = {name: paths for name, paths in by_name.items() if len(paths) > 1}
+    if not collisions:
+        return
+
+    lines = [
+        "--archives contains paths that share a filename, which would collapse "
+        "onto one local file and silently build the wrong corpus:"
+    ]
+    for name in sorted(collisions):
+        lines.append(f"  {name}")
+        lines.extend(f"    from {path}" for path in collisions[name])
+    lines.append("Drop or rename the duplicates and re-run.")
+    raise SystemExit("\n".join(lines))
 
 
 def download_archive(
@@ -867,11 +1052,17 @@ def download_archive(
             last_error = error
         if attempt < attempts:
             backoff = 2**attempt
-            log(f"download: {dest.name} attempt {attempt} failed ({last_error}); "
+            # Scrub defensively: transport errors can echo the request that
+            # carried the Authorization header.  No empty-needle guard is
+            # needed the way the extraction path guards its password --
+            # read_hf_token raises rather than returning an empty string.
+            detail = str(last_error).replace(token, "***")
+            log(f"download: {dest.name} attempt {attempt} failed ({detail}); "
                 f"retrying in {backoff}s")
             time.sleep(backoff)
 
-    raise SystemExit(f"failed to download {remote_path}: {last_error}")
+    detail = str(last_error).replace(token, "***")
+    raise SystemExit(f"failed to download {remote_path}: {detail}")
 
 
 def download_all(
@@ -902,6 +1093,25 @@ def download_all(
 # --------------------------------------------------------------------------
 # Extraction
 # --------------------------------------------------------------------------
+def find_archive_password() -> str | None:
+    """Return the configured 7z password, or ``None`` when there is none.
+
+    The tolerant half of :func:`read_archive_password`: the resume check wants
+    the password to *verify* an existing extraction against the archive's entry
+    list, but a machine without the secret must still be able to re-run over an
+    already-extracted corpus rather than dying on a verification it only ever
+    wanted to attempt.
+    """
+    value = os.environ.get(ARCHIVE_PASSWORD_ENV, "").strip()
+    if value:
+        return value
+    if ARCHIVE_PASSWORD_FILE.is_file():
+        value = ARCHIVE_PASSWORD_FILE.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    return None
+
+
 def read_archive_password() -> str:
     """Load the 7z password from the environment or a local file.
 
@@ -913,13 +1123,9 @@ def read_archive_password() -> str:
     The value is published alongside the dataset on HuggingFace; it is supplied
     per-machine rather than committed.
     """
-    value = os.environ.get(ARCHIVE_PASSWORD_ENV, "").strip()
+    value = find_archive_password()
     if value:
         return value
-    if ARCHIVE_PASSWORD_FILE.is_file():
-        value = ARCHIVE_PASSWORD_FILE.read_text(encoding="utf-8").strip()
-        if value:
-            return value
     raise SystemExit(
         f"no archive password found: set ${ARCHIVE_PASSWORD_ENV} or write it to "
         f"{ARCHIVE_PASSWORD_FILE}.  The password is published with the dataset "
@@ -927,18 +1133,211 @@ def read_archive_password() -> str:
     )
 
 
+def count_extracted_files(target: Path) -> int:
+    """Number of real files under ``target``, ignoring dotfiles.
+
+    Dotfiles are excluded on both sides of the completeness comparison (here and
+    in :func:`count_archive_entries`) so that this script's own marker -- and
+    any ``.DS_Store``-style litter the filesystem drops in -- cannot make a
+    complete extraction look over-full and trigger a needless re-extraction.
+    """
+    if not target.is_dir():
+        return 0
+    return sum(
+        1
+        for path in target.rglob("*")
+        if path.is_file() and not path.name.startswith(".")
+    )
+
+
+def count_archive_entries(archive: Path, password: str) -> int | None:
+    """Number of file entries inside ``archive``, or ``None`` if unreadable.
+
+    Reading the entry list needs the password, so ``None`` is the honest answer
+    on the no-password path (and when ``py7zr`` is missing, or the archive
+    cannot be opened).  Callers must treat ``None`` as "cannot verify", never as
+    "zero files".
+    """
+    if not password:
+        return None
+    try:
+        import py7zr  # noqa: PLC0415 - only needed on the extraction path
+
+        with py7zr.SevenZipFile(archive, mode="r", password=password) as handle:
+            entries = handle.list()
+    except ImportError:
+        return None
+    except Exception as error:  # noqa: BLE001 - verification is best-effort
+        detail = str(error).replace(password, "***")
+        log(f"extract: cannot read entry list of {archive.name}: {detail[:200]}")
+        return None
+    return sum(
+        1
+        for entry in entries
+        if not entry.is_directory
+        and not Path(entry.filename).name.startswith(".")
+    )
+
+
+def read_extract_marker(target: Path) -> dict[str, Any] | None:
+    """Load ``target``'s extraction marker; ``None`` if absent or unreadable."""
+    path = target / EXTRACT_MARKER_NAME
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def write_extract_marker(archive: Path, target: Path, file_count: int) -> None:
+    """Record that ``archive`` is extracted into ``target`` in full.
+
+    Deliberately records enough to be falsifiable on the next run: the archive
+    it came from, that archive's size (so a re-published archive invalidates the
+    marker) and the file count the extraction produced.  Never the password.
+    """
+    payload = {
+        "archive": archive.name,
+        "archive_bytes": archive.stat().st_size if archive.is_file() else None,
+        "file_count": file_count,
+        "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    (target / EXTRACT_MARKER_NAME).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def classify_extraction(archive: Path, target: Path, password: str) -> tuple[str, str]:
+    """Decide whether ``target`` holds a *complete* extraction of ``archive``.
+
+    Returns ``(status, message)`` where status is one of:
+
+    ``complete-by-marker``
+        A marker is present and still agrees with the archive and the disk.
+    ``complete-by-count``
+        No marker (the pre-existing corpora), but the file count on disk matches
+        the archive's entry count.  The caller backfills the marker.
+    ``unverified``
+        No marker and no way to read the archive's entry list (no password, no
+        ``py7zr``).  Falls back to the historical "directory exists means done"
+        behaviour, but says so out loud.
+    ``incomplete``
+        A genuine mismatch.  The caller must re-extract.
+
+    Directory existence alone is *not* evidence of completeness: an extraction
+    killed halfway leaves a directory indistinguishable from a finished one, and
+    the pipeline then builds a silently truncated corpus whose only symptom is a
+    raised ``dropped_missing_audio`` count in the filter summary.
+    """
+    on_disk = count_extracted_files(target)
+    marker = read_extract_marker(target)
+    if marker is not None:
+        size = archive.stat().st_size if archive.is_file() else None
+        agrees = (
+            marker.get("archive") == archive.name
+            and marker.get("archive_bytes") == size
+            and marker.get("file_count") == on_disk
+        )
+        if agrees:
+            return (
+                "complete-by-marker",
+                f"extract: already extracted, skipping {archive.name} "
+                f"(marker verified: {on_disk} files)",
+            )
+        return (
+            "incomplete",
+            f"extract: marker disagrees with disk for {archive.name} "
+            f"(marker: archive={marker.get('archive')!r} "
+            f"bytes={marker.get('archive_bytes')} files={marker.get('file_count')}; "
+            f"disk: archive={archive.name!r} bytes={size} files={on_disk}); "
+            f"re-extracting",
+        )
+
+    expected = count_archive_entries(archive, password)
+    if expected is None:
+        return (
+            "unverified",
+            f"extract: already extracted, skipping {archive.name} "
+            f"(no marker and no readable entry list: completeness NOT verified, "
+            f"{on_disk} files on disk)",
+        )
+    if expected == on_disk:
+        return (
+            "complete-by-count",
+            f"extract: already extracted, skipping {archive.name} "
+            f"(no marker; verified by count: {on_disk} files == {expected} "
+            f"archive entries, writing marker)",
+        )
+    return (
+        "incomplete",
+        f"extract: incomplete extraction of {archive.name} "
+        f"(archive holds {expected} files, {on_disk} on disk); re-extracting",
+    )
+
+
+def discard_partial_extraction(target: Path, raw_dir: Path) -> None:
+    """Delete ``target`` -- and only ``target`` -- before a re-extraction.
+
+    ``py7zr`` writes into the directory in place, so re-extracting on top of a
+    partial tree would silently merge the two: files the previous attempt wrote
+    from a *different* archive revision, or paths no longer present in the
+    archive, would survive as orphans and get indexed as if they were current.
+
+    The deletion is scoped hard: ``target`` must be a direct child of ``raw_dir``
+    (i.e. one archive's own raw directory), and never ``raw_dir`` itself.
+    """
+    if target == raw_dir or target.parent != raw_dir:
+        raise SystemExit(
+            f"refusing to delete {target}: not a single archive's raw directory "
+            f"under {raw_dir}"
+        )
+    if not target.is_dir() or not any(target.iterdir()):
+        return
+    log(f"extract: removing stale partial extraction {target}")
+    shutil.rmtree(target)
+
+
+def extraction_password_need(archive: Path, raw_dir: Path) -> str:
+    """How badly the password is needed for ``archive``: skip/verify/extract.
+
+    ``extract`` means the run cannot proceed without the secret; ``verify``
+    means it is only wanted to check an existing extraction and its absence is
+    survivable; ``skip`` means the marker already settles the question.
+    """
+    target = raw_dir / archive.stem
+    if find_index_json(target) is None:
+        return "extract"
+    status, _ = classify_extraction(archive, target, "")
+    if status == "complete-by-marker":
+        return "skip"
+    if status == "incomplete":
+        return "extract"
+    return "verify"
+
+
 def extract_archive(archive: Path, raw_dir: Path, password: str) -> Path:
     """Extract ``archive`` and return the directory holding ``index.json``.
 
-    Idempotent: an already-extracted archive is detected by its ``index.json``,
-    and the password is not even needed on that path.
+    Idempotent, but resume is decided by *verified completeness*, not by the
+    output directory existing: see :func:`classify_extraction`.  An archive with
+    a valid marker is skipped without needing the password at all.
     """
     target = raw_dir / archive.stem
     index = find_index_json(target)
     if index is not None:
-        log(f"extract: already extracted, skipping {archive.name}")
-        return index.parent
+        status, message = classify_extraction(archive, target, password)
+        log(message)
+        if status == "complete-by-count":
+            write_extract_marker(archive, target, count_extracted_files(target))
+            return index.parent
+        if status != "incomplete":
+            return index.parent
 
+    # Either nothing is extracted yet, or what is there is provably incomplete.
+    # Both cases must start from an empty directory.
+    discard_partial_extraction(target, raw_dir)
     target.mkdir(parents=True, exist_ok=True)
     log(f"extract: {archive.name} -> {target}")
     try:
@@ -953,8 +1352,10 @@ def extract_archive(archive: Path, raw_dir: Path, password: str) -> Path:
             "expose the password in the process argv"
         ) from error
     except Exception as error:  # noqa: BLE001 - surface a clean, secret-free message
-        # Scrub defensively: some py7zr errors echo constructor arguments.
-        detail = str(error).replace(password, "***")
+        # Scrub defensively: some py7zr errors echo constructor arguments.  The
+        # empty-password guard matters: "".replace() would splice the mask
+        # between every character of the message.
+        detail = str(error).replace(password, "***") if password else str(error)
         raise SystemExit(
             f"failed to extract {archive.name}: {type(error).__name__}: "
             f"{detail[:400]}"
@@ -963,6 +1364,10 @@ def extract_archive(archive: Path, raw_dir: Path, password: str) -> Path:
     index = find_index_json(target)
     if index is None:
         raise SystemExit(f"no index.json found after extracting {archive.name}")
+    # Only now -- after extractall returned and index.json is on disk -- is the
+    # extraction complete.  An interrupted run never reaches this line, so the
+    # next run cannot mistake its leftovers for a finished extraction.
+    write_extract_marker(archive, target, count_extracted_files(target))
     return index.parent
 
 
@@ -1387,7 +1792,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="+",
         default=list(DEFAULT_ARCHIVES),
         metavar="PATH",
-        help="Override the GalGame/*.7z paths to fetch",
+        help=(
+            "Override the .7z paths to fetch, repo-relative, as printed by "
+            "--list-archives (most but not all live under GalGame/).  Their "
+            "filenames must be unique: the local layout is keyed by basename "
+            f"(default: the {len(DEFAULT_ARCHIVES)} GalGame titles in "
+            "DEFAULT_ARCHIVES)"
+        ),
+    )
+    parser.add_argument(
+        "--list-archives",
+        action="store_true",
+        help=(
+            "List every .7z in the dataset repo (byte size, human size, running "
+            "cumulative total) and exit without downloading or extracting "
+            "anything.  Use it to pick an --archives subset by total size"
+        ),
+    )
+    parser.add_argument(
+        "--list-format",
+        choices=("text", "plain"),
+        default=None,
+        help=(
+            "Output style for --list-archives, which it requires: 'text' is "
+            "the sizes table, 'plain' is shell-quoted paths one per line, "
+            f"ready to paste after --archives (default: {DEFAULT_LIST_FORMAT})"
+        ),
     )
     parser.add_argument(
         "--limit-hours",
@@ -1455,10 +1885,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    # A pure query: it reads the repo tree and exits.  Handled before every
+    # other check so it needs no archive password, creates no --out-dir, and is
+    # unaffected by the pipeline's argument validation.
+    if args.list_archives:
+        print_archive_listing(
+            list_repo_archives(read_hf_token()),
+            args.list_format or DEFAULT_LIST_FORMAT,
+        )
+        return 0
+
+    if args.list_format is not None:
+        raise SystemExit("--list-format only applies to --list-archives")
+
     if args.max_seconds <= args.min_seconds:
         raise SystemExit("--max-seconds must be greater than --min-seconds")
     if args.limit_hours is not None and args.limit_hours <= 0:
         raise SystemExit("--limit-hours must be > 0")
+
+    # Before anything touches the network or the disk: two archives sharing a
+    # basename would collapse onto one local file and build the wrong corpus.
+    check_archive_basenames(args.archives)
 
     out_dir: Path = args.out_dir
     archive_dir = out_dir / "archives"
@@ -1486,14 +1934,21 @@ def main(argv: list[str] | None = None) -> int:
         del token
 
     # 2. extract --------------------------------------------------------
-    # The password is only read if something actually needs extracting, so a
-    # re-run on an already-extracted corpus needs no secret at all.
+    # The password is only read if something actually needs extracting or
+    # verifying, so a re-run on a marker-verified corpus needs no secret at all.
+    # An extraction that still has to be *checked* (no marker: the corpora built
+    # before markers existed) asks for the password too, but tolerates its
+    # absence -- that check is a safety net, not a hard requirement.
     password: str | None = None
     index_paths: list[tuple[str, Path]] = []
     for remote in args.archives:
         archive = downloaded[remote]
-        if find_index_json(raw_dir / archive.stem) is None and password is None:
-            password = read_archive_password()
+        if password is None:
+            need = extraction_password_need(archive, raw_dir)
+            if need == "extract":
+                password = read_archive_password()
+            elif need == "verify":
+                password = find_archive_password()
         root = extract_archive(archive, raw_dir, password or "")
         index_paths.append((archive.stem, root / "index.json"))
     del password

@@ -41,6 +41,7 @@ import importlib.util
 import json
 import os
 import sys
+import urllib.error
 import wave
 from pathlib import Path
 
@@ -1670,3 +1671,572 @@ def test_the_archive_password_is_never_logged(monkeypatch, capsys):
     vn.log(f"extracting with password from ${vn.ARCHIVE_PASSWORD_ENV}")
 
     assert "sentinel-password-value" not in capsys.readouterr().out
+
+
+def test_the_hf_token_is_scrubbed_from_download_transport_errors(
+    monkeypatch, tmp_path, capsys
+):
+    """A transport error that echoes the request must not leak the HF token.
+
+    ``download_archive`` is the one place that attaches ``Authorization:
+    Bearer``, and it puts the exception text into two messages: the retry log
+    line and the final ``SystemExit``.  Today's ``URLError.__str__`` does not
+    embed request headers, so the error is simulated rather than provoked --
+    the point is that the *scrubbing* holds if a dependency ever starts
+    formatting exceptions that way.  Both sites are exercised: ``attempts=2``
+    gives exactly one retry log before the raise.
+    """
+    token = "hf_sentinel-token-value"
+
+    def explode(request, timeout=None):
+        raise urllib.error.URLError(
+            f"connection reset while sending Authorization: Bearer {token}"
+        )
+
+    monkeypatch.setattr(vn.urllib.request, "urlopen", explode)
+    monkeypatch.setattr(vn.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.download_archive(
+            "GalGame/Studio_Title.7z",
+            tmp_path / "Studio_Title.7z",
+            token,
+            attempts=2,
+        )
+
+    raised = str(excinfo.value)
+    logged = capsys.readouterr().out
+    assert token not in raised
+    assert token not in logged
+    # Not just absent -- the surrounding detail must still be there, so the
+    # scrub is proven to be a substitution rather than a dropped message.
+    assert "***" in raised
+    assert "***" in logged
+    assert "attempt 1 failed" in logged
+
+
+# ---------------------------------------------------------------------------
+# --archives basename collision
+#
+# Every stage keys an archive by its basename: the download writes
+# <out-dir>/archives/<name>, extraction unpacks <out-dir>/raw/<stem> and the
+# manifest records <stem> as the title.  Two repo paths sharing a basename
+# therefore collapse onto one local file, and download_archive returns early
+# for a file that already exists -- so the second archive silently resolves to
+# the first one's contents and the manifest fingerprint records a lie.
+# DEFAULT_ARCHIVES cannot reach this; --list-archives spans the whole repo, so
+# paths pasted off it can.
+# ---------------------------------------------------------------------------
+
+
+def test_unique_basenames_are_accepted_unchanged():
+    # The load-bearing case: a resume of an already-downloaded corpus must pass
+    # the guard untouched, so it can go straight to extraction.
+    sixteen = [f"GalGame/Studio {i}_Title {i}.7z" for i in range(16)]
+
+    assert vn.check_archive_basenames(sixteen) is None
+
+
+def test_the_shipped_default_archives_pass_the_guard():
+    assert vn.check_archive_basenames(vn.DEFAULT_ARCHIVES) is None
+
+
+def test_same_basename_in_two_directories_is_refused():
+    with pytest.raises(SystemExit) as excinfo:
+        vn.check_archive_basenames(
+            ["GalGame/Ai Kiss 2.7z", "Voice/Ai Kiss 2.7z", "GalGame/Other.7z"]
+        )
+
+    message = str(excinfo.value)
+    # The colliding remote paths must be named: the whole failure mode is that
+    # you cannot tell from the local layout which archive you actually got.
+    assert "GalGame/Ai Kiss 2.7z" in message
+    assert "Voice/Ai Kiss 2.7z" in message
+    assert "GalGame/Other.7z" not in message
+
+
+def test_a_repeated_path_is_refused():
+    with pytest.raises(SystemExit):
+        vn.check_archive_basenames(["GalGame/A.7z", "GalGame/A.7z"])
+
+
+def test_the_collision_guard_runs_before_any_download(monkeypatch):
+    # Fail-fast is the point: a collision must cost nothing, not surface after
+    # hundreds of GB have been fetched.
+    def explode(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("download attempted despite a basename collision")
+
+    monkeypatch.setattr(vn, "download_all", explode)
+    monkeypatch.setattr(vn, "read_hf_token", explode)
+
+    with pytest.raises(SystemExit):
+        vn.main(["--archives", "GalGame/A.7z", "Other/A.7z"])
+
+
+# ---------------------------------------------------------------------------
+# --list-format
+# ---------------------------------------------------------------------------
+
+
+def test_list_format_without_list_archives_is_an_error(monkeypatch):
+    def explode(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("pipeline started despite an inapplicable flag")
+
+    monkeypatch.setattr(vn, "download_all", explode)
+    monkeypatch.setattr(vn, "read_hf_token", explode)
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.main(["--list-format", "plain"])
+
+    assert "--list-format" in str(excinfo.value)
+
+
+def test_list_format_defaults_to_none_so_it_stays_out_of_the_manifest():
+    # parse_args defaults it to None (not "text") purely so the combination
+    # above is detectable.  Nothing else may observe the difference.
+    assert vn.parse_args([]).list_format is None
+    assert vn.DEFAULT_LIST_FORMAT == "text"
+
+
+def test_the_listing_table_columns_line_up(capsys):
+    vn.print_archive_listing([("GalGame/a.7z", 1), ("X/b.7z", 45678901234)], "text")
+
+    lines = capsys.readouterr().out.splitlines()
+    header, rows = lines[1], lines[2:-1]
+    # The header's leading "# " is part of its first column, so a 3-wide 'idx'
+    # header aligns with a 5-wide index field.  Each column must end where the
+    # header's label ends.
+    for column in ("idx", "bytes", "size", "cumulative"):
+        end = header.index(column) + len(column)
+        for row in rows:
+            # The row's value for this column ends exactly at the header
+            # label's right edge, and a separator follows.
+            assert row[:end] == row[:end].rstrip(), (column, header, row)
+            assert row[end : end + 1] == " ", (column, header, row)
+
+
+# ---------------------------------------------------------------------------
+# Extraction resume: completeness must be *verified*, never assumed
+#
+# The bug this section pins: the resume check used to read "the output
+# directory exists" as "this archive is fully extracted".  An extraction killed
+# partway -- OOM, timeout, evicted node, full disk -- leaves a directory that is
+# indistinguishable from a finished one, so the next run skipped it and the
+# pipeline built a silently truncated corpus.  The only downstream symptom is a
+# raised ``dropped_missing_audio`` in the filter summary, which reads as a
+# dataset quirk rather than as a truncated extraction.
+#
+# Everything below drives real (tiny) password-protected .7z archives built in
+# tmp_path.  The production archives are ~28 GiB each and gated, so they are
+# never touched; py7zr is imported lazily in the script and skipped here the
+# same way when it is not installed.
+# ---------------------------------------------------------------------------
+
+try:  # py7zr is an extraction-only extra: commented out in requirements.txt
+    import py7zr
+except ImportError:  # pragma: no cover - depends on the machine, not the code
+    py7zr = None
+
+# Skipped per test rather than with a module-level importorskip: that would skip
+# this *whole* file, and everything above it is deliberately dependency-free.
+requires_py7zr = pytest.mark.skipif(py7zr is None, reason="py7zr is not installed")
+
+# Not a real credential: the archives below are built by this test, and the
+# value is deliberately non-alnum so the embedded-secret detector above stays
+# meaningful.
+TEST_ARCHIVE_PASSWORD = "vn-test-password"
+
+
+def build_test_archive(
+    tmp_path,
+    name="Studio_Test.7z",
+    clips=3,
+    password=TEST_ARCHIVE_PASSWORD,
+    nested=False,
+):
+    """Build a small encrypted .7z with an ``index.json`` and ``clips`` oggs.
+
+    ``nested`` mirrors the other real archive layout, where everything sits one
+    directory down and ``find_index_json`` has to descend a level.
+
+    Returns ``(archive_path, file_count)`` where ``file_count`` is the number of
+    non-directory entries -- what a complete extraction must put on disk.
+    """
+    source = tmp_path / "source" / Path(name).stem
+    (source / "spk").mkdir(parents=True, exist_ok=True)
+    entries = [
+        {"Speaker": "spk", "Voice": f"v{i:03d}", "Text": f"せりふ{i}"} for i in range(clips)
+    ]
+    (source / "index.json").write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+    for entry in entries:
+        (source / "spk" / f"{entry['Voice']}.ogg").write_bytes(b"OggS-not-really-audio")
+
+    archive = tmp_path / "archives" / name
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    with py7zr.SevenZipFile(archive, "w", password=password) as handle:
+        if nested:
+            handle.writeall(source, arcname=source.name)
+        else:
+            # Written entry by entry rather than with writeall(arcname=".")
+            # because py7zr refuses to extract a "." directory entry.
+            for path in sorted(source.rglob("*")):
+                handle.write(path, arcname=path.relative_to(source).as_posix())
+    return archive, 1 + clips
+
+
+@pytest.fixture
+def extracted(tmp_path):
+    """A freshly extracted archive: ``(archive, raw_dir, target, file_count)``."""
+    archive, file_count = build_test_archive(tmp_path)
+    raw_dir = tmp_path / "raw"
+    root = vn.extract_archive(archive, raw_dir, TEST_ARCHIVE_PASSWORD)
+    target = raw_dir / archive.stem
+    assert root == target
+    return archive, raw_dir, target, file_count
+
+
+def forbid_re_extraction(monkeypatch):
+    """Make any re-extraction attempt fail the test loudly instead of running."""
+
+    def explode(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("re-extracted an extraction that was already complete")
+
+    monkeypatch.setattr(vn, "discard_partial_extraction", explode)
+
+
+# --- the marker itself ------------------------------------------------------
+
+
+@requires_py7zr
+def test_a_successful_extraction_writes_a_completion_marker(extracted):
+    archive, _raw_dir, target, file_count = extracted
+
+    marker = vn.read_extract_marker(target)
+    assert marker is not None, "no marker written: every later run has to re-verify by count"
+    assert marker["archive"] == archive.name
+    assert marker["archive_bytes"] == archive.stat().st_size
+    assert marker["file_count"] == file_count
+    assert marker["completed_at"]
+
+
+@requires_py7zr
+def test_the_marker_never_records_the_password(extracted):
+    _archive, _raw_dir, target, _file_count = extracted
+
+    text = (target / vn.EXTRACT_MARKER_NAME).read_text(encoding="utf-8")
+    assert TEST_ARCHIVE_PASSWORD not in text
+
+
+@requires_py7zr
+def test_the_marker_is_a_dotfile_so_it_cannot_reach_the_manifest(extracted):
+    _archive, _raw_dir, target, file_count = extracted
+
+    # Two independent guards.  The name is a dotfile, and the only place the
+    # raw tree is walked (find_index_json) descends into directories only, so
+    # the marker can never be resolved as an index or counted as dataset audio.
+    assert vn.EXTRACT_MARKER_NAME.startswith(".")
+    assert vn.find_index_json(target) == target / "index.json"
+    assert vn.count_extracted_files(target) == file_count
+
+
+# --- 1. a truncated extraction is detected ----------------------------------
+
+
+@requires_py7zr
+def test_a_truncated_extraction_is_re_extracted_not_skipped(extracted, capsys):
+    """The core regression: a half-populated directory must not pass for done."""
+    archive, raw_dir, target, file_count = extracted
+    # Simulate a kill mid-extraction: no marker was ever written, and one clip
+    # never made it to disk.
+    (target / vn.EXTRACT_MARKER_NAME).unlink()
+    (target / "spk" / "v002.ogg").unlink()
+    assert vn.count_extracted_files(target) == file_count - 1
+
+    capsys.readouterr()
+    root = vn.extract_archive(archive, raw_dir, TEST_ARCHIVE_PASSWORD)
+    out = capsys.readouterr().out
+
+    assert root == target
+    assert (target / "spk" / "v002.ogg").is_file(), "the missing clip was not restored"
+    assert vn.count_extracted_files(target) == file_count
+    assert vn.read_extract_marker(target)["file_count"] == file_count
+    # The reasoning has to be legible in the log: silence is what let the
+    # truncated corpus through in the first place.
+    assert "incomplete extraction" in out
+    assert f"archive holds {file_count} files, {file_count - 1} on disk" in out
+
+
+@requires_py7zr
+def test_a_truncated_extraction_missing_its_index_is_also_re_extracted(extracted):
+    archive, raw_dir, target, file_count = extracted
+    (target / vn.EXTRACT_MARKER_NAME).unlink()
+    (target / "index.json").unlink()
+    (target / "spk" / "v000.ogg").unlink()
+
+    root = vn.extract_archive(archive, raw_dir, TEST_ARCHIVE_PASSWORD)
+
+    assert vn.find_index_json(root) == target / "index.json"
+    assert vn.count_extracted_files(target) == file_count
+
+
+@requires_py7zr
+def test_re_extraction_does_not_merge_with_stale_orphans(extracted):
+    """py7zr writes in place, so leftovers would survive and be indexed."""
+    archive, raw_dir, target, file_count = extracted
+    (target / vn.EXTRACT_MARKER_NAME).unlink()
+    # Two clips short and one file that is not in the archive at all, so the
+    # directory is unambiguously incomplete (a one-for-one swap would balance
+    # the count -- see the marker tests for the check that catches that).
+    (target / "spk" / "v001.ogg").unlink()
+    (target / "spk" / "v002.ogg").unlink()
+    orphan = target / "spk" / "from_a_previous_revision.ogg"
+    orphan.write_bytes(b"stale")
+
+    vn.extract_archive(archive, raw_dir, TEST_ARCHIVE_PASSWORD)
+
+    assert not orphan.exists(), "a stale file survived the re-extraction"
+    assert vn.count_extracted_files(target) == file_count
+
+
+# --- 2. a marked, complete extraction is skipped ----------------------------
+
+
+@requires_py7zr
+def test_a_complete_extraction_with_a_valid_marker_is_skipped(extracted, monkeypatch, capsys):
+    archive, raw_dir, target, file_count = extracted
+    forbid_re_extraction(monkeypatch)
+    stamp = (target / "index.json").stat().st_mtime_ns
+
+    capsys.readouterr()
+    # Empty password on purpose: a marker-verified archive must be skippable
+    # with no secret available at all.
+    root = vn.extract_archive(archive, raw_dir, "")
+    out = capsys.readouterr().out
+
+    assert root == target
+    assert (target / "index.json").stat().st_mtime_ns == stamp, "files were rewritten"
+    assert "already extracted, skipping" in out
+    assert f"marker verified: {file_count} files" in out
+
+
+@requires_py7zr
+def test_a_marker_verified_archive_needs_no_password(extracted):
+    archive, raw_dir, _target, _file_count = extracted
+
+    assert vn.extraction_password_need(archive, raw_dir) == "skip"
+
+
+# --- 3. a complete extraction with no marker (the pre-existing corpora) -----
+
+
+@requires_py7zr
+def test_an_unmarked_but_complete_extraction_is_verified_by_count_and_backfilled(
+    extracted, monkeypatch, capsys
+):
+    """The 53.8 h and ~187 h corpora on disk predate markers.
+
+    Re-extracting them on the next run would be a costly surprise, so an
+    unmarked directory whose file count matches the archive's entry count is
+    accepted -- and the marker is written retroactively so the next run is
+    cheap.
+    """
+    archive, raw_dir, target, file_count = extracted
+    (target / vn.EXTRACT_MARKER_NAME).unlink()
+    forbid_re_extraction(monkeypatch)
+
+    capsys.readouterr()
+    root = vn.extract_archive(archive, raw_dir, TEST_ARCHIVE_PASSWORD)
+    out = capsys.readouterr().out
+
+    assert root == target
+    assert "verified by count" in out
+    assert f"{file_count} files == {file_count} archive entries" in out
+
+    marker = vn.read_extract_marker(target)
+    assert marker is not None, "the marker was not backfilled"
+    assert marker["file_count"] == file_count
+    assert marker["archive_bytes"] == archive.stat().st_size
+
+
+@requires_py7zr
+def test_the_backfilled_marker_makes_the_next_run_free(extracted, monkeypatch, capsys):
+    archive, raw_dir, target, _file_count = extracted
+    (target / vn.EXTRACT_MARKER_NAME).unlink()
+    vn.extract_archive(archive, raw_dir, TEST_ARCHIVE_PASSWORD)
+
+    forbid_re_extraction(monkeypatch)
+    capsys.readouterr()
+    vn.extract_archive(archive, raw_dir, "")
+
+    assert "marker verified" in capsys.readouterr().out
+
+
+@requires_py7zr
+def test_an_unmarked_extraction_wants_the_password_only_to_verify(extracted):
+    archive, raw_dir, target, _file_count = extracted
+    (target / vn.EXTRACT_MARKER_NAME).unlink()
+
+    # "verify", not "extract": missing the secret must not abort a run over an
+    # already-extracted corpus.
+    assert vn.extraction_password_need(archive, raw_dir) == "verify"
+
+
+@requires_py7zr
+def test_without_a_password_an_unmarked_extraction_is_skipped_but_flagged(
+    extracted, monkeypatch, capsys
+):
+    archive, raw_dir, target, _file_count = extracted
+    (target / vn.EXTRACT_MARKER_NAME).unlink()
+    forbid_re_extraction(monkeypatch)
+
+    capsys.readouterr()
+    root = vn.extract_archive(archive, raw_dir, "")
+    out = capsys.readouterr().out
+
+    assert root == target
+    assert "NOT verified" in out
+    # Nothing was verified, so nothing may be certified: writing a marker here
+    # would launder an unchecked directory into a trusted one forever.
+    assert vn.read_extract_marker(target) is None
+
+
+# --- 4. a marker that disagrees with disk -----------------------------------
+
+
+@requires_py7zr
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("file_count", 999),
+        ("archive_bytes", 1),
+        ("archive", "Some_Other_Title.7z"),
+    ],
+)
+def test_a_marker_that_disagrees_with_disk_triggers_re_extraction(
+    extracted, capsys, field, value
+):
+    archive, raw_dir, target, file_count = extracted
+    marker_path = target / vn.EXTRACT_MARKER_NAME
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker[field] = value
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    # Something is also actually missing, to prove the re-extraction repairs it.
+    (target / "spk" / "v000.ogg").unlink()
+
+    capsys.readouterr()
+    vn.extract_archive(archive, raw_dir, TEST_ARCHIVE_PASSWORD)
+    out = capsys.readouterr().out
+
+    assert "marker disagrees with disk" in out
+    assert (target / "spk" / "v000.ogg").is_file()
+    assert vn.read_extract_marker(target)["file_count"] == file_count
+
+
+@requires_py7zr
+def test_a_disagreeing_marker_makes_the_password_mandatory(extracted):
+    archive, raw_dir, target, _file_count = extracted
+    marker_path = target / vn.EXTRACT_MARKER_NAME
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["file_count"] += 1
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    assert vn.extraction_password_need(archive, raw_dir) == "extract"
+
+
+@requires_py7zr
+def test_a_corrupt_marker_is_treated_as_absent(extracted):
+    _archive, _raw_dir, target, _file_count = extracted
+    (target / vn.EXTRACT_MARKER_NAME).write_text("{not json", encoding="utf-8")
+
+    assert vn.read_extract_marker(target) is None
+
+
+# --- the wipe is scoped ------------------------------------------------------
+
+
+@requires_py7zr
+def test_the_stale_wipe_refuses_anything_but_one_archives_raw_dir(tmp_path):
+    raw_dir = tmp_path / "raw"
+    (raw_dir / "Title" / "spk").mkdir(parents=True)
+
+    # The whole raw tree, and anything below the per-archive level, is off
+    # limits: only <raw>/<stem> may ever be deleted.
+    with pytest.raises(SystemExit):
+        vn.discard_partial_extraction(raw_dir, raw_dir)
+    with pytest.raises(SystemExit):
+        vn.discard_partial_extraction(raw_dir / "Title" / "spk", raw_dir)
+    assert (raw_dir / "Title" / "spk").is_dir()
+
+
+@requires_py7zr
+def test_the_stale_wipe_removes_only_the_named_archive(tmp_path):
+    raw_dir = tmp_path / "raw"
+    doomed = raw_dir / "Title_A"
+    keeper = raw_dir / "Title_B"
+    doomed.mkdir(parents=True)
+    keeper.mkdir(parents=True)
+    (doomed / "partial.ogg").write_bytes(b"x")
+    (keeper / "index.json").write_text("[]", encoding="utf-8")
+
+    vn.discard_partial_extraction(doomed, raw_dir)
+
+    assert not doomed.exists()
+    assert (keeper / "index.json").is_file()
+
+
+# --- entry counting ---------------------------------------------------------
+
+
+@requires_py7zr
+def test_the_archive_entry_count_ignores_directories(tmp_path):
+    archive, file_count = build_test_archive(tmp_path, clips=5)
+
+    assert vn.count_archive_entries(archive, TEST_ARCHIVE_PASSWORD) == file_count
+
+
+@requires_py7zr
+def test_the_archive_entry_count_is_none_without_a_password(tmp_path):
+    archive, _file_count = build_test_archive(tmp_path)
+
+    # None means "cannot verify" and must never be read as zero, which would
+    # condemn every complete extraction to a re-run.
+    assert vn.count_archive_entries(archive, "") is None
+
+
+@requires_py7zr
+def test_the_archive_entry_count_is_none_when_the_archive_cannot_be_read(tmp_path):
+    broken = tmp_path / "archives" / "Broken.7z"
+    broken.parent.mkdir(parents=True)
+    broken.write_bytes(b"not a 7z container at all")
+
+    assert vn.count_archive_entries(broken, TEST_ARCHIVE_PASSWORD) is None
+
+
+@requires_py7zr
+def test_an_unextracted_archive_needs_the_password(tmp_path):
+    archive, _file_count = build_test_archive(tmp_path)
+
+    assert vn.extraction_password_need(archive, tmp_path / "raw") == "extract"
+
+
+@requires_py7zr
+def test_the_resume_check_works_on_the_nested_archive_layout(tmp_path, capsys):
+    """Some archives put everything one directory down; the marker still sits
+    at the raw dir's root, so the count must not be thrown off by the level."""
+    archive, file_count = build_test_archive(tmp_path, clips=4, nested=True)
+    raw_dir = tmp_path / "raw"
+    target = raw_dir / archive.stem
+
+    root = vn.extract_archive(archive, raw_dir, TEST_ARCHIVE_PASSWORD)
+    assert root == target / archive.stem
+    assert vn.find_index_json(target) == root / "index.json"
+    assert vn.read_extract_marker(target)["file_count"] == file_count
+
+    (root / "spk" / "v000.ogg").unlink()
+    (target / vn.EXTRACT_MARKER_NAME).unlink()
+
+    capsys.readouterr()
+    vn.extract_archive(archive, raw_dir, TEST_ARCHIVE_PASSWORD)
+
+    assert "incomplete extraction" in capsys.readouterr().out
+    assert (root / "spk" / "v000.ogg").is_file()
