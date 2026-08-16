@@ -27,3 +27,5 @@ examples/aishell/llm_asr_nar/*
 venv/
 .pytest_cache/
 models/
+data/smoke/
+data/smoke_*.jsonl
