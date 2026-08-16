@@ -293,9 +293,10 @@ fastapi run --port 50000
 
 ### Streaming recognition (CPU)
 
-The `streaming/` package adds real-time recognition on top of the stock model. It accumulates
-features inside a VAD-delimited utterance and re-runs the **full** encoder on every chunk, so it
-does not use truncated attention and does not change `model.py`'s inference behaviour.
+The `streaming/` package adds real-time recognition on top of the stock model. By default it
+accumulates features inside a VAD-delimited utterance and re-runs the **full** encoder on every
+chunk, so it does not use truncated attention and does not change `model.py`'s inference
+behaviour. (An experimental second backend is described below.)
 
 Two stages are emitted per utterance:
 
@@ -319,6 +320,41 @@ python -m streaming.ws_server --host 127.0.0.1 --port 8000
 ```
 Send 16 kHz mono PCM as binary frames; receive `{"type": "partial", "text": ...}` and
 `{"type": "final", "text": ...}` as JSON text frames.
+
+#### Chunk backend (experimental — requires a finetuned checkpoint)
+
+`StreamingConfig.backend` selects the recognition strategy:
+
+| | `"accumulate"` (default) | `"chunk"` |
+|---|---|---|
+| Encoder work | re-runs the full encoder over a growing window | each frame encoded once into a streaming cache |
+| Cost | grows with utterance length | constant per frame, but higher fixed cost |
+| Weights | works with the published weights | expects a chunk-finetuned checkpoint |
+| Benchmarked | yes | no |
+
+The cost row is asymptotic, not a promise. On a 6 s clip the chunk backend measured
+*slower* than the default (RTF 0.818 vs 0.697) — the accumulate window never reached
+`max_history`, so the constant-per-frame advantage was never exercised. It should only be
+expected to win on utterances long enough for that window to saturate.
+
+```python
+from streaming.config import StreamingConfig
+config = StreamingConfig(backend="chunk")
+```
+
+**This is not a drop-in speedup.** The published weights are trained with full
+self-attention, and the chunk backend decodes them in a regime they were never trained
+for, so partial results are expected to degrade — possibly severely — until the model is
+finetuned with `finetune_chunk.sh`. The `final` result is unaffected either way: it comes
+from a full-quality offline pass over the buffered utterance.
+
+The chunk geometry defaults (`chunk_pad_left`, `chunk_stride`, `chunk_pad_right`,
+`chunk_encoder_look_back`) mirror the middle entry of the training configuration in
+`finetune_chunk.sh` rather than any measurement, and are a starting point to benchmark.
+
+See [docs/chunk_training.md](docs/chunk_training.md) for the encoder's chunk-masked training
+path, the geometry conventions, what has and has not been verified, and the prerequisites for
+a real finetune.
 
 #### Using a local model directory
 
