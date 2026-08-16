@@ -100,6 +100,25 @@ if [ "${SMOKE:-0}" = "1" ]; then
     export CUDA_VISIBLE_DEVICES=""
     nproc_per_node=1
 
+    # train_ds.py cannot run on CPU.  After building the model it does
+    #     kwargs["device"] = int(os.environ.get("LOCAL_RANK", 0))
+    #     trainer.device   = int(os.environ.get("LOCAL_RANK", 0))
+    # unconditionally (funasr/bin/train_ds.py, just after warp_model), so every
+    # batch is sent to *accelerator index 0* no matter what ++device says --
+    # cuda:0 on a CPU-only Linux box, mps:0 on this Mac.  No config key can
+    # override it.  funasr/bin/train.py runs the same model, dataset, sampler
+    # and chunk config through funasr's other trainer, but takes its device
+    # from the model itself (``kwargs["device"] = next(model.parameters()).device``),
+    # which is what makes an honest CPU run possible.  The GPU path below keeps
+    # using train_ds.py.
+    smoke_train_tool="$(dirname "${train_tool}")/train.py"
+    if [ ! -f "${smoke_train_tool}" ]; then
+        echo "Error: ${smoke_train_tool} not found; SMOKE mode needs funasr's train.py" >&2
+        exit 1
+    fi
+    train_tool="${smoke_train_tool}"
+    echo "trainer (smoke): ${train_tool}"
+
     train_data="${workspace}/data/smoke_train.jsonl"
     val_data="${workspace}/data/smoke_val.jsonl"
     echo "generating smoke data..."
@@ -108,15 +127,33 @@ if [ "${SMOKE:-0}" = "1" ]; then
         --val-jsonl "${val_data}"
 
     output_dir="${workspace}/outputs/chunk_smoke"
-    # Small example-batches with a small sort window, so a batch still mixes
-    # clip lengths and the padding path gets exercised.
+    # Token batching with a small sort window, so a batch still mixes clip
+    # lengths and the padding path gets exercised.
+    #
+    # batch_type=example is NOT usable here: SenseVoiceCTCDataset.__getitem__
+    # reuses ``batch_size`` as a per-clip frame-length cap
+    # (``if speech_lengths > self.batch_size: continue``).  With
+    # batch_type=example/batch_size=4 every smoke clip (17-67 LFR frames) was
+    # silently dropped, the collator emitted its "data is empty!" 1x1 dummy
+    # batch, and model.py died on text[:, 3] with an IndexError.
+    # 800 is above the longest clip, so nothing is dropped, and with sort_size=4
+    # it packs 2-4 clips of differing lengths per batch: 6 batches, i.e. 6
+    # optimizer steps, for the 12 clips make_smoke_data.py generates by default.
     DATA_ARGS=(
-        "++dataset_conf.batch_type=example"
-        "++dataset_conf.batch_size=4"
+        "++dataset_conf.batch_type=token"
+        "++dataset_conf.batch_size=800"
         "++dataset_conf.sort_size=4"
         "++dataset_conf.num_workers=0"
     )
     TRAIN_ARGS=(
+        # The trainer defaults device to "cuda" (funasr/bin/train.py:
+        # ``device = kwargs.get("device", "cuda")``), and CUDA_VISIBLE_DEVICES=""
+        # does not change that string -- torch still asserts "Torch not compiled
+        # with CUDA enabled".  The device has to be named explicitly.
+        "++device=cpu"
+        # Only read if someone runs the smoke with WORLD_SIZE>1: funasr would
+        # otherwise init the process group with nccl, which does not exist on CPU.
+        "++backend=gloo"
         "++train_conf.max_epoch=1"
         "++train_conf.log_interval=1"
         "++train_conf.resume=false"
