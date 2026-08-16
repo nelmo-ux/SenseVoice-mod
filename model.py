@@ -3,12 +3,14 @@ import time
 import torch
 from torch import nn
 import torch.nn.functional as F
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence, Tuple, Union
 
 from funasr.register import tables
 from funasr.models.ctc.ctc import CTC
 from funasr.utils.datadir_writer import DatadirWriter
 from funasr.models.paraformer.search import Hypothesis
+from funasr.models.scama.chunk_utilis import overlap_chunk
+from funasr.models.transformer.embedding import StreamSinusoidalPositionEncoder
 from funasr.train_utils.device_funcs import force_gatherable
 from funasr.losses.label_smoothing_loss import LabelSmoothingLoss
 from funasr.metrics.compute_acc import compute_accuracy, th_accuracy
@@ -464,10 +466,44 @@ class SenseVoiceEncoderSmall(nn.Module):
         kernel_size: int = 11,
         sanm_shfit: int = 0,
         selfattention_layer_type: str = "sanm",
+        chunk_size: Optional[Union[int, Sequence[int]]] = None,
+        stride: Optional[Union[int, Sequence[int]]] = None,
+        pad_left: Optional[Union[int, Sequence[int]]] = None,
+        encoder_att_look_back_factor: Optional[Union[int, Sequence[int]]] = None,
+        decoder_att_look_back_factor: Optional[Union[int, Sequence[int]]] = None,
         **kwargs,
     ):
+        """Build the encoder.
+
+        Args:
+            chunk_size: Total chunk width(s) in frames used by the chunk-mask training
+                path, i.e. ``pad_left + stride + pad_right``. ``None`` (the default)
+                disables the chunk path completely and ``forward`` runs the unmodified
+                full-attention computation. A tuple with several entries turns on
+                dynamic chunk training: one entry is drawn uniformly at random per
+                training step. An entry ``<= 0`` is the *full attention sentinel* -
+                when that entry is drawn the step runs the plain full-attention path,
+                which is how full-attention batches are mixed into chunk training.
+                ``-1`` is the canonical spelling of the sentinel.
+            stride: Committed frames per chunk, one entry per ``chunk_size`` entry (a
+                single entry is broadcast). Defaults to ``chunk_size`` (no right
+                context). Must satisfy ``0 < stride <= chunk_size``.
+            pad_left: Left context frames per chunk, broadcast like ``stride``.
+                Defaults to ``0``. ``pad_right`` is implied as
+                ``chunk_size - stride - pad_left`` and must be ``>= 0``.
+            encoder_att_look_back_factor: How many previous chunks the encoder
+                self-attention may attend to. Defaults to ``(1,)``.
+            decoder_att_look_back_factor: Unused by SenseVoice (there is no decoder);
+                accepted and forwarded because ``overlap_chunk`` requires it.
+
+        Note:
+            The 3-tuple passed to :meth:`forward_chunk` via the cache has a *different*
+            meaning: ``[pad_left, stride, pad_right]``. Use :meth:`init_chunk_cache` to
+            derive it from the training configuration instead of writing it by hand.
+        """
         super().__init__()
         self._output_size = output_size
+        self._input_size = input_size
 
         self.embed = SinusoidalPositionEncoder()
 
@@ -540,6 +576,138 @@ class SenseVoiceEncoderSmall(nn.Module):
 
         self.tp_norm = LayerNorm(output_size)
 
+        # Streaming position encoder used only by ``forward_chunk``. It holds no
+        # parameters and no buffers, so ``state_dict()`` is byte-for-byte unchanged
+        # and published checkpoints still load with ``strict=True``.
+        self.chunk_embed = StreamSinusoidalPositionEncoder()
+
+        self.chunk_size, self.stride, self.pad_left = None, None, None
+        self.overlap_chunk_cls = None
+        if chunk_size is not None:
+            self.chunk_size, self.stride, self.pad_left = self._normalize_chunk_args(
+                chunk_size, stride, pad_left
+            )
+            self.overlap_chunk_cls = overlap_chunk(
+                chunk_size=self.chunk_size,
+                stride=self.stride,
+                pad_left=self.pad_left,
+                shfit_fsmn=(kernel_size - 1) // 2,
+                encoder_att_look_back_factor=self._as_int_tuple(
+                    encoder_att_look_back_factor, (1,)
+                ),
+                decoder_att_look_back_factor=self._as_int_tuple(
+                    decoder_att_look_back_factor, (1,)
+                ),
+            )
+
+    @staticmethod
+    def _as_int_tuple(
+        value: Optional[Union[int, Sequence[int]]],
+        default: Tuple[int, ...],
+    ) -> Tuple[int, ...]:
+        """Coerce a scalar / sequence / omitted chunk argument to a tuple of ints.
+
+        Args:
+            value: An int, any sequence of ints (including a Hydra ``ListConfig``),
+                or ``None``.
+            default: Returned when ``value`` is ``None``.
+
+        Returns:
+            The coerced tuple.
+        """
+        if value is None:
+            return default
+        if isinstance(value, int):
+            return (value,)
+        return tuple(int(v) for v in value)
+
+    @classmethod
+    def _normalize_chunk_args(
+        cls,
+        chunk_size: Union[int, Sequence[int]],
+        stride: Optional[Union[int, Sequence[int]]],
+        pad_left: Optional[Union[int, Sequence[int]]],
+    ) -> Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]:
+        """Validate and broadcast the chunk-mask training arguments.
+
+        ``overlap_chunk`` broadcasts ``pad_left`` and the look-back factors itself but
+        *not* ``stride``, so every tuple is expanded to ``len(chunk_size)`` here and the
+        per-entry geometry is checked up front rather than failing deep inside mask
+        generation.
+
+        Args:
+            chunk_size: Total chunk width(s); entries ``<= 0`` are full-attention
+                sentinels and skip geometry validation.
+            stride: Committed frames per chunk, or ``None`` to default to ``chunk_size``.
+            pad_left: Left context frames, or ``None`` to default to ``0``.
+
+        Returns:
+            ``(chunk_size, stride, pad_left)`` as equal-length tuples of ints.
+
+        Raises:
+            ValueError: If a tuple length cannot be broadcast, or if any non-sentinel
+                entry violates ``0 < stride <= chunk_size`` or
+                ``0 <= pad_left <= chunk_size - stride``.
+        """
+        chunk_size = cls._as_int_tuple(chunk_size, ())
+        if not chunk_size:
+            raise ValueError("chunk_size must contain at least one entry")
+
+        def _broadcast(value: Tuple[int, ...], name: str) -> Tuple[int, ...]:
+            if len(value) == 1:
+                return value * len(chunk_size)
+            if len(value) != len(chunk_size):
+                raise ValueError(
+                    f"{name} has {len(value)} entries but chunk_size has "
+                    f"{len(chunk_size)}; pass one entry per chunk_size entry or a "
+                    "single entry to broadcast"
+                )
+            return value
+
+        stride = _broadcast(cls._as_int_tuple(stride, chunk_size), "stride")
+        pad_left = _broadcast(cls._as_int_tuple(pad_left, (0,)), "pad_left")
+
+        for i, total in enumerate(chunk_size):
+            if total <= 0:
+                continue  # full-attention sentinel: geometry is not used
+            if not 0 < stride[i] <= total:
+                raise ValueError(
+                    f"stride[{i}]={stride[i]} must satisfy 0 < stride <= "
+                    f"chunk_size[{i}]={total}"
+                )
+            if not 0 <= pad_left[i] <= total - stride[i]:
+                raise ValueError(
+                    f"pad_left[{i}]={pad_left[i]} must satisfy 0 <= pad_left <= "
+                    f"chunk_size[{i}] - stride[{i}] = {total - stride[i]}"
+                )
+        return chunk_size, stride, pad_left
+
+    def _check_chunk_ind(self, ind: Optional[int], name: str) -> None:
+        """Range-check an index into the chunk configuration tuples.
+
+        ``overlap_chunk.random_choice`` and ``overlap_chunk.get_chunk_size`` do no
+        bounds checking, so an out-of-range index surfaces as a bare ``IndexError``
+        deep inside mask generation.
+
+        Args:
+            ind: Index to check. ``None`` is accepted and means "not supplied".
+            name: Argument name to quote in the error message.
+
+        Raises:
+            ValueError: If the chunk path is disabled or ``ind`` is out of range.
+        """
+        if ind is None:
+            return
+        if self.overlap_chunk_cls is None:
+            raise ValueError(
+                f"{name}={ind} was given but this encoder was built without chunk_size"
+            )
+        if not 0 <= ind < len(self.chunk_size):
+            raise ValueError(
+                f"{name}={ind} is out of range for {len(self.chunk_size)} configured "
+                "chunk size(s)"
+            )
+
     def output_size(self) -> int:
         return self._output_size
 
@@ -547,21 +715,72 @@ class SenseVoiceEncoderSmall(nn.Module):
         self,
         xs_pad: torch.Tensor,
         ilens: torch.Tensor,
+        decoding_ind: Optional[int] = None,
+        **kwargs,
     ):
-        """Embed positions in tensor."""
+        """Embed positions in tensor.
+
+        Args:
+            xs_pad: Input features (batch, time, input_size). Scaled in place, as
+                before.
+            ilens: Input lengths (batch,).
+            decoding_ind: Chunk configuration index to use when not training. Ignored
+                unless the chunk path is enabled; ``None`` uses index 0. During
+                training the index is drawn at random from the configured tuple
+                (dynamic chunk training).
+            **kwargs: Ignored; accepted so callers can pass extra keywords.
+
+        Returns:
+            ``(xs_pad, olens)`` with the same shape and length semantics as the
+            full-attention path. When the chunk path is active the chunk-expanded
+            sequence is folded back to the original time axis before returning, so the
+            CTC head and loss need no changes.
+
+        Note:
+            When the chunk path is active the returned time axis is truncated to
+            ``ilens.max()``; the full-attention path keeps ``xs_pad.size(1)``. These
+            agree for the usual case of a batch padded exactly to its longest item.
+        """
         masks = sequence_mask(ilens, device=ilens.device)[:, None, :]
 
         xs_pad *= self.output_size() ** 0.5
 
         xs_pad = self.embed(xs_pad)
 
+        self._check_chunk_ind(decoding_ind, "decoding_ind")
+        chunk_outs, olens_chunk = None, None
+        mask_shfit_chunk, mask_att_chunk_encoder = None, None
+        if self.overlap_chunk_cls is not None:
+            ind = self.overlap_chunk_cls.random_choice(self.training, decoding_ind)
+            # A non-positive entry is the full-attention sentinel: leave every chunk
+            # tensor as None so this step runs the plain full-attention computation.
+            if self.chunk_size[ind] > 0:
+                chunk_ilens = masks.squeeze(1).sum(1).to(torch.int64)
+                chunk_outs = self.overlap_chunk_cls.gen_chunk_mask(chunk_ilens, ind)
+                xs_pad, olens_chunk = self.overlap_chunk_cls.split_chunk(
+                    xs_pad, chunk_ilens, chunk_outs=chunk_outs
+                )
+                masks = sequence_mask(
+                    olens_chunk, maxlen=xs_pad.size(1), device=xs_pad.device
+                )[:, None, :]
+                mask_shfit_chunk = self.overlap_chunk_cls.get_mask_shfit_chunk(
+                    chunk_outs, xs_pad.device, xs_pad.size(0), dtype=xs_pad.dtype
+                )
+                mask_att_chunk_encoder = self.overlap_chunk_cls.get_mask_att_chunk_encoder(
+                    chunk_outs, xs_pad.device, xs_pad.size(0), dtype=xs_pad.dtype
+                )
+
         # forward encoder1
         for layer_idx, encoder_layer in enumerate(self.encoders0):
-            encoder_outs = encoder_layer(xs_pad, masks)
+            encoder_outs = encoder_layer(
+                xs_pad, masks, None, mask_shfit_chunk, mask_att_chunk_encoder
+            )
             xs_pad, masks = encoder_outs[0], encoder_outs[1]
 
         for layer_idx, encoder_layer in enumerate(self.encoders):
-            encoder_outs = encoder_layer(xs_pad, masks)
+            encoder_outs = encoder_layer(
+                xs_pad, masks, None, mask_shfit_chunk, mask_att_chunk_encoder
+            )
             xs_pad, masks = encoder_outs[0], encoder_outs[1]
 
         xs_pad = self.after_norm(xs_pad)
@@ -570,11 +789,250 @@ class SenseVoiceEncoderSmall(nn.Module):
         olens = masks.squeeze(1).sum(1).int()
 
         for layer_idx, encoder_layer in enumerate(self.tp_encoders):
-            encoder_outs = encoder_layer(xs_pad, masks)
+            encoder_outs = encoder_layer(
+                xs_pad, masks, None, mask_shfit_chunk, mask_att_chunk_encoder
+            )
             xs_pad, masks = encoder_outs[0], encoder_outs[1]
 
         xs_pad = self.tp_norm(xs_pad)
+
+        if chunk_outs is not None:
+            # Fold the chunk-expanded sequence back onto the original time axis so the
+            # CTC loss is computed at full length, unlike funasr's SANMEncoderChunkOpt
+            # which returns the expanded sequence. remove_chunk masks its input in
+            # place, so hand it a clone and keep tp_norm's output untouched for
+            # autograd.
+            xs_pad, olens = self.overlap_chunk_cls.remove_chunk(
+                xs_pad.clone(), olens_chunk, chunk_outs
+            )
+            olens = olens.int()
         return xs_pad, olens
+
+    def init_chunk_cache(
+        self,
+        pad_left: Optional[int] = None,
+        stride: Optional[int] = None,
+        pad_right: Optional[int] = None,
+        encoder_chunk_look_back: int = 0,
+        batch_size: int = 1,
+        device: Optional[Union[str, torch.device]] = None,
+        dtype: torch.dtype = torch.float32,
+        ind: int = 0,
+    ) -> dict:
+        """Build a fresh streaming cache for :meth:`forward_chunk`.
+
+        Args:
+            pad_left: Left context frames carried over from the previous chunk.
+            stride: Committed frames per :meth:`forward_chunk` call. This is how many
+                new frames the caller feeds each step.
+            pad_right: Lookahead frames withheld from the output until the next call.
+            encoder_chunk_look_back: Number of previous chunks the encoder
+                self-attention may attend to through the per-layer key/value cache.
+                ``0`` (the default) keeps attention inside the current window, ``-1``
+                keeps every past chunk.
+            batch_size: Batch size of the stream. Streaming decode is normally 1.
+            device: Device for the cached tensors. Defaults to CPU.
+            dtype: Dtype for the cached tensors.
+            ind: Index into the encoder's training chunk configuration, used only when
+                ``stride`` is omitted.
+
+        Returns:
+            The cache dict. It is mutated in place by :meth:`forward_chunk`, so hold on
+            to it and pass the same object every call. Keys:
+
+            - ``start_idx`` (int): absolute frame offset consumed so far, used to keep
+              the sinusoidal position encoding continuous across calls.
+            - ``chunk_size`` (list[int]): ``[pad_left, stride, pad_right]``.
+            - ``encoder_chunk_look_back`` (int): as above.
+            - ``opt`` (list | None): per-layer attention key/value caches, one entry per
+              encoder layer in ``encoders0 + encoders + tp_encoders``. Each entry is
+              ``None`` or ``{"k": (batch, head, time, d_k), "v": (batch, head, time,
+              d_k)}``. Stays ``None`` when ``encoder_chunk_look_back == 0``.
+            - ``feats`` (Tensor): ``(batch, kept, input_size)`` overlap of already
+              scaled and position-encoded frames prepended to the next chunk. Starts
+              with ``pad_left`` zero frames and holds ``pad_left + pad_right`` frames
+              afterwards.
+            - ``tail_chunk`` (bool): set to ``True`` by the caller before the final
+              call to flush the withheld lookahead frames.
+
+        Raises:
+            ValueError: If the geometry is invalid, or if ``stride`` is omitted while
+                the encoder was built without ``chunk_size``.
+
+        Note:
+            When ``stride`` is omitted the geometry is derived from the training
+            configuration at ``ind``: ``pad_left = self.pad_left[ind]``,
+            ``stride = self.stride[ind]``,
+            ``pad_right = self.chunk_size[ind] - stride - pad_left``.
+
+        Note:
+            ``encoder_chunk_look_back != 0`` requires ``pad_right >= 1`` because
+            :meth:`MultiHeadedAttentionSANM.forward_chunk` trims the lookahead with
+            ``k_h[:, :, :-pad_right, :]``, which would empty the cache at
+            ``pad_right == 0``. Combining it with ``pad_left > 0`` also re-appends the
+            left-context frames to that cache (upstream funasr behaviour), so prefer
+            ``pad_left = 0`` whenever look-back is enabled.
+        """
+        if stride is None:
+            if self.overlap_chunk_cls is None:
+                raise ValueError(
+                    "stride must be given because this encoder was built without "
+                    "chunk_size, so there is no training configuration to derive from"
+                )
+            self._check_chunk_ind(ind, "ind")
+            if self.chunk_size[ind] <= 0:
+                raise ValueError(
+                    f"chunk_size[{ind}]={self.chunk_size[ind]} is the full-attention "
+                    "sentinel and has no streaming geometry; pick another ind or pass "
+                    "stride explicitly"
+                )
+            pad_left = self.pad_left[ind]
+            stride = self.stride[ind]
+            pad_right = self.chunk_size[ind] - stride - pad_left
+        else:
+            pad_left = 0 if pad_left is None else int(pad_left)
+            stride = int(stride)
+            pad_right = 0 if pad_right is None else int(pad_right)
+
+        if stride < 1:
+            raise ValueError(f"stride must be >= 1, got {stride}")
+        if pad_left < 0 or pad_right < 0:
+            raise ValueError(
+                f"pad_left and pad_right must be >= 0, got {pad_left} and {pad_right}"
+            )
+        if encoder_chunk_look_back != 0 and pad_right < 1:
+            raise ValueError(
+                "encoder_chunk_look_back != 0 requires pad_right >= 1; the attention "
+                "cache is built by dropping the last pad_right frames and would be "
+                "empty otherwise"
+            )
+
+        return {
+            "start_idx": 0,
+            "chunk_size": [pad_left, stride, pad_right],
+            "encoder_chunk_look_back": encoder_chunk_look_back,
+            "opt": None,
+            "feats": torch.zeros(
+                (batch_size, pad_left, self._input_size), dtype=dtype, device=device
+            ),
+            "tail_chunk": False,
+        }
+
+    def _add_overlap_chunk(self, feats: torch.Tensor, cache: dict) -> torch.Tensor:
+        """Prepend the cached overlap to the incoming frames and refresh the cache.
+
+        The SANM memory block has no streaming cache of its own; its context is
+        supplied by overlapping the chunks instead, which is what this does.
+
+        Args:
+            feats: Scaled and position-encoded new frames (batch, time, input_size).
+            cache: Cache dict from :meth:`init_chunk_cache`.
+
+        Returns:
+            The concatenated window (batch, kept + time, input_size).
+        """
+        cached = cache.get("feats")
+        if cached is None:
+            return feats
+        overlap_feats = torch.cat(
+            (cached.to(device=feats.device, dtype=feats.dtype), feats), dim=1
+        )
+        keep = cache["chunk_size"][0] + cache["chunk_size"][2]
+        cache["feats"] = overlap_feats[:, max(0, overlap_feats.size(1) - keep) :, :]
+        return overlap_feats
+
+    def forward_chunk(
+        self,
+        xs_pad: torch.Tensor,
+        cache: Optional[dict] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, dict]:
+        """Encode one streaming chunk.
+
+        Args:
+            xs_pad: New frames for this step, ``(batch, stride, input_size)``. The last
+                real chunk may be shorter. Not modified in place, unlike
+                :meth:`forward`. Ignored when ``cache["tail_chunk"]`` is set.
+            cache: Cache dict from :meth:`init_chunk_cache`, mutated in place. When
+                ``None`` a default cache is built from the training configuration.
+            **kwargs: ``trim`` (bool, default ``True``) returns only the frames that
+                are final at this step. Pass ``trim=False`` for the raw
+                ``pad_left + time + pad_right`` window, matching funasr's
+                ``SANMEncoderChunkOpt.forward_chunk``.
+
+        Returns:
+            ``(xs_pad, cache)``. With ``trim=True`` the output frames line up one to
+            one with the input frames, delayed by ``pad_right``: the first call returns
+            ``time - pad_right`` frames, later calls return ``time`` frames, and the
+            ``tail_chunk`` call flushes the final ``pad_right`` frames. Concatenating
+            every call's output reproduces the whole utterance in order.
+
+        Note:
+            Run this under ``torch.no_grad()`` with the module in ``eval()`` mode; the
+            per-layer caches assume a single monotonic pass over one stream.
+
+        Note:
+            The caller owns the SenseVoice prompt frames. Prepend the four
+            ``[language, event, emo, textnorm]`` frames to the first chunk so they take
+            absolute positions 1-4, exactly as ``SenseVoiceSmall.encode`` does.
+        """
+        if cache is None:
+            cache = self.init_chunk_cache(
+                batch_size=xs_pad.size(0), device=xs_pad.device, dtype=xs_pad.dtype
+            )
+        pad_left, _, pad_right = cache["chunk_size"]
+        is_tail = cache.get("tail_chunk", False)
+
+        if is_tail:
+            # The cached overlap is already scaled and position-encoded; re-running it
+            # is what flushes the frames whose lookahead never arrived.
+            xs_pad = cache["feats"].to(device=xs_pad.device, dtype=xs_pad.dtype)
+        else:
+            xs_pad = xs_pad * self.output_size() ** 0.5
+            xs_pad = self.chunk_embed(xs_pad, cache)
+            xs_pad = self._add_overlap_chunk(xs_pad, cache)
+
+        if cache["opt"] is None:
+            cache_layer_num = (
+                len(self.encoders0) + len(self.encoders) + len(self.tp_encoders)
+            )
+            new_cache = [None] * cache_layer_num
+        else:
+            new_cache = cache["opt"]
+
+        chunk_size, look_back = cache["chunk_size"], cache["encoder_chunk_look_back"]
+        offset = 0
+        for layer_idx, encoder_layer in enumerate(self.encoders0):
+            idx = offset + layer_idx
+            xs_pad, new_cache[idx] = encoder_layer.forward_chunk(
+                xs_pad, new_cache[idx], chunk_size, look_back
+            )
+
+        offset += len(self.encoders0)
+        for layer_idx, encoder_layer in enumerate(self.encoders):
+            idx = offset + layer_idx
+            xs_pad, new_cache[idx] = encoder_layer.forward_chunk(
+                xs_pad, new_cache[idx], chunk_size, look_back
+            )
+
+        xs_pad = self.after_norm(xs_pad)
+
+        offset += len(self.encoders)
+        for layer_idx, encoder_layer in enumerate(self.tp_encoders):
+            idx = offset + layer_idx
+            xs_pad, new_cache[idx] = encoder_layer.forward_chunk(
+                xs_pad, new_cache[idx], chunk_size, look_back
+            )
+
+        xs_pad = self.tp_norm(xs_pad)
+
+        if look_back > 0 or look_back == -1:
+            cache["opt"] = new_cache
+
+        if kwargs.get("trim", True):
+            end = xs_pad.size(1) if is_tail else xs_pad.size(1) - pad_right
+            xs_pad = xs_pad[:, pad_left : max(0, end), :]
+        return xs_pad, cache
 
 
 @tables.register("model_classes", "SenseVoiceSmall")
