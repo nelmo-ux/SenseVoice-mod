@@ -35,6 +35,21 @@ corpora are GPL-derived or research-only, which would contaminate a model we
 intend to ship.  Anything proposed as a replacement here has to clear the same
 bar.
 
+Which revision to stage
+-----------------------
+
+**Do not pin the ``v2.0.5`` tag.**  Its ``tokens.txt`` carries four literal
+placeholder slots (``unuse_0`` .. ``unuse_3``) where four of the nine classes
+should be, so any clip whose argmax lands in a dead slot aborts the sweep in
+:func:`parse_class_label`.  Commit ``767b2e00`` replaced the placeholders with
+the real classes; stage that or anything later -- ``master`` head, verified at
+``b9c9fc7f``, carries all nine.
+
+The nine labels are pinned line-for-line, with the file's sha256, in
+``tests/test_emo_labels.py``.  Stage a different revision and that test tells
+you whether this script still understands its output, which is cheaper than
+finding out mid-sweep.
+
 Operational notes for the cluster
 ---------------------------------
 
@@ -116,12 +131,28 @@ DEFAULT_MAX_CONSECUTIVE_FAILURES = 5
 # ----------------------------------------------------------------- label parsing
 
 
+#: Raw labels that are not of the ``中文/english`` form, mapped to their class.
+#:
+#: Exactly one such label exists.  Eight of the nine lines in the model's
+#: ``tokens.txt`` are bilingual pairs; the ninth is a bare ``<unk>`` with no
+#: slash and no English half, so the split-on-slash rule below yields
+#: ``"<unk>"`` rather than ``"unknown"``.  Verified against the staged artefact
+#: -- see ``TOKENS_TXT_LINES`` in ``tests/test_emo_labels.py``, which pins all
+#: nine lines and their sha256.
+#:
+#: Deliberately a literal, not a pattern like "anything in angle brackets".  A
+#: pattern would be another guess about a file we have now actually read.
+_CLASS_ALIASES: Dict[str, str] = {"<unk>": "unknown"}
+
+
 def parse_class_label(raw: str) -> str:
     """Reduce one raw emotion2vec label to its bare English class name.
 
-    The model returns bilingual labels -- ``"生气/angry"``, ``"<unk>/unknown"``
-    -- and the Chinese half has changed between checkpoint revisions while the
-    English half has not, so only the English half is trusted.
+    Eight of the model's nine labels are bilingual pairs -- ``"生气/angry"`` --
+    and the Chinese half has changed between checkpoint revisions while the
+    English half has not, so only the English half is trusted.  The ninth,
+    ``<unk>``, has no English half at all and is handled by
+    :data:`_CLASS_ALIASES`.
 
     Args:
         raw: A label string as emitted by the model.
@@ -135,9 +166,12 @@ def parse_class_label(raw: str) -> str:
             into ``other`` (and therefore into the mask), which would silently
             delete supervision for a whole emotion if a future checkpoint
             renamed one.  A crash on clip 1 is cheap; discovering this after a
-            550k-clip sweep is not.
+            550k-clip sweep is not.  This is not hypothetical -- it is exactly
+            how the ``<unk>`` handling above came to be written, on the first
+            clip of the first batch against the real model.
     """
     name = raw.split("/")[-1].strip().lower()
+    name = _CLASS_ALIASES.get(name, name)
     if name not in AUDIO_CLASSES:
         known = ", ".join(AUDIO_CLASSES)
         raise ValueError(

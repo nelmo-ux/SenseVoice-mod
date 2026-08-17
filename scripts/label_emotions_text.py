@@ -43,6 +43,38 @@ clean.  Downstream both map to the mask, so these clips contribute nothing to
 the emotion head -- but they stay in the corpus and keep training the ASR
 branch.  ``sexual`` is a content category to be labelled, never a filter.
 
+What here is observed, and what is still assumed
+------------------------------------------------
+
+The audio labeller shipped with a test asserting a label string that model has
+never emitted, and the sweep died on its first clip.  The same question is worth
+asking of this script, and the answer differs by kind:
+
+*Not at risk.*  The label vocabulary (:data:`TEXT_CLASSES`, its glosses and
+hints) is **ours**, not an artefact's.  This file defines it, the prompt asks
+for it and :func:`parse_response` accepts it -- a closed loop, tested against
+itself on purpose.  There is no external file that can disagree with it, which
+is precisely what went wrong on the audio side, where ``tokens.txt`` was the
+authority and the test was a guess about its contents.
+
+*Assumed, but fail-loud.*  The model's **response format** has not been observed
+from the staged weights.  If it answers in some shape
+:func:`parse_response` does not accept, every clip returns ``None``, which is
+recorded as ``label: null``, masked by the merge -- and caught by
+``--max-unparsed-frac``, which fails the run.  A format surprise costs one job,
+not a corpus.  The known untested shape is a reasoning preamble: a model that
+emits ``<think>`` before its answer would have its first line read as the
+answer and fail to parse.  Qwen2.5-Instruct does not do this, and no handling
+for it is written here -- guessing at the output format of a model we do not use
+is the mistake this section exists to avoid.
+
+*Assumed, and harmless.*  The vLLM logprobs payload shape has changed across
+releases, so :func:`_first_token_probability` is defensive and yields ``None``
+on anything unexpected.  Nothing downstream reads the text labeller's ``score``:
+``merge_emo_labels.py`` consults only ``audio_score`` (for the neutral cap
+ordering and the confidence fallback).  A wholly absent text confidence
+therefore degrades a diagnostic, never a decision.
+
 Extra dependencies beyond the repo's ``requirements.txt``: ``vllm`` (with a
 matching ``torch``) and ``transformers`` for the chat template.  Both are
 imported lazily, inside the backend, so this module -- and its unit tests --

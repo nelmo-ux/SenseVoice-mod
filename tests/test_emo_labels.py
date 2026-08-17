@@ -34,8 +34,10 @@ go wrong produces a plausible-looking label file.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import os
 import random
 import subprocess
 import sys
@@ -559,6 +561,32 @@ def test_load_label_file_drops_null_labels_but_remembers_the_key(merge, tmp_path
     assert loaded.keys == {"a"}
 
 
+def test_text_scores_are_diagnostic_only(merge, tmp_path):
+    """A text file with no confidences at all must merge identically.
+
+    vLLM's logprobs payload has changed shape across releases, so
+    ``_first_token_probability`` can legitimately yield ``None`` for every row.
+    That must degrade a diagnostic and nothing else: only ``audio_score`` feeds
+    a decision (the cap ordering and the confidence fallback). Pinned because
+    the two scores sit in adjacent fields and a future reader could easily wire
+    the wrong one into a rule.
+    """
+    audio_path = write_jsonl(
+        tmp_path / "audio.jsonl", [{"key": k, **audio_record("happy")} for k in "abc"]
+    )
+    scored = write_jsonl(
+        tmp_path / "t1.jsonl", [{"key": k, **text_record("happy", score=0.9)} for k in "abc"]
+    )
+    unscored = write_jsonl(
+        tmp_path / "t2.jsonl", [{"key": k, **text_record("happy", score=None)} for k in "abc"]
+    )
+    audio = merge.load_label_file(audio_path)
+    with_scores = merge.merge(audio, merge.load_label_file(scored))
+    without = merge.merge(audio, merge.load_label_file(unscored))
+    assert [r.emo_target for r in with_scores] == [r.emo_target for r in without]
+    assert [r.decision for r in with_scores] == [r.decision for r in without]
+
+
 def test_load_label_file_keeps_only_label_and_score(merge, tmp_path):
     """The bulky diagnostic fields are dropped on load.
 
@@ -995,20 +1023,126 @@ def test_prompt_never_offers_emo_unknown(text, merge):
 # --------------------------------------------------- audio label parsing + CLI
 
 
+#: The **exact** contents of ``emotion2vec_plus_large/tokens.txt``, one entry per
+#: line, at revision ``b9c9fc7fce7dd80c0a59d9d1d1265021e31cb2e8``.
+#:
+#: sha256 ``866121e470057b847d7a50e9923509141fb2924392f53385a186482a1ec0fb7f``
+#: over ``"\n".join(TOKENS_TXT_LINES)`` -- 119 bytes, **no trailing newline**.
+#: :func:`test_tokens_fixture_matches_the_staged_artefact` recomputes that digest
+#: on every run, so this fixture cannot drift from the artefact silently: edit
+#: any character here and the test fails.
+#:
+#: This list is transcribed from the real file, not reconstructed from the shape
+#: the other eight lines suggest. That distinction is the entire point. The
+#: previous version of this test asserted the ninth label was ``"<unk>/unknown"``
+#: -- a form the model has never emitted at any revision -- and passed, because
+#: it fed ``parse_class_label`` a string invented for the occasion and checked
+#: the invention against itself. Against the staged model the sweep died on clip
+#: 1 of batch 1.
+TOKENS_TXT_LINES = (
+    "生气/angry",
+    "厌恶/disgusted",
+    "恐惧/fearful",
+    "开心/happy",
+    "中立/neutral",
+    "其他/other",
+    "难过/sad",
+    "吃惊/surprised",
+    "<unk>",  # bare: no slash, no English half -- the defect this pins
+)
+
+TOKENS_TXT_SHA256 = "866121e470057b847d7a50e9923509141fb2924392f53385a186482a1ec0fb7f"
+
+#: Optional: point this at a staged ``tokens.txt`` to check the fixture against
+#: the real file rather than against its recorded digest.
+TOKENS_TXT_ENV = "SENSEVOICE_EMOTION2VEC_TOKENS"
+
+
+def test_tokens_fixture_matches_the_staged_artefact():
+    """The pinned lines must hash to the digest measured on the staged model.
+
+    Without this the fixture is just another assumption, indistinguishable from
+    the one it replaced. With it, the nine lines below are checkable evidence:
+    the digest was measured on the artefact, and any edit to the fixture breaks
+    the hash.
+    """
+    content = "\n".join(TOKENS_TXT_LINES)
+    assert len(content.encode("utf-8")) == 119
+    assert hashlib.sha256(content.encode("utf-8")).hexdigest() == TOKENS_TXT_SHA256
+
+
+def test_tokens_fixture_matches_a_staged_file_when_one_is_available():
+    """Verify against the artefact itself when the environment points at it.
+
+    Skipped on a workstation with no staged model. On the cluster this is what
+    turns the fixture from a recorded claim into a checked one, and it is the
+    test to run first after staging a different revision.
+    """
+    staged = os.environ.get(TOKENS_TXT_ENV)
+    if not staged:
+        pytest.skip(f"set {TOKENS_TXT_ENV} to a staged tokens.txt to check against it")
+    path = Path(staged)
+    if not path.is_file():
+        pytest.skip(f"{TOKENS_TXT_ENV}={staged} is not a file")
+    actual = path.read_text(encoding="utf-8").rstrip("\n").splitlines()
+    assert tuple(actual) == TOKENS_TXT_LINES
+
+
+def test_parse_class_label_covers_every_line_of_the_real_tokens_file(audio):
+    """All nine real labels map onto the nine classes, one-to-one.
+
+    A test about the model's actual output rather than about what we hoped it
+    would be. Surjectivity is asserted as well as totality: if two lines
+    collapsed onto one class, some class would be unreachable and that emotion
+    would be silently absent from the corpus.
+    """
+    mapped = [audio.parse_class_label(line) for line in TOKENS_TXT_LINES]
+    assert len(mapped) == 9
+    assert set(mapped) == set(audio.AUDIO_CLASSES)
+    assert len(set(mapped)) == len(mapped)  # no two lines share a class
+
+
+def test_bare_unk_maps_to_unknown(audio):
+    """The ninth line has no English half; splitting on "/" yields "<unk>".
+
+    This single line is what killed the first cluster run. Every revision
+    checked -- c43c13ee, v2.0.5 and master head -- emits it bare, so there is no
+    revision where the split-on-slash rule alone suffices.
+    """
+    assert audio.parse_class_label("<unk>") == "unknown"
+    assert "<unk>" in audio._CLASS_ALIASES
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
         pytest.param("生气/angry", "angry", id="bilingual"),
         pytest.param("开心/happy", "happy", id="bilingual-happy"),
-        pytest.param("<unk>/unknown", "unknown", id="unknown-class"),
         pytest.param("其他/other", "other", id="other-class"),
         pytest.param("neutral", "neutral", id="english-only"),
         pytest.param(" 难过/Sad ", "sad", id="whitespace-and-case"),
+        pytest.param(" <UNK> ", "unknown", id="bare-unk-whitespace-and-case"),
+        # Not observed at any revision, but harmless to accept: if a future
+        # checkpoint regularises the ninth line into a pair, the split rule
+        # already handles it and this stays green.
+        pytest.param("<unk>/unknown", "unknown", id="hypothetical-paired-unk"),
     ],
 )
 def test_parse_class_label_reads_the_english_half(audio, raw, expected):
     """Only the English half is trusted -- the Chinese half has changed before."""
     assert audio.parse_class_label(raw) == expected
+
+
+def test_parse_class_label_rejects_the_v205_placeholder_slots(audio):
+    """``v2.0.5``'s ``tokens.txt`` has four ``unuse_N`` slots where classes go.
+
+    Pinned as a rejection so that staging that tag fails fast and loudly rather
+    than mid-sweep. The module docstring tells operators to stage 767b2e00 or
+    later; this is the check that backs the instruction up.
+    """
+    for slot in ["unuse_0", "unuse_1", "unuse_2", "unuse_3"]:
+        with pytest.raises(ValueError, match="unrecognised emotion2vec class"):
+            audio.parse_class_label(slot)
 
 
 def test_parse_class_label_rejects_an_unknown_class(audio):
