@@ -816,6 +816,63 @@ buckets. Both are frequent here and neither maps onto the seven SenseVoice
 emotions, so giving them their own labels keeps them out of the seven. They
 mask rather than drop: no clip leaves the corpus.
 
+### How badly, measured against a corpus nobody here labelled
+
+JVNV — 1,615 clips, four speakers, six emotions, human-labelled, CC BY-SA,
+evaluation only. It contains **no neutral recordings at all**, so a
+`<|NEUTRAL|>` prediction is wrong by construction.
+
+| | accuracy | macro-F1 | dominant prediction | share |
+|---|---|---|---|---|
+| base, `--ban-emo-unk` | 0.318 | 0.261 | `<\|ANGRY\|>` | 63.7 % |
+| round 2 epoch 3 | **0.000** | **0.000** | `<\|NEUTRAL\|>` | **99.75 %** |
+
+Round 2 answers `<|NEUTRAL|>` for 1,611 of 1,615 clips and never once emits
+any of the six target emotions. Accuracy is not low, it is exactly zero, and
+the confusion matrix collapses every row into a single column. The result is
+byte-identical with and without `--ban-emo-unk`, because the head never
+reaches for `<|EMO_UNKNOWN|>` either.
+
+The attribution is clean: **base emits zero `<|NEUTRAL|>` predictions**, so
+this is not the architecture, it is what round 2's training did to it.
+
+Base is a weak bar and should be read as one — it over-predicts `<|ANGRY|>`
+on 63.7 % of clips and is blind to `<|DISGUSTED|>` entirely. It clears chance
+(16.7 %) and the majority class (18.9 %), so it is a real floor, but not a
+strong one.
+
+Two measurement notes. Without `--ban-emo-unk`, base abstains on 98.1 % of
+clips and scores 1.24 %, which makes the base-versus-round-2 gap read as a
+floor effect rather than a real ordering — the banned run is the one that
+answers the question. And the first run of this evaluation was submitted
+with a `NameError` that fires *after* all decoding completes; on this
+scheduler that surfaces as a COMPLETED job with an empty output file.
+
+### Why round 3 still starts from round 2, and what would prove that wrong
+
+Round 3 initialises from round 2 epoch 3 rather than from base. The reasoning
+rests on a hypothesis that is **not established**, and is recorded here as a
+hypothesis so it does not quietly become a fact:
+
+> the emotion head's output layer is saturated towards a constant, while the
+> encoder representations are intact.
+
+What supports it: round 2 epoch 3 is the best ASR checkpoint measured
+(chunk CER 0.1623), so the encoder still produces features good enough to
+transcribe from; and the JVNV failure is perfectly uniform across all six
+classes, which is the signature of an output-side constant rather than
+degraded features. What would settle it properly is a linear probe on frozen
+encoder features — not run, because the alternative is cheaper.
+
+**The fallback is the experiment.** A base-initialised rerun costs about two
+hours, so P5's JVNV measurement doubles as the test: if round 3's JVNV
+macro-F1 comes in **below base's 0.261**, the run is repeated once from base
+initialisation, and that rerun's result is what decides whether the encoder
+was damaged after all. Reporting per-class F1 is required either way —
+whether round 3 can score non-zero on `<|DISGUSTED|>`, where base is blind,
+is qualitative evidence of having genuinely surpassed base rather than
+having edged past its average.
+
 ### The corpus, and the pin that moved
 
 801.10 h of train against round 2's 813.81. The arithmetic is worth writing
