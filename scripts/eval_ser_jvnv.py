@@ -34,6 +34,25 @@ on this benchmark instead of quietly having all its predictions discarded.  The
 per-model prediction distribution is in the JSON for the same reason - "it
 predicts one class for everything" should be visible directly, not inferred.
 
+Layout
+------
+
+Upstream ships one directory per speaker, flat, with the emotion in the
+filename::
+
+    F1/F1_anger_free_01.wav
+    M2/M2_surprise_regular_12.wav
+
+:func:`emotion_from_path` searches the directory components *and* the
+filename's ``_``/``-``/``.``-separated fields, so a re-export that nests clips
+under per-emotion directories (``F1/anger/F1_anger_1.wav``) reads correctly too.
+Do not restructure a staged corpus to suit this script: its entire value is
+being an untouched external reference, and the parser already handles both.
+
+The ``_no_nv`` variant has the non-verbal segments removed, giving 1,615 clips
+and about 3.45 audio-hours across the four speakers - less than the figure the
+original corpus would suggest, which is expected rather than a staging error.
+
 Reading the output
 ------------------
 
@@ -244,9 +263,12 @@ def _relative_parts(path: Path, root: Optional[Path]) -> Tuple[str, ...]:
 def emotion_from_path(path: Path, root: Optional[Path] = None) -> str:
     """Read a clip's labelled emotion out of its path.
 
-    JVNV encodes the label in the layout (``F1/anger/F1_anger_1.wav`` and the
-    like), so both the directory names and the filename fields are searched.
-    Kept a pure function of the path so it is unit-testable without the corpus.
+    Upstream encodes the label in the filename under a flat per-speaker
+    directory (``F1/F1_anger_free_01.wav``); a re-export may instead nest clips
+    under per-emotion directories (``F1/anger/F1_anger_1.wav``).  Both the
+    directory names and the filename fields are searched, so both read
+    correctly.  Kept a pure function of the path so it is unit-testable without
+    the corpus.
 
     Args:
         path: The clip path.
@@ -272,9 +294,11 @@ def emotion_from_path(path: Path, root: Optional[Path] = None) -> str:
 
     if not names:
         raise ValueError(
-            f"cannot determine the emotion of {path}: no path component names "
-            f"one of {sorted(JVNV_EMOTION_TO_TOKEN)}.  Point --corpus-dir at "
-            "the JVNV root, whose layout is <speaker>/<emotion>/<clip>.wav"
+            f"cannot determine the emotion of {path}: neither its directories "
+            f"nor its filename fields name one of "
+            f"{sorted(JVNV_EMOTION_TO_TOKEN)}.  Upstream names them in the "
+            "filename (F1/F1_anger_free_01.wav); check that --corpus-dir "
+            "points at the JVNV root and that this file belongs to the corpus"
         )
     if len(names) > 1:
         raise ValueError(
@@ -629,8 +653,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=Path,
         required=True,
         help=(
-            "locally staged JVNV root, e.g. <speaker>/<emotion>/<clip>.wav.  "
-            "Never downloaded: evaluation must not depend on the network"
+            "locally staged JVNV root: one directory per speaker with the "
+            "emotion in the filename (F1/F1_anger_free_01.wav), which is what "
+            "upstream ships; per-emotion subdirectories also work.  Never "
+            "downloaded - evaluation must not depend on the network"
         ),
     )
     parser.add_argument(
@@ -836,6 +862,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         per_model[spec.label] = {
             "checkpoint": str(spec.checkpoint) if spec.checkpoint else None,
+            "model_dir": str(spec.model_dir),
             "num_decode_failures": len(failures),
             **metrics,
         }
@@ -859,7 +886,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "num_clips": len(usable),
         "decode": {
             "mode": "full-attention (SenseVoiceSmall.inference)",
-            "model_dir": str(model_dir),
+            # The directory checkpoints load their config, CMVN and BPE from.
+            # Each model also records its own, because ``--base DIR`` may point
+            # somewhere else entirely.
+            "model_dir": str(args.model_dir),
             "language": config.language,
             "use_itn": config.use_itn,
             "ban_emo_unk": config.ban_emo_unk,

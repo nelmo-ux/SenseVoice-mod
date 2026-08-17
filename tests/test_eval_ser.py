@@ -33,6 +33,19 @@ The CER path is untouched
     The round-2 CER numbers must stay reproducible byte-for-byte, so the CER
     helpers are pinned against hand-computed values.  If these fail, the SER
     work has changed something it had no business changing.
+
+``main()`` is executed, not merely imported
+    An earlier revision of ``eval_ser_jvnv.py`` referenced an undefined
+    ``model_dir`` inside the payload dict.  Every pure-function test passed, and
+    the crash sat *after* all decoding and *before* the report was printed or
+    written -- so a multi-checkpoint GPU run would have burned its whole
+    allocation, decoded 1,615 clips per model, then died having produced
+    nothing.  The scheduler here discards batch-script exit codes, so it would
+    have been recorded as COMPLETED with an empty output file.  The ``main()``
+    tests below stub out model loading and audio and drive the real payload
+    assembly, the real ``print_comparison`` and the real ``--out`` write.  A
+    test suite that never runs the function that writes the output cannot tell
+    you the output can be written.
 """
 
 from __future__ import annotations
@@ -538,6 +551,25 @@ def test_cer_helpers_are_untouched(gap):
     assert metrics["wer"] == pytest.approx(1.0)
 
 
+def test_cer_edge_cases_are_untouched(gap):
+    """The empty-reference conventions the CER path has always used."""
+    assert gap.levenshtein("", "abc") == 3
+    assert gap.levenshtein("abc", "") == 3
+    assert gap.corpus_metrics([]) is None
+    # No reference and no hypothesis is not an error; no reference with a
+    # hypothesis is wholly insertion.
+    assert gap.pair_cer("", "") == pytest.approx(0.0)
+    assert gap.pair_cer("", "なにか") == pytest.approx(1.0)
+
+
+def test_summarise_val_returns_an_empty_dict_for_no_clips(gap):
+    """The SER block must not resurrect a report where there was none.
+
+    ``print_summary`` keys "is there a selection signal" off this being empty.
+    """
+    assert gap.summarise_val([], {}, False, False) == {}
+
+
 def test_rich_tags_including_emotion_are_still_stripped_before_cer(gap):
     """The SER work must not leak tags into the transcript comparison."""
     hypothesis = f"<|ja|>{HAPPY}<|Speech|><|woitn|>こんにちは世界"
@@ -574,6 +606,107 @@ def test_summarise_val_keeps_cer_metrics_and_adds_ser_alongside(gap):
     assert set(result) == {"per_model", "ser"}
 
 
+# --------------------------------------------- eval_chunk_gap CLI and printing
+
+
+def test_ban_emo_unk_flag_reaches_the_streaming_config(gap):
+    """The flag has to survive parse_args -> build_config to mean anything."""
+    default_config, _ = gap.build_config(gap.parse_args([]))
+    banned_config, _ = gap.build_config(gap.parse_args(["--ban-emo-unk"]))
+
+    assert default_config.ban_emo_unk is False
+    assert banned_config.ban_emo_unk is True
+    # And nothing else about the decode geometry moved with it.
+    assert banned_config.chunk_size == default_config.chunk_size
+    assert banned_config.chunk_stride == default_config.chunk_stride
+    assert banned_config.chunk_pad_right == default_config.chunk_pad_right
+
+
+def test_summarise_val_accepts_the_call_shape_main_uses(gap):
+    """``main`` passes all four positionally; pin that signature."""
+    clips = [make_clip(gap, "a", HAPPY), make_clip(gap, "b", SAD)]
+    decodes = make_decodes(gap, {"base": {"a": tagged(HAPPY), "b": tagged(SAD)}})
+
+    result = gap.summarise_val(clips, decodes, False, True)
+    assert result["ser"]["ban_emo_unk"] is True
+
+
+def build_summary_payload(gap, metrics):
+    """Assemble the minimum ``print_summary`` reads.
+
+    Args:
+        gap: The ``eval_chunk_gap`` module.
+        metrics: The ``japanese.val.metrics`` block.
+
+    Returns:
+        A payload dict.
+    """
+    return {
+        "geometry": {
+            "geometry_index": 1,
+            "window_frames": 12,
+            "stride_frames": 10,
+            "pad_left_frames": 0,
+            "pad_right_frames": 2,
+            "encoder_look_back": 1,
+            "lookahead_ms": 120.0,
+        },
+        "models": {"base": {"dir": "models/SenseVoiceSmall"}, "finetuned": {"checkpoint": "c.pt"}},
+        "device": "cpu",
+        "precision": {},
+        "japanese": {
+            "val": {"jsonl": "data/vn/val.jsonl", "num_clips": 2, "metrics": metrics},
+            "clips": [],
+        },
+        "selection": {"metric": "ja_val_chunk_cer", "value": 0.1623, "note": ""},
+    }
+
+
+def test_print_summary_renders_the_ser_block(gap, capsys):
+    clips = [make_clip(gap, "a", HAPPY), make_clip(gap, "b", SAD)]
+    decodes = make_decodes(
+        gap,
+        {
+            "base": {"a": tagged(HAPPY), "b": tagged(SAD)},
+            "finetuned": {"a": tagged(NEUTRAL), "b": tagged(NEUTRAL)},
+        },
+    )
+    metrics = gap.summarise_val(clips, decodes, False, False)
+    gap.print_summary(build_summary_payload(gap, metrics), [])
+
+    stdout = capsys.readouterr().out
+    assert "SER (full-attn)" in stdout
+    assert "n=2 scored of 2 val clips" in stdout
+    assert "most-predicted=<|NEUTRAL|> (100%)" in stdout
+    # The CER table is still there and still first.
+    assert stdout.index("chunk CER") < stdout.index("SER (full-attn)")
+    assert "BEST-CHECKPOINT SIGNAL" in stdout
+
+
+def test_print_summary_shouts_a_degenerate_reference_set(gap, capsys):
+    """The round-2 shape prints 1.0000 accuracy; the status must be louder."""
+    clips = [make_clip(gap, key, NEUTRAL) for key in ("a", "b")]
+    decodes = make_decodes(gap, {"base": {"a": tagged(NEUTRAL), "b": tagged(NEUTRAL)}})
+    metrics = gap.summarise_val(clips, decodes, False, False)
+    gap.print_summary(build_summary_payload(gap, metrics), [])
+
+    stdout = capsys.readouterr().out
+    assert "accuracy=1.0000" in stdout
+    assert "*** SER DEGENERATE ***" in stdout
+    assert "constant" in stdout
+
+
+def test_print_summary_survives_a_report_without_a_ser_block(gap, capsys):
+    """Reports predating the SER work must still print."""
+    clips = [make_clip(gap, "a", HAPPY)]
+    decodes = make_decodes(gap, {"base": {"a": tagged(HAPPY)}})
+    metrics = gap.summarise_val(clips, decodes, False, False)
+    del metrics["ser"]
+
+    gap.print_summary(build_summary_payload(gap, metrics), ["a warning"])
+    assert "SER (full-attn)" not in capsys.readouterr().out
+
+
 # ------------------------------------------------------------ JVNV path parsing
 
 
@@ -595,9 +728,34 @@ def test_jvnv_layout_maps_every_emotion(jvnv, emotion, token):
     assert jvnv.emotion_from_path(path, root) == token
 
 
+@pytest.mark.parametrize(
+    ("relative", "token"),
+    [
+        ("F1/F1_anger_free_01.wav", "<|ANGRY|>"),
+        ("M2/M2_surprise_regular_12.wav", "<|SURPRISED|>"),
+        ("F2/F2_disgust_free_07.wav", "<|DISGUSTED|>"),
+        ("M1/M1_fear_regular_03.wav", "<|FEARFUL|>"),
+    ],
+)
+def test_upstream_flat_layout_is_the_one_that_ships(jvnv, relative, token):
+    """What ``litagin/jvnv_corpus_v1_no_nv`` actually ships.
+
+    One directory per speaker, flat, emotion in the filename.  The nested
+    ``<speaker>/<emotion>/`` form the parser also accepts is a re-export shape,
+    not upstream's, and this test is what keeps that distinction honest.
+    """
+    root = Path("/data/jvnv_corpus_v1_no_nv")
+    assert jvnv.emotion_from_path(root / relative, root) == token
+
+
 def test_jvnv_flat_layout_reads_the_filename(jvnv):
     root = Path("/data/jvnv")
     assert jvnv.emotion_from_path(root / "F1_sad_01.wav", root) == SAD
+
+
+def test_upstream_flat_layout_reads_the_speaker(jvnv):
+    root = Path("/data/jvnv_corpus_v1_no_nv")
+    assert jvnv.speaker_from_path(root / "M2" / "M2_surprise_regular_12.wav", root) == "M2"
 
 
 def test_jvnv_ignores_components_above_the_corpus_root(jvnv):
@@ -655,6 +813,34 @@ def build_corpus(root: Path, speakers=("F1", "M1"), emotions=("anger", "happy", 
     return root
 
 
+def build_upstream_corpus(root: Path):
+    """Create the flat per-speaker tree upstream actually ships.
+
+    Args:
+        root: Directory to create.
+
+    Returns:
+        The root.
+    """
+    for speaker in ("F1", "M2"):
+        directory = root / speaker
+        directory.mkdir(parents=True, exist_ok=True)
+        for emotion in ("anger", "surprise"):
+            for style in ("free", "regular"):
+                (directory / f"{speaker}_{emotion}_{style}_01.wav").write_bytes(b"")
+    return root
+
+
+def test_discover_clips_reads_the_upstream_flat_layout(jvnv, tmp_path):
+    """End-to-end over the shape the staged corpus really has."""
+    clips = jvnv.discover_clips(build_upstream_corpus(tmp_path / "jvnv"))
+
+    assert len(clips) == 8
+    assert clips[0].key == "F1/F1_anger_free_01.wav"
+    assert {clip.speaker for clip in clips} == {"F1", "M2"}
+    assert {clip.emotion for clip in clips} == {ANGRY, "<|SURPRISED|>"}
+
+
 def test_discover_clips_walks_the_tree(jvnv, tmp_path):
     clips = jvnv.discover_clips(build_corpus(tmp_path / "jvnv"))
 
@@ -676,6 +862,12 @@ def test_discover_clips_limit_keeps_every_class(jvnv, tmp_path):
     assert len(clips) == 6
     assert {clip.emotion for clip in clips} == {ANGRY, HAPPY, SAD}
     assert {clip.speaker for clip in clips} == {"F1", "M1"}
+
+
+def test_discover_clips_rejects_a_speaker_filter_matching_nothing(jvnv, tmp_path):
+    """Silently returning zero clips would produce an empty report, not an error."""
+    with pytest.raises(ValueError, match="matched no clip"):
+        jvnv.discover_clips(build_corpus(tmp_path / "jvnv"), speakers=["F9"])
 
 
 def test_discover_clips_rejects_an_unlabelled_clip(jvnv, tmp_path):
@@ -787,3 +979,309 @@ def test_jvnv_and_gap_share_one_metric_implementation(jvnv, gap):
     """Not merely equal results: literally the same function object."""
     assert jvnv.classification_metrics is gap.classification_metrics
     assert jvnv.extract_emotion_tag is gap.extract_emotion_tag
+
+
+# ------------------------------------------------------------- main() end to end
+
+
+class StubRecogniser:
+    """Stands in for ``CheckpointRecogniser`` -- no weights, no audio, no torch.
+
+    Answers are consumed in clip order and cycle when the list runs short, so a
+    one-element list is a model that returns the same emotion for every clip -
+    the collapsed head this benchmark exists to catch.
+
+    Attributes:
+        answers: ``{checkpoint string or None: [raw decode, ...]}``.
+        constructed: ``(model_dir, checkpoint)`` per instantiation, in order.
+        live: How many instances are currently un-released.
+        max_live: The high-water mark, asserted to stay at 1.
+        fail_on: Clip indices (0-based, per model) whose decode should raise.
+    """
+
+    answers: Dict[Optional[str], list] = {}
+    constructed: list = []
+    live = 0
+    max_live = 0
+    fail_on: set = set()
+
+    def __init__(self, model_dir, config, checkpoint):
+        self.checkpoint = None if checkpoint is None else str(checkpoint)
+        self.config = config
+        self.calls = 0
+        cls = type(self)
+        cls.constructed.append((str(model_dir), self.checkpoint))
+        cls.live += 1
+        cls.max_live = max(cls.max_live, cls.live)
+
+    def decode_full(self, samples) -> str:
+        index = self.calls
+        self.calls += 1
+        if index in type(self).fail_on:
+            raise RuntimeError("synthetic decode failure")
+        answers = type(self).answers[self.checkpoint]
+        return answers[index % len(answers)]
+
+    @classmethod
+    def reset(cls) -> None:
+        """Clear the cross-test state."""
+        cls.answers = {}
+        cls.constructed = []
+        cls.live = 0
+        cls.max_live = 0
+        cls.fail_on = set()
+
+
+@pytest.fixture
+def stubbed(jvnv, monkeypatch):
+    """Replace model loading, audio decoding and release with stubs.
+
+    Everything else in ``main()`` -- argument parsing, corpus discovery, metric
+    computation, payload assembly, printing and the JSON write -- runs for real.
+
+    Returns:
+        The :class:`StubRecogniser` class, for setting answers and asserting.
+    """
+    import numpy as np
+
+    StubRecogniser.reset()
+
+    def fake_release(recogniser) -> None:
+        StubRecogniser.live -= 1
+
+    monkeypatch.setattr(jvnv, "CheckpointRecogniser", StubRecogniser)
+    monkeypatch.setattr(jvnv, "release", fake_release)
+    monkeypatch.setattr(
+        jvnv, "load_audio", lambda path, sample_rate: np.zeros(1600, dtype=np.float32)
+    )
+    return StubRecogniser
+
+
+def tagged(emotion: str) -> str:
+    """Wrap an emotion token in a realistic rich-tag block.
+
+    Args:
+        emotion: The emotion token.
+
+    Returns:
+        A raw decode string.
+    """
+    return f"<|ja|>{emotion}<|Speech|><|woitn|>本文"
+
+
+def corpus_and_models(jvnv, tmp_path):
+    """Build a staged corpus plus a model directory and a checkpoint file.
+
+    Args:
+        jvnv: The ``eval_ser_jvnv`` module.
+        tmp_path: pytest temporary directory.
+
+    Returns:
+        ``(root, model_dir, checkpoint, clips)``.
+    """
+    root = build_corpus(tmp_path / "jvnv")
+    model_dir = tmp_path / "SenseVoiceSmall"
+    model_dir.mkdir()
+    checkpoint = tmp_path / "model.pt.ep3"
+    checkpoint.write_bytes(b"")
+    return root, model_dir, checkpoint, jvnv.discover_clips(root)
+
+
+def test_main_writes_a_report_and_prints_the_table(jvnv, tmp_path, stubbed, capsys):
+    """The regression test for the undefined ``model_dir``.
+
+    It fails with ``NameError`` on the pre-fix script: the crash is in the
+    payload dict, which only runs once every clip of every model is decoded.
+    """
+    root, model_dir, checkpoint, clips = corpus_and_models(jvnv, tmp_path)
+    out = tmp_path / "report.json"
+    stubbed.answers = {
+        # Base answers correctly; the collapsed checkpoint says NEUTRAL always.
+        None: [tagged(clip.emotion) for clip in clips],
+        str(checkpoint): [tagged(NEUTRAL)],
+    }
+
+    code = jvnv.main(
+        [
+            "--corpus-dir", str(root),
+            "--model-dir", str(model_dir),
+            "--base", str(model_dir),
+            "--checkpoint", f"round2-ep3={checkpoint}",
+            "--device", "cpu",
+            "--out", str(out),
+        ]
+    )
+    assert code == 0
+
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["num_clips"] == 12
+    assert list(payload["per_model"]) == ["base", "round2-ep3"]
+    assert payload["decode"]["model_dir"] == str(model_dir)
+    assert payload["per_model"]["base"]["model_dir"] == str(model_dir)
+    assert payload["per_model"]["round2-ep3"]["checkpoint"] == str(checkpoint)
+
+    assert payload["per_model"]["base"]["accuracy"] == pytest.approx(1.0)
+    collapsed = payload["per_model"]["round2-ep3"]
+    assert collapsed["accuracy"] == pytest.approx(0.0)
+    assert collapsed["prediction_distribution"] == {NEUTRAL: 12}
+    assert collapsed["dominant_prediction"]["share"] == pytest.approx(1.0)
+
+    stdout = capsys.readouterr().out
+    assert "SER on JVNV" in stdout
+    assert "round2-ep3" in stdout
+    # The diagnosis, not just the score, has to reach the terminal.
+    assert "prediction distributions" in stdout
+    assert f"wrote {out}" in stdout
+
+
+def test_main_creates_the_out_directory(jvnv, tmp_path, stubbed):
+    root, model_dir, _, clips = corpus_and_models(jvnv, tmp_path)
+    stubbed.answers = {None: [tagged(clip.emotion) for clip in clips]}
+    out = tmp_path / "nested" / "deeper" / "report.json"
+
+    assert jvnv.main(
+        ["--corpus-dir", str(root), "--model-dir", str(model_dir),
+         "--base", str(model_dir), "--device", "cpu", "--out", str(out)]
+    ) == 0
+    assert out.exists()
+
+
+def test_main_without_out_still_prints(jvnv, tmp_path, stubbed, capsys):
+    """The stdout-only path: no file is written and nothing raises."""
+    root, model_dir, _, clips = corpus_and_models(jvnv, tmp_path)
+    stubbed.answers = {None: [tagged(clip.emotion) for clip in clips]}
+
+    assert jvnv.main(
+        ["--corpus-dir", str(root), "--model-dir", str(model_dir),
+         "--base", str(model_dir), "--device", "cpu"]
+    ) == 0
+    stdout = capsys.readouterr().out
+    assert "most-predicted" in stdout
+    assert "wrote" not in stdout
+
+
+def test_main_holds_one_model_in_memory_at_a_time(jvnv, tmp_path, stubbed):
+    """Three checkpoints in one run must not mean three models resident."""
+    root, model_dir, checkpoint, clips = corpus_and_models(jvnv, tmp_path)
+    second = tmp_path / "model.pt.ep4"
+    second.write_bytes(b"")
+    stubbed.answers = {
+        None: [tagged(clip.emotion) for clip in clips],
+        str(checkpoint): [tagged(NEUTRAL)],
+        str(second): [tagged(HAPPY)],
+    }
+
+    code = jvnv.main(
+        ["--corpus-dir", str(root), "--model-dir", str(model_dir),
+         "--base", str(model_dir),
+         "--checkpoint", f"round2-ep3={checkpoint}",
+         "--checkpoint", f"round3-ep3={second}",
+         "--device", "cpu"]
+    )
+    assert code == 0
+    assert stubbed.max_live == 1
+    assert [entry[1] for entry in stubbed.constructed] == [
+        None,
+        str(checkpoint),
+        str(second),
+    ]
+
+
+def test_main_survives_a_decode_failure_and_reports_it(jvnv, tmp_path, stubbed):
+    """One bad clip must not kill a run, but it must be visible in the JSON."""
+    root, model_dir, _, clips = corpus_and_models(jvnv, tmp_path)
+    stubbed.answers = {None: [tagged(clip.emotion) for clip in clips]}
+    stubbed.fail_on = {3}
+    out = tmp_path / "report.json"
+
+    assert jvnv.main(
+        ["--corpus-dir", str(root), "--model-dir", str(model_dir),
+         "--base", str(model_dir), "--device", "cpu", "--out", str(out)]
+    ) == 0
+
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    base = payload["per_model"]["base"]
+    assert base["num_decode_failures"] == 1
+    # Scored as a miss over the full population, not quietly excluded.
+    assert base["num_scored"] == 12
+    assert base["num_pred_none"] == 1
+    assert base["accuracy"] == pytest.approx(11 / 12)
+    assert any("decode failed" in message for message in payload["warnings"])
+
+
+def test_main_honours_limit_and_speakers(jvnv, tmp_path, stubbed):
+    root, model_dir, _, _ = corpus_and_models(jvnv, tmp_path)
+    stubbed.answers = {None: [tagged(NEUTRAL)]}
+    out = tmp_path / "report.json"
+
+    assert jvnv.main(
+        ["--corpus-dir", str(root), "--model-dir", str(model_dir),
+         "--base", str(model_dir), "--speakers", "F1", "--limit", "3",
+         "--device", "cpu", "--out", str(out)]
+    ) == 0
+
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["num_clips"] == 3
+    assert payload["corpus"]["speakers"] == ["F1"]
+    assert payload["decode"]["ban_emo_unk"] is False
+
+
+def test_main_records_ban_emo_unk(jvnv, tmp_path, stubbed):
+    root, model_dir, _, clips = corpus_and_models(jvnv, tmp_path)
+    stubbed.answers = {None: [tagged(clip.emotion) for clip in clips]}
+    out = tmp_path / "report.json"
+
+    assert jvnv.main(
+        ["--corpus-dir", str(root), "--model-dir", str(model_dir),
+         "--base", str(model_dir), "--ban-emo-unk", "--device", "cpu",
+         "--out", str(out)]
+    ) == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["decode"]["ban_emo_unk"] is True
+
+
+def test_main_reports_an_unusable_corpus_without_loading_a_model(jvnv, tmp_path, stubbed, capsys):
+    model_dir = tmp_path / "SenseVoiceSmall"
+    model_dir.mkdir()
+
+    code = jvnv.main(
+        ["--corpus-dir", str(tmp_path / "absent"), "--model-dir", str(model_dir),
+         "--base", str(model_dir), "--device", "cpu"]
+    )
+    assert code == 1
+    assert "never downloads" in capsys.readouterr().err
+    assert stubbed.constructed == []
+
+
+def test_main_requires_a_model(jvnv, tmp_path, stubbed, capsys):
+    root = build_corpus(tmp_path / "jvnv")
+    code = jvnv.main(["--corpus-dir", str(root), "--device", "cpu"])
+    assert code == 1
+    assert "nothing to evaluate" in capsys.readouterr().err
+    assert stubbed.constructed == []
+
+
+def test_main_reports_a_missing_checkpoint_before_decoding(jvnv, tmp_path, stubbed, capsys):
+    root, model_dir, _, _ = corpus_and_models(jvnv, tmp_path)
+    code = jvnv.main(
+        ["--corpus-dir", str(root), "--model-dir", str(model_dir),
+         "--checkpoint", f"r3={tmp_path / 'absent.pt'}", "--device", "cpu"]
+    )
+    assert code == 1
+    assert "absent.pt" in capsys.readouterr().err
+    assert stubbed.constructed == []
+
+
+def test_main_fails_when_no_clip_can_be_read(jvnv, tmp_path, stubbed, monkeypatch, capsys):
+    """Every clip failing to decode is a failed run, not an empty report."""
+    root, model_dir, _, _ = corpus_and_models(jvnv, tmp_path)
+
+    def unreadable(path, sample_rate):
+        raise RuntimeError(f"could not decode {path}: synthetic")
+
+    monkeypatch.setattr(jvnv, "load_audio", unreadable)
+    code = jvnv.main(
+        ["--corpus-dir", str(root), "--model-dir", str(model_dir),
+         "--base", str(model_dir), "--device", "cpu"]
+    )
+    assert code == 1
+    assert "no JVNV clip could be decoded" in capsys.readouterr().err
