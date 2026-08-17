@@ -74,20 +74,55 @@
 # ---------------------------------------------------------------------------
 # WHY THE SBATCH HEADER LOOKS LIKE THIS
 # ---------------------------------------------------------------------------
-# * The QOS limits on `research` are a PER-USER AGGREGATE across every running
-#   job: cpu=16, gres/gpu=4, mem=512G, MaxWall 1-00:00:00, MaxSubmitJobsPU=4.
-#   So this job's 2 GPUs / 12 CPUs / 256G are a *share* of that budget, not a
-#   per-job ceiling.
-# * --cpus-per-task=12 rather than 16 is deliberate: it leaves 4 CPUs of the
-#   16-CPU per-user aggregate free so a pseudo-labeling job can run alongside
-#   this one.  Taking all 16 would make that second job queue behind this one
-#   for the full 24 h wall clock.
+# PROVENANCE OF THE NUMBERS BELOW -- READ THIS BEFORE QUOTING THEM
+# An earlier version of this block asserted a set of `research` QOS limits with
+# no indication of where they came from or whether anyone had ever checked.  They
+# were wrong, and because they read as fact they were quoted back as fact.  So:
+# every claim here is now tagged MEASURED or INFERRED, and the commands and date
+# are recorded so the next reader can re-run them rather than trust this comment.
+#
+# MEASURED on 2026-08-18 with:
+#     sacctmgr show qos format=Name,MaxWall,MaxJobsPU,MaxSubmitJobsPU,MaxTRESPU%40,MaxTRESPerJob%40
+#     scontrol show partition research
+#     sacct --starttime 2026-08-01 -o JobID,JobName,QOS,Partition,Timelimit,Elapsed,State
+#
+# * THIS ACCOUNT RUNS UNDER QOS=normal, NOT `research`.  The partition advertises
+#   a research QoS, but the association resolves to `normal`, and the evidence
+#   that settles it is the scheduler's own record rather than any configuration:
+#   the two completed training jobs, 12899 and 12904, are logged by sacct with
+#   QOS=normal.  So the `research` QOS limits this comment used to assert (4 GPUs
+#   per user, 16 CPUs, MaxSubmitJobsPU=4) are most likely NOT the binding
+#   constraint for this account at all.  If you are adapting this script for a
+#   different account, re-run the commands above before assuming anything here
+#   applies to you.
+# * WHAT ACTUALLY BINDS IS NODE CAPACITY (MEASURED): partition `research` has one
+#   node, `t-gpu01`, with 8 GPUs and 32 CPUs, shared with other users.
+# * CONCURRENCY IS A CONVENTION, NOT AN ENFORCED LIMIT (INFERRED).  No per-user
+#   job cap has been confirmed for QOS=normal, so do not treat any number as
+#   enforced -- what governs how much runs at once is node capacity and
+#   contention with other users.  The project's operating convention is a
+#   conservative 2-3 jobs, which fits inside the node: training on 2 GPUs,
+#   labelling on 1, evaluation on 1.
+# * --cpus-per-task=12 leaves room on the 32-CPU node for a labelling or
+#   evaluation job to run alongside this one.  It is sized to the convention
+#   above, not to a per-user CPU quota (the 16-CPU quota it used to cite has not
+#   been confirmed to apply).
 # * --gpus-per-task=2 with --nodes=1 --ntasks=1 is the GRES form verified working
 #   at this site.  --gres=gpu:N is NOT what the working site example used; do not
 #   "simplify" it back to that without re-testing.
-# * --time=24:00:00 is the MaxWall.  A run that needs longer is chained rather
-#   than extended -- see scripts/submit_chunk_chain.sh, which submits N links
-#   with --dependency=afterany so each one resumes from the last checkpoint.
+# * THE WALL CLOCK IS THE DANGEROUS ONE (MEASURED).  This header requests
+#   --time=24:00:00, but sacct records jobs 12899 and 12904 with
+#   Timelimit=08:00:00 -- i.e. the request is being CLAMPED to 8 h and the 24 h
+#   this file's documentation long assumed was never granted.  Round 2 finished
+#   in about 2 h so it never mattered; round 3 trains on a larger corpus, where
+#   it does.  A run truncated at the ceiling looks like a COMPLETED job with a
+#   missing final epoch, and this site's scheduler discards the batch script's
+#   exit code, so nothing in sacct distinguishes it from success.  The preflight
+#   now compares the requested --time against TIME_CEILING_HOURS and says so.
+#   THE MITIGATION IS THE RESUME CHAIN, and it is not optional for a long round:
+#   scripts/submit_chunk_chain.sh submits N links with --dependency=afterany, and
+#   each link resumes from the last checkpoint (RESUME=true reading
+#   ${OUTPUT_DIR}/model.pt), so the run survives being cut at the ceiling.
 #
 # ---------------------------------------------------------------------------
 # WHY THIS SCRIPT NEVER READS SLURM_JOB_ID
@@ -151,6 +186,55 @@ Environment overrides (defaults in the CONFIGURATION block of this file):
   NUM_WORKERS SAVE_INTERVAL KEEP_NBEST RESUME USE_BF16 SMOKE NPROC_PER_NODE
   CHUNK_SIZES STRIDES PAD_LEFTS LOOK_BACKS PYTHON_BIN LR_CEILING
   EXPECT_TRAIN_HOURS EXPECT_TRAIN_HOURS_TOLERANCE EXPECT_VAL_CLIPS
+  INIT_PARAM RICH_WEIGHT EMO_MASK_TOKEN_ID TIME_CEILING_HOURS
+
+  TIME_CEILING_HOURS (default 8) is the wall clock this script believes the
+  scheduler will actually grant.  The preflight compares it against the
+  '#SBATCH --time=' this file requests and warns when the request is larger,
+  because a job cut off at the ceiling leaves a COMPLETED record with a missing
+  final epoch and this site's scheduler discards exit codes, so nothing
+  downstream can tell it from a clean finish.  The default records an
+  observation, not an enforced limit -- sacct logs jobs 12899/12904 with
+  Timelimit=08:00:00 against a 24 h request -- and the enforced value cannot be
+  read from inside the container, since the site wrapper forwards no SLURM_*.
+  Set it to whatever you have confirmed and the warning goes quiet.  The
+  mitigation for a long round is scripts/submit_chunk_chain.sh, which chains
+  jobs with --dependency=afterany so each link resumes from the last checkpoint.
+
+  INIT_PARAM, RICH_WEIGHT and EMO_MASK_TOKEN_ID are all unset by default and add
+  nothing to the command when unset, so an invocation that sets none of them runs
+  exactly the command earlier rounds ran.
+
+  INIT_PARAM is a checkpoint to initialise the weights from (++init_param), i.e.
+  how round N starts from a chosen epoch of round N-1.  The preflight refuses a
+  path that does not exist, because funasr does not: it prints one line and
+  trains from scratch, costing the whole allocation.  RESUME defaults to true and
+  the two coexist -- init_param is applied at model build and a resumed
+  ${OUTPUT_DIR}/model.pt overwrites it afterwards, so a fresh OUTPUT_DIR seeds
+  from INIT_PARAM while a restarted job keeps its own progress.  The preflight
+  says which one supplies the weights; it never fails on the combination.
+
+  RICH_WEIGHT sets ++model_conf.rich_loss_weight (non-negative float).
+  EMO_MASK_TOKEN_ID sets ++model_conf.emo_mask_token_id (non-negative integer);
+  24991 is the id of <|SER|> and maps the emotion slot to ignore_id so it drops
+  out of the loss.  SMOKE keeps both -- proving they load is the point of a smoke
+  run for this change -- but drops INIT_PARAM.
+
+  The preflight also reports a manifest whose emo_target never varies: that is the
+  round-1/2 defect, where every clip was <|NEUTRAL|>, the emotion head trained on
+  a constant and acc_rich saturated at 1.0 while nothing had been learned.  It is
+  a note normally, and a hard failure when EMO_MASK_TOKEN_ID is set outside SMOKE,
+  since masking against constant labels is a contradiction.
+
+  It also cross-checks the <|SER|> sentinel against EMO_MASK_TOKEN_ID, because the
+  two are chosen in different places (the manifest by prepare_vn_data.py
+  --emo-labels, the mask here) and nothing else connects them.  A manifest holding
+  <|SER|> with EMO_MASK_TOKEN_ID unset is FATAL in every mode including SMOKE:
+  model.py raises on it at training step 1 anyway, so the only question is whether
+  that happens before or after the GPU allocation is spent.  The converse --
+  EMO_MASK_TOKEN_ID set against a manifest with no <|SER|> at all -- is a warning,
+  since it is usually the round-2 constant-<|NEUTRAL|> corpus but is legitimate
+  for an ablation.  Both counts are exact, not sampled.
 
   EXPECT_TRAIN_HOURS is unset by default and opt-in: set it to the audio-hours
   the training manifest is supposed to hold and the preflight refuses to start
@@ -684,6 +768,72 @@ RESUME="${RESUME:-true}"
 # preflight.  Measured on the MPS run; override if the model changes.
 CKPT_SIZE_GIB="${CKPT_SIZE_GIB:-2.7}"
 
+# --- wall-clock ceiling ---
+# The wall-clock limit this script BELIEVES the scheduler will enforce, in hours.
+# See the PROVENANCE block at the top of this file: sacct records jobs 12899 and
+# 12904 with Timelimit=08:00:00 even though this header requests --time=24:00:00,
+# so the request is being clamped.  8 is that observation, not a value read from
+# the QOS -- and it CANNOT be read at runtime, because SLURM_* is unset inside the
+# container (see WHY THIS SCRIPT NEVER READS SLURM_JOB_ID).  The preflight
+# compares the requested --time against this and warns on a mismatch; set it to
+# whatever you have confirmed for your account, and the warning goes quiet.
+TIME_CEILING_HOURS="${TIME_CEILING_HOURS:-8}"
+
+# --- seed checkpoint and emotion-head knobs (opt-in; unset = the behaviour this
+#     script has always had) ---
+# All three are EMPTY by default and append nothing to the command when empty, so
+# an invocation that sets none of them emits byte-for-byte the command it emitted
+# before they existed.  Round-2 reproducibility depends on that.
+#
+# INIT_PARAM -- path to a checkpoint to initialise the weights from, i.e. start
+# round N from a chosen epoch of round N-1 rather than from the stock model.
+# VERIFIED against the installed funasr 1.4.1: bin/train_ds.py:105 builds the
+# model through ``AutoModel(**kwargs)``, whose build_model reads this key at
+# auto/auto_model.py:620-634 and hands it to train_utils/load_pretrained_model.py.
+# That function documents the extended ``<file_path>:<src_key>:<dst_key>:<exclude_keys>``
+# form, so a scoped load is available if a later round needs one.
+#
+# WHY THE PREFLIGHT CHECKS THE PATH
+# auto_model.py:633-634 does NOT raise when the file is missing -- it print()s
+# "error, init_param does not exist!" and CARRIES ON training from randomly
+# initialised weights.  That line is one of thousands in a torchrun log, so a
+# typo'd path costs a full GPU allocation and produces a checkpoint that looks
+# ordinary and is worthless.  The preflight refuses the run instead.
+#
+# INIT_PARAM AND RESUME=true: RESUME WINS, AND THAT IS NOT A CONFLICT
+# RESUME defaults to true, so INIT_PARAM is normally set alongside it and the
+# combination is the NORMAL case, not a mistake -- failing on it would make
+# INIT_PARAM unusable without also passing RESUME=false.  It is also already
+# unambiguous in funasr: init_param is applied while the model is being built
+# (train_ds.py:105), and Trainer.resume_checkpoint runs afterwards at
+# train_ds.py:170, overwriting those weights -- but only ``if self.resume`` AND
+# ${OUTPUT_DIR}/model.pt actually exists.  So:
+#   * fresh OUTPUT_DIR (no model.pt) -> INIT_PARAM applies.  This is the intended
+#     round-3 flow: seed from round-2 epoch 3, resume left at its default.
+#   * OUTPUT_DIR already holds model.pt -> the resumed checkpoint wins and
+#     INIT_PARAM is silently ignored, which is also correct: a job restarted by
+#     the chain must not throw away its progress and re-seed.
+# The preflight WARNS and names which of the two will supply the weights, because
+# the difference is invisible in the log otherwise.  It never fails on it.
+INIT_PARAM="${INIT_PARAM:-}"
+
+# RICH_WEIGHT -- weight of the "rich" (emotion/event) loss term, appended as
+# ++model_conf.rich_loss_weight.  Empty leaves the model's own default alone.
+RICH_WEIGHT="${RICH_WEIGHT:-}"
+
+# EMO_MASK_TOKEN_ID -- token id whose emotion slot is mapped to ignore_id, so the
+# emotion position drops out of the loss instead of training against a label that
+# is not really there.  The intended value is 24991, the id of the single token
+# <|SER|> in ${MODEL_DIR}/chn_jpn_yue_eng_ko_spectok.bpe.model.
+#
+# ++model_conf.<key> is the right override path rather than a bare ++<key>:
+# auto_model.py:615-618 merges kwargs["model_conf"] into the dict it then splats
+# into the model constructor (``model_class(**model_conf)``), and
+# SenseVoiceSmall.__init__ takes **kwargs, so both keys arrive as constructor
+# kwargs.  The model's own config.yaml already carries a model_conf: block, which
+# is what these overrides merge into.
+EMO_MASK_TOKEN_ID="${EMO_MASK_TOKEN_ID:-}"
+
 # --- precision ---
 # See the bf16 resolution block further down: this is a REQUEST, not the final
 # answer.  The script probes the installed funasr for a real bf16 option and
@@ -758,6 +908,21 @@ if [ "${SMOKE}" = "1" ]; then
     fi
     EXPECT_TRAIN_HOURS=""
     EXPECT_VAL_CLIPS=""
+
+    # RICH_WEIGHT and EMO_MASK_TOKEN_ID are deliberately KEPT in SMOKE mode.
+    # Proving those two overrides is the entire reason to smoke-test this change:
+    # the run must show acc_emo in the log and show that the ignore_id sentinel
+    # does not blow up in the loss, and dropping them here would test the one
+    # configuration nobody is about to run.
+    #
+    # INIT_PARAM is dropped.  Smoke runs against a handful of generated clips in a
+    # throwaway OUTPUT_DIR to prove the container works; seeding it from a real
+    # round's checkpoint tests nothing extra, and pulling a multi-GiB file over the
+    # shared filesystem is the slowest thing in an otherwise minutes-long check.
+    if [ -n "${INIT_PARAM}" ]; then
+        info "  ignoring INIT_PARAM: SMOKE proves the container, not a training lineage"
+    fi
+    INIT_PARAM=""
 
     MAX_EPOCH=1
     LOG_INTERVAL=1
@@ -1288,6 +1453,28 @@ else
     check_fail "nvidia-smi not found; this job is not seeing a GPU node (the container may have been launched without --gpus-per-task)"
 fi
 
+# The wall clock this job ASKED for, read back out of the #SBATCH header.
+#
+# This is the request, not the grant, and the two are known to differ here (see
+# the PROVENANCE block at the top).  The grant is unreadable from inside: the site
+# wrapper forwards no SLURM_* variables, so there is no job id to hand `scontrol`
+# and no SLURM_TIMELIMIT to read.  The request is therefore the only end of the
+# comparison this script can observe, which is exactly why the check below
+# compares it against a RECORDED OBSERVATION rather than against the live limit.
+#
+# Reads ${BASH_SOURCE[0]} for the same reason site_header_check does: under sbatch
+# that is the scheduler's spool copy, i.e. the exact text the wrapper parsed.
+requested_walltime() {
+    local src="${BASH_SOURCE[0]}" line=""
+    [ -r "${src}" ] || return 0
+    # `|| true` because grep exits 1 on no match, which is a state the caller
+    # reports rather than an error that should trip set -e.
+    line="$(grep -E '^#SBATCH --time=' "${src}" 2>/dev/null | head -n 1 || true)"
+    printf '%s' "${line#\#SBATCH --time=}"
+}
+
+REQUESTED_WALLTIME="$(requested_walltime)"
+
 run_preflight() {
     "${PYTHON_BIN}" - \
         "${DEVICE}" \
@@ -1308,6 +1495,13 @@ run_preflight() {
         "${EXPECT_TRAIN_HOURS}" \
         "${EXPECT_TRAIN_HOURS_TOLERANCE}" \
         "${EXPECT_VAL_CLIPS}" \
+        "${INIT_PARAM}" \
+        "${RICH_WEIGHT}" \
+        "${EMO_MASK_TOKEN_ID}" \
+        "${RESUME}" \
+        "${SMOKE}" \
+        "${REQUESTED_WALLTIME}" \
+        "${TIME_CEILING_HOURS}" \
         <<'PREFLIGHT_PY'
 import json
 import math
@@ -1319,7 +1513,9 @@ import sys
     device, train_jsonl, val_jsonl, model_dir, max_epoch, lr, warmup_arg,
     batch_tokens, samp_cap, units_per_sec, nproc, output_dir, keep_nbest,
     ckpt_gib, bf16, expect_train_hours, expect_train_tol, expect_val_clips,
-) = sys.argv[1:19]
+    init_param, rich_weight, emo_mask_token_id, resume, smoke,
+    requested_walltime, time_ceiling_hours,
+) = sys.argv[1:26]
 
 max_epoch = int(max_epoch)
 lr = float(lr)
@@ -1334,9 +1530,99 @@ bf16 = bf16 == "true"
 errors = []
 notes = []
 
+# The emotion-slot sentinel as it appears in a manifest's emo_target field.  Its
+# token id is 24991, which is what EMO_MASK_TOKEN_ID carries; this is the string
+# side of the same thing, and the manifest only ever holds the string.
+EMO_SENTINEL = "<|SER|>"
+
 
 def fail(msg):
     errors.append(msg)
+
+
+# --- seed checkpoint and emotion-head knobs (opt-in) -----------------------
+# All three are skipped entirely when empty, so an invocation that sets none of
+# them gets byte-for-byte the preflight it got before they existed.
+resume_on = resume == "true"
+smoke_on = smoke == "1"
+
+# Parsed here rather than beside its own check because the emo_target constancy
+# check inside inspect() has to know whether emotion masking was requested.
+emo_mask_id = None
+if emo_mask_token_id.strip():
+    try:
+        emo_mask_id = int(emo_mask_token_id)
+    except ValueError:
+        fail(
+            "EMO_MASK_TOKEN_ID must be a non-negative integer token id, got "
+            f"{emo_mask_token_id!r}. The intended value is 24991, the id of the "
+            "single token <|SER|> in the model's "
+            "chn_jpn_yue_eng_ko_spectok.bpe.model."
+        )
+    else:
+        if emo_mask_id < 0:
+            fail(
+                "EMO_MASK_TOKEN_ID must be a non-negative integer token id, got "
+                f"{emo_mask_token_id!r}."
+            )
+            emo_mask_id = None
+        else:
+            print(f"  emotion masking: model_conf.emo_mask_token_id={emo_mask_id}")
+
+if rich_weight.strip():
+    rich_value = None
+    try:
+        rich_value = float(rich_weight)
+    except ValueError:
+        pass
+    if rich_value is None or math.isnan(rich_value) or math.isinf(rich_value):
+        fail(f"RICH_WEIGHT must be a non-negative number, got {rich_weight!r}")
+    elif rich_value < 0:
+        fail(f"RICH_WEIGHT must be a non-negative number, got {rich_weight!r}")
+    else:
+        print(f"  rich loss: model_conf.rich_loss_weight={rich_value}")
+
+# A missing init_param is NOT fatal inside funasr: auto_model.py:633-634 prints
+# "error, init_param does not exist!" and trains on from randomly initialised
+# weights.  One line in a torchrun log, a whole GPU allocation, and a checkpoint
+# that looks ordinary and is worthless.  Caught here instead, before the queue.
+if init_param.strip():
+    if not os.path.isfile(init_param):
+        fail(
+            f"INIT_PARAM does not exist or is not a file: {init_param}. "
+            "funasr does NOT fail on this -- it prints one line and trains from "
+            "scratch instead -- so a typo here silently costs the whole run. "
+            "The path must be container-internal (under the #CONTAINER bind "
+            "mounts), not a login-node path."
+        )
+    elif not os.access(init_param, os.R_OK):
+        fail(f"INIT_PARAM exists but is not readable: {init_param}")
+    else:
+        size_gib = os.path.getsize(init_param) / 1024**3
+        print(f"  init_param: {init_param} ({size_gib:.2f} GiB)")
+        # Not a failure: RESUME defaults to true, so this combination is the
+        # normal way INIT_PARAM is used.  See the INIT_PARAM block in the
+        # CONFIGURATION section -- init_param is applied when the model is built
+        # and resume_checkpoint overwrites it afterwards, but only if a
+        # checkpoint is actually there.  Say which one wins, because nothing in
+        # the training log distinguishes the two.
+        if resume_on:
+            resume_ckpt = os.path.join(output_dir, "model.pt")
+            if os.path.isfile(resume_ckpt):
+                notes.append(
+                    f"INIT_PARAM is set but RESUME=true and {resume_ckpt} already "
+                    "exists, so the RESUMED checkpoint wins and INIT_PARAM will be "
+                    "ignored (init_param is applied at model build, then "
+                    "Trainer.resume_checkpoint overwrites it). This is correct for "
+                    "a restarted/chained job. To seed from INIT_PARAM instead, "
+                    "point OUTPUT_DIR at a fresh directory or pass RESUME=false."
+                )
+            else:
+                notes.append(
+                    f"INIT_PARAM is set with RESUME=true, but no {resume_ckpt} "
+                    "exists yet, so the weights come from INIT_PARAM. A later "
+                    "restart against this same OUTPUT_DIR will resume instead."
+                )
 
 
 # --- torch / CUDA ----------------------------------------------------------
@@ -1436,6 +1722,125 @@ def inspect(path, label):
     if missing_keys:
         fail(f"{label}: records lack required key(s): {', '.join(missing_keys)}")
         return None
+
+    # --- constant emo_target -----------------------------------------------
+    # THE ROUND-1/2 DEFECT, WHICH NOTHING IN THE PIPELINE CAUGHT.
+    # Every clip was stamped <|NEUTRAL|>, so the emotion head trained against a
+    # constant, acc_rich saturated at 1.0 by step 880, and the run looked like it
+    # was learning beautifully.  A constant label is not visible to any other
+    # check here: the manifest is well-formed, the audio is present, the hours are
+    # right, the loss goes down.  It is only visible by looking at the label
+    # distribution, which is what this does.
+    #
+    # emo_target is absent from older manifests; that is not the defect and says
+    # nothing.  Only a field that is PRESENT and never varies is reported.
+    emo_values = [r["emo_target"] for r in records if "emo_target" in r]
+    if emo_values:
+        # One pass, counted EXACTLY over every record -- not the 20-record sample
+        # the audio and source_len checks below use.  The sentinel check depends
+        # on that: "this manifest contains no <|SER|> anywhere" is not a claim a
+        # sample can support, and it gates a fatal branch.
+        emo_counts = {}
+        for value in emo_values:
+            emo_counts[value] = emo_counts.get(value, 0) + 1
+        distinct = set(emo_counts)
+        sentinel_n = emo_counts.get(EMO_SENTINEL, 0)
+        top = max(emo_counts, key=emo_counts.get)
+        print(
+            f"  {label}: emo_target {len(distinct)} distinct value(s) over "
+            f"{len(emo_values)}/{len(records)} records, most common {top!r} "
+            f"{100.0 * emo_counts[top] / len(emo_values):.1f}%; {EMO_SENTINEL} "
+            f"sentinel {sentinel_n} ({100.0 * sentinel_n / len(emo_values):.1f}%)"
+        )
+
+        if len(distinct) == 1:
+            only = next(iter(distinct))
+            coverage = (
+                "100% of"
+                if len(emo_values) == len(records)
+                else f"{len(emo_values)}/{len(records)} of"
+            )
+            msg = (
+                f"{label}: emo_target is the single value {only!r} across "
+                f"{coverage} {len(records)} records -- the emotion label carries no "
+                "information and an emotion head trained on it will report a "
+                "near-perfect acc_rich while having learned nothing. This is "
+                "exactly the round-1/2 defect. Re-label the manifest (see "
+                "scripts/label_emotions_*.py) or mask the emotion slot out of the "
+                "loss with EMO_MASK_TOKEN_ID."
+            )
+            # Fatal only when emotion masking was actually requested, and only
+            # outside SMOKE.  Asking to mask the emotion slot against a manifest
+            # whose emotion labels are constant is a contradiction: the run is
+            # either pointed at the wrong manifest or the labelling step never
+            # ran, and either way it is not the experiment that was intended.
+            #
+            # SMOKE is exempt on purpose.  A DEFAULT smoke corpus is constant by
+            # construction -- scripts/make_smoke_data.py gives every generated clip
+            # the same emo_target unless it is asked for a mixture -- so failing
+            # here would block the one run that exists to prove these overrides
+            # load at all.  On throwaway plumbing data a degenerate label
+            # distribution is expected and harmless.
+            #
+            # This is an exemption for the DEFAULT smoke corpus specifically, not a
+            # claim that smoke manifests can never vary: make_smoke_data.py can be
+            # asked for a realistic mixture, and such a run simply does not trip
+            # this branch.  Do not widen the exemption to the sentinel check below
+            # on the strength of this one -- see the reasoning there.
+            if emo_mask_id is not None and not smoke_on:
+                fail(msg)
+            else:
+                notes.append(msg)
+
+        # --- sentinel / EMO_MASK_TOKEN_ID agreement -------------------------
+        # These two settings are chosen in two different places -- the manifest
+        # by scripts/prepare_vn_data.py --emo-labels, the mask by the sbatch
+        # environment -- and nothing else connects them.
+        #
+        # model.py raises RuntimeError from forward() when it meets the sentinel
+        # with no emo_mask_token_id configured, which is the right guard but fires
+        # at TRAINING STEP 1: after the queue wait, the GPU allocation, the
+        # dataloader build and the checkpoint load.  Everything needed to catch it
+        # is already in this manifest, so catch it here for free instead.
+        #
+        # NOT exempt under SMOKE, unlike the constant-label check above, and the
+        # difference is deliberate: a constant label is a DATA-QUALITY judgement
+        # that is meaningless on generated throwaway clips, whereas this is a hard
+        # runtime fact -- the forward pass raises just as reliably on smoke data as
+        # on the real corpus, so exempting it would only move the same crash a few
+        # minutes later.  scripts/make_smoke_data.py can emit a realistic sentinel
+        # mixture precisely so the smoke run exercises this path; a smoke run that
+        # asks for that mixture and then forgets EMO_MASK_TOKEN_ID has proved
+        # nothing, and must not be allowed to look like it did.
+        #
+        # Applied to the val manifest as well as train: Trainer.validate_epoch
+        # calls the same forward_step (trainer_ds.py:849), so a sentinel in val
+        # raises identically, just at the first validation instead of step 1.
+        if sentinel_n and emo_mask_id is None:
+            fail(
+                f"{label}: {sentinel_n} record(s) "
+                f"({100.0 * sentinel_n / len(emo_values):.1f}%) carry the "
+                f"{EMO_SENTINEL} emotion sentinel but EMO_MASK_TOKEN_ID is not "
+                "set, so the emotion slot would be trained AGAINST the sentinel "
+                "instead of masked out of the loss. model.py raises RuntimeError "
+                "on this at training step 1, after the allocation is already "
+                "spent. Fix whichever matches what you meant to run: set "
+                "EMO_MASK_TOKEN_ID=24991 (the id of "
+                f"{EMO_SENTINEL}) to drop the emotion slot from the loss, or "
+                "rebuild the manifest WITHOUT scripts/prepare_vn_data.py "
+                "--emo-labels so it carries real emotion labels."
+            )
+        elif emo_mask_id is not None and sentinel_n == 0:
+            notes.append(
+                f"{label}: EMO_MASK_TOKEN_ID={emo_mask_id} is set but not one of "
+                f"{len(emo_values)} records carries the {EMO_SENTINEL} sentinel, "
+                "so the mask will never fire and the emotion head trains on the "
+                "labels as they are. MOST LIKELY CAUSE: this manifest was built "
+                "without scripts/prepare_vn_data.py --emo-labels, i.e. it is the "
+                "round-2 constant-<|NEUTRAL|> corpus, which would silently "
+                "reproduce the exact defect round 3 exists to repair. Legitimate "
+                "only if this is a deliberate ablation."
+            )
 
     lens = [int(r["source_len"]) for r in records]
     seconds = [n / units_per_sec for n in lens]
@@ -1663,6 +2068,103 @@ try:
 except Exception as exc:
     notes.append(f"could not check free space on {probe}: {exc}")
 
+
+# --- wall clock ------------------------------------------------------------
+# A run cut off at the wall clock is the failure this script is least able to
+# see. It leaves a COMPLETED job with a missing final epoch, and the site's
+# scheduler discards the batch script's exit code, so sacct cannot tell it from a
+# clean finish. The job-status sentinel cannot help either: the process is killed,
+# so nothing gets the chance to write SENSEVOICE_JOB_FAILED.
+#
+# WHAT THIS CAN AND CANNOT CHECK
+# It compares the wall clock this job REQUESTED against a RECORDED OBSERVATION of
+# what the scheduler granted last time. It does NOT read the enforced limit: that
+# is unreadable from inside the container (SLURM_* is unset, so there is no job id
+# for scontrol), so this is a comparison against a number a human wrote down, and
+# it is stale the moment the QOS changes. Re-measure with the commands in the
+# PROVENANCE block at the top of this file if it disagrees with reality.
+#
+# WARNS RATHER THAN FAILS, deliberately. The ceiling is an observation of two
+# jobs, not a read of enforced configuration; the truncation it predicts is fully
+# recoverable through the resume chain; and the --time line cannot be templated
+# from the environment, so a fatal check would block every run behind a manual
+# edit of a site-specific line on evidence this file itself labels as observed
+# rather than enforced.
+def parse_slurm_duration(text):
+    """Slurm accepts M, M:S, H:M:S, D-H, D-H:M and D-H:M:S. Returns hours."""
+    text = text.strip()
+    if not text:
+        return None
+    days = 0
+    if "-" in text:
+        head, _, text = text.partition("-")
+        try:
+            days = int(head)
+        except ValueError:
+            return None
+        if not text:
+            return days * 24.0
+    parts = text.split(":")
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return None
+    if days or len(parts) == 3:
+        # D-H[:M[:S]] and H:M:S both count from the left.
+        nums += [0] * (3 - len(nums))
+        h, m, s = nums[:3]
+    elif len(parts) == 2:
+        h, m, s = 0, nums[0], nums[1]  # M:S
+    else:
+        h, m, s = 0, nums[0], 0  # bare minutes
+    return days * 24.0 + h + m / 60.0 + s / 3600.0
+
+ceiling_h = None
+try:
+    ceiling_h = float(time_ceiling_hours)
+except ValueError:
+    pass
+if ceiling_h is None or not ceiling_h > 0:
+    fail(f"TIME_CEILING_HOURS must be a positive number of hours, got {time_ceiling_hours!r}")
+elif not requested_walltime.strip():
+    notes.append(
+        "could not read '#SBATCH --time=' from this script, so the requested wall "
+        f"clock could not be checked against the {ceiling_h:g} h ceiling. If this "
+        "run is long, submit it through scripts/submit_chunk_chain.sh so it "
+        "survives being cut off."
+    )
+else:
+    requested_h = parse_slurm_duration(requested_walltime)
+    if requested_h is None:
+        notes.append(
+            f"could not parse '#SBATCH --time={requested_walltime}', so the "
+            f"requested wall clock could not be checked against the "
+            f"{ceiling_h:g} h ceiling"
+        )
+    elif requested_h > ceiling_h:
+        notes.append(
+            f"WALL CLOCK: this job requests --time={requested_walltime} "
+            f"({requested_h:g} h) but the scheduler is believed to grant only "
+            f"{ceiling_h:g} h (TIME_CEILING_HOURS), so the request is expected to "
+            f"be CLAMPED and the job killed at ~{ceiling_h:g} h. That leaves a "
+            "COMPLETED job with a missing final epoch: the exit code is discarded "
+            "by this site's scheduler, and a killed process never gets to write "
+            "the job-status sentinel, so NOTHING downstream can tell it from a "
+            "clean finish. MITIGATION: submit through "
+            "scripts/submit_chunk_chain.sh, which chains links with "
+            "--dependency=afterany so each one resumes from "
+            f"{os.path.join(output_dir, 'model.pt')}; a single job is only safe if "
+            f"it finishes inside {ceiling_h:g} h. This compares the REQUEST against "
+            "a recorded observation -- the enforced limit cannot be read from "
+            "inside the container (SLURM_* is unset). If it is wrong, re-measure "
+            "and set TIME_CEILING_HOURS."
+        )
+    else:
+        print(
+            f"  wall clock: requested --time={requested_walltime} "
+            f"({requested_h:g} h), within the believed {ceiling_h:g} h ceiling"
+        )
+
 for note in notes:
     print(f"  note: {note}")
 for err in errors:
@@ -1783,6 +2285,20 @@ CMD=(
     "++output_dir=${OUTPUT_DIR}"
     "hydra.run.dir=${hydra_run_dir}"
 )
+
+# Appended rather than written into the array above so that an invocation setting
+# none of them produces a command that is byte-identical to the one this script
+# emitted before these knobs existed.  Hydra overrides are order-independent, so
+# trailing them is safe.
+if [ -n "${INIT_PARAM}" ]; then
+    CMD+=("++init_param=${INIT_PARAM}")
+fi
+if [ -n "${RICH_WEIGHT}" ]; then
+    CMD+=("++model_conf.rich_loss_weight=${RICH_WEIGHT}")
+fi
+if [ -n "${EMO_MASK_TOKEN_ID}" ]; then
+    CMD+=("++model_conf.emo_mask_token_id=${EMO_MASK_TOKEN_ID}")
+fi
 
 # ---------------------------------------------------------------------------
 # OUTPUT_DIR concurrency lock
