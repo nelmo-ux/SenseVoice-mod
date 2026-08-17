@@ -1,0 +1,346 @@
+# syntax=docker/dockerfile:1
+# ==========================================================
+#   SenseVoice text emotion labeller — GPU cluster image
+#   (Qwen2.5-14B-Instruct through vLLM, offline batch mode)
+# ==========================================================
+#
+# Runs scripts/label_emotions_text.py, the transcript-only half of round 3's
+# emotion pseudo-labelling. It shares nothing at runtime with the ASR training
+# image (docker/Dockerfile.cluster): different model, different framework, no
+# common code path beyond the Python standard library.
+#
+# Build and push (run from THIS directory; substitute your own hostname and
+# Harbor project for the placeholders, exactly as in Dockerfile.cluster):
+#
+#   docker build --no-cache --platform linux/amd64 \
+#       --build-context scripts=../scripts \
+#       -t <cluster-registry>/<project>/sensevoice-textlabel:vllm0.27.1-v1 \
+#       -f Dockerfile.textlabel .
+#   docker push <cluster-registry>/<project>/sensevoice-textlabel:vllm0.27.1-v1
+#
+# Two things about that command differ from Dockerfile.cluster's and are not
+# cosmetic:
+#
+#   --platform linux/amd64 is mandatory, not a convention. The cluster is
+#   x86_64 H100 NVL; vLLM publishes a manylinux_2_28_x86_64 wheel and a separate
+#   aarch64 one, so a build that inherits an Apple-silicon builder's native
+#   platform would silently install the aarch64 wheel and produce an image no
+#   node can run. Building on an x86_64 host is strongly preferred: under qemu
+#   emulation the verification layers below execute ~300 MB of emulated native
+#   extension code and take minutes rather than seconds.
+#
+#   --build-context scripts=../scripts exists so the build context stays this
+#   directory. The verification layer needs one file from the repo
+#   (scripts/label_emotions_text.py) and the repo root is 5.7 GB, most of it
+#   outputs/ and .venv/ — with --no-cache that whole tree would be handed to the
+#   daemon on every build. The named context transfers scripts/ (about 1 MB)
+#   instead, and the file is bind-mounted for the check rather than COPY'd, so
+#   it lands in no layer. If your Docker is too old for named contexts, build
+#   from the repo root with `-f docker/Dockerfile.textlabel .`, change the
+#   --mount below to `type=bind,source=scripts,target=/mnt/scripts` and add a
+#   .dockerignore covering outputs/, .venv/, data/, models/ and .git/ first.
+#
+# The tag must stay in sync with whatever sbatch script requests this image, for
+# the same reason Dockerfile.cluster documents: a stale tag that still exists in
+# the registry fails quietly with old contents instead of loudly at pull time.
+#
+# ---------------------------------------------------------------------------
+# Why this is a second image and not a few more lines in Dockerfile.cluster
+# ---------------------------------------------------------------------------
+#
+# The conflict is in the dependency metadata, so no install order resolves it.
+# Measured against vllm 0.27.1's declared requirements:
+#
+#   vllm 0.27.1 requires opencv-python-headless>=4.13.0
+#   every opencv-python-headless from 4.13.0.90 up requires
+#       numpy>=2 ; python_version >= "3.9"
+#
+#   vllm 0.27.1 requires numba==0.65.0
+#   requirements.txt caps numba<0.61
+#
+# requirements.txt pins numpy<=1.26.4, and its scipy<1.14 / numba<0.61 /
+# llvmlite<0.44 / scikit-learn<1.6 / umap-learn<0.5.8 caps exist for no other
+# purpose than holding that ceiling (commit 319195d). `numpy<=1.26.4` and
+# `numpy>=2` have an empty intersection, so one install set cannot contain both
+# stacks — this is arithmetic, not a resolver preference.
+# tests/test_textlabel_image.py pins that reasoning so a future attempt to merge
+# the two images is told why it cannot before it spends a build on finding out.
+#
+# The torch situation is subtler than the numpy one and worth stating exactly,
+# because it looks like a non-conflict today. vllm 0.27.1 pins torch==2.13.0,
+# which is the very version Dockerfile.cluster installs and does satisfy
+# requirements.txt's torch>=2.12.1. But it is an *equality* pin that moves with
+# every vLLM release, and it comes with torchvision==0.28.0 and torchcodec>=0.14
+# attached — so a shared image would hand control of the training stack's torch
+# to whatever vLLM was compiled against next. Splitting costs nothing here: the
+# labeller reads a manifest and writes a JSONL, and imports nothing from the
+# training stack.
+#
+# ---------------------------------------------------------------------------
+# Base image
+# ---------------------------------------------------------------------------
+#
+# Deliberately NOT the site's NGC PyTorch mirror that Dockerfile.cluster uses.
+# That base earns its place there by supplying a driver-matched CUDA userspace
+# for a torch this project then has to replace anyway; here it would be pure
+# cost. vLLM's wheels are compiled against exactly torch==2.13.0 and would
+# replace NGC's custom-ABI torch 2.6 on the first pip invocation, so the whole
+# reason to start from NGC evaporates, while its two documented defects (the
+# .egg wheel tags that crash `pip check`, and the dead extra-index-url in five
+# pip config paths) would come along for free.
+#
+# nvidia/cuda:13.0.3-runtime-ubuntu24.04 instead, for three concrete reasons:
+#
+#   1. CUDA major version. The PyPI torch 2.13.0 wheel that vLLM pins depends on
+#      nvidia-cudnn-cu13, nvidia-nccl-cu13 and nvidia-nvshmem-cu13 — it is a
+#      CUDA 13 build. Pairing it with a CUDA 12 base would be a mismatch this
+#      project has no reason to introduce.
+#   2. Forward compatibility with the node driver, which is the reason this is
+#      a CUDA base and not python:3.12-slim. The node driver version is not
+#      recorded anywhere in this repo; all that is known is that the training
+#      image's cu126 stack runs there, which establishes r560-era at the low end
+#      and says nothing about whether CUDA 13's own r580 requirement is met.
+#      The CUDA 13 base installs cuda-compat-13-0 and its NVIDIA_REQUIRE_CUDA
+#      declares driver families down to r535, so the cu13 wheels can run against
+#      an older driver through the forward-compatibility path — which applies to
+#      datacenter GPUs, and H100 NVL is one. A slim Python base carries no compat
+#      libraries at all and would simply need the node driver to already be new
+#      enough, discovered hours after the build passed.
+#      That declaration has a second benefit: the container runtime refuses to
+#      start on a genuinely too-old driver, which is the failure mode to want —
+#      immediate and named, rather than a CUDA error deep inside engine startup.
+#   3. Ubuntu 24.04 ships Python 3.12, inside vllm 0.27.1's >=3.10,<3.15 window.
+#
+# The weights are NOT baked in; see the staging note near the bottom.
+FROM nvidia/cuda:13.0.3-runtime-ubuntu24.04
+
+# Python plus the two small system pieces the wheels expect. The base is a CUDA
+# runtime image, not a Python one, so nothing here is redundant with it.
+#
+# libgomp1 is cheap insurance: PyTorch's manylinux wheels vendor their own
+# OpenMP runtime, but not every numeric wheel in vLLM's dependency tree does,
+# and a missing libgomp.so.1 surfaces as an ImportError at engine start.
+#
+# python3-venv rather than python3-pip: Ubuntu 24.04 marks its system Python
+# externally managed (PEP 668), so a system-wide pip install would be refused.
+# A venv is the supported answer and also keeps every package this image adds in
+# one directory that apt has no opinion about.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        python3 \
+        python3-venv \
+        libgomp1 \
+        ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Everything below installs into the venv, and so does anything a future edit
+# adds, because PATH puts it first. VIRTUAL_ENV is set so tooling that inspects
+# it agrees with PATH.
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+RUN python3 -m venv /opt/venv \
+ && python -m pip install --no-cache-dir --upgrade pip \
+ && python -V \
+ && pip -V
+
+# The one install layer. vLLM and transformers are resolved together, in a
+# single pip invocation, so the resolver sees both requirement sets at once —
+# unlike Dockerfile.cluster, which is forced into two invocations by needing a
+# different index for torch and therefore needs a separate metadata check to
+# notice one install breaking the other.
+#
+# On the pins:
+#
+#   vllm==0.27.1 — exact, because the image tag names this version and an
+#   unpinned install would make the tag a lie the moment upstream releases
+#   again. The floor that the *code* requires is much lower: the labeller calls
+#   LLM.chat(conversations, params, use_tqdm=False), so it needs a chat() that
+#   takes a sequence of conversations and accepts use_tqdm, which is roughly
+#   vllm>=0.6.0. 0.27.1 is simply the current release; the verification layer
+#   below re-proves that API shape rather than trusting the version number.
+#
+#   transformers==5.15.0 — exact for reproducibility, not for compatibility.
+#   What the labeller actually needs is a transformers new enough to carry the
+#   Qwen2.5 chat template (>=4.45); vllm 0.27.1 already demands >=5.5.3, so the
+#   real floor is set by vLLM and this pin only stops two builds of the same tag
+#   from disagreeing. It is named explicitly rather than left to vLLM's
+#   requirement because the chat template is this script's dependency, not
+#   vLLM's, and a reader should be able to see that from this file.
+#
+# No PIP_CONSTRAINT file here, which is the other deliberate inversion relative
+# to Dockerfile.cluster. There a constraints file defends a numpy ceiling and a
+# torch pair against funasr's transitive dependencies. This image has no ceiling
+# to defend: it *wants* whatever numpy and torch vLLM was compiled against, and
+# constraining them would only give the resolver a way to produce a combination
+# nobody tested.
+#
+# --no-cache-dir because the wheel set here is large enough (the vLLM wheel
+# alone is 313 MB, before torch and the nvidia-*-cu13 runtime wheels) that a
+# retained pip cache would be a visible fraction of the image.
+RUN pip install --no-cache-dir \
+        vllm==0.27.1 \
+        transformers==5.15.0
+
+# Dependency-consistency check, carried over from Dockerfile.cluster unchanged
+# in shape and narrowed to this image's packages.
+#
+# `pip check` is not used, but for a different reason than there. The .egg
+# packaging defect that crashes it is NGC's and does not exist in this base, so
+# `pip check` would in principle run here. It is still not the right check: it
+# would police vLLM's entire transitive tree, ~60 direct requirements deep, and
+# fail this build over upstream pins that are not ours to fix. So the check is
+# aimed at exactly the packages this file installs, through importlib.metadata,
+# which reads metadata and never parses wheel tags. Names are compared PEP 503
+# normalised; requirements guarded by an extra we did not request are skipped.
+#
+# This layer and the transformers one below import `packaging`, which is not
+# installed here on purpose but is not incidental either: transformers declares
+# packaging>=20.0 and huggingface_hub declares packaging>=20.9, so it is present
+# whenever the install above succeeded. Worth knowing because the base is a bare
+# CUDA image and ships no Python packages of its own.
+RUN python -c 'import importlib.metadata as md, re; \
+from packaging.requirements import Requirement; \
+ours=("vllm","transformers","torch","numpy"); \
+norm=lambda n: re.sub("[-_.]+", "-", n).lower(); \
+have={norm(d.metadata["Name"] or ""): d.version for d in md.distributions()}; \
+need=[(p, r) for p in ours for r in [Requirement(s) for s in (md.requires(p) or [])] if not r.marker or r.marker.evaluate({"extra": ""})]; \
+missing=["%s requires %s, which is not installed" % (p, r) for p, r in need if norm(r.name) not in have]; \
+conflict=["%s requires %s, but %s is installed" % (p, r, have[norm(r.name)]) for p, r in need if norm(r.name) in have and not r.specifier.contains(have[norm(r.name)], prereleases=True)]; \
+print("checked %d declared requirements of: %s" % (len(need), ", ".join(ours))); \
+print("\n".join(missing + conflict) or "all declared requirements satisfied"); \
+assert not (missing + conflict), "declared requirements of the installed packages are not satisfied; see the list above."'
+
+# Runtime proof. Dockerfile.cluster's equivalent is what caught the missing
+# torchaudio before a job was ever queued, and the argument for it is stronger
+# here. Cluster turnaround is measured in hours and this labelling pass is a
+# multi-hour job over ~550k lines, so an ImportError that waits for the
+# scheduler already costs far more than a failed build — but on top of that the
+# scheduler discards the batch script's exit code, so a job that died on an
+# import is reported as a job that succeeded. The image cannot rely on the node
+# telling anyone it was broken; these layers are the last point at which it can
+# still say so.
+#
+# No GPU is present during a build, which is not a limitation for what needs
+# proving. Everything below is import-time and signature-level:
+#
+#   1. numpy is on the 2.x side of the split. This is the whole reason the image
+#      exists, asserted rather than assumed, so that anyone who later adds a
+#      package that drags numpy back under the training stack's ceiling learns
+#      it here.
+#   2. `from vllm import LLM, SamplingParams` — the exact import the labeller's
+#      backend performs on first use, and the one that would otherwise fail on
+#      the node after the model was already being loaded.
+#   3. The two call signatures the labeller depends on, checked by binding the
+#      arguments it actually passes rather than by looking for parameter names.
+#      That distinction matters: max_model_len is not a named parameter of
+#      LLM.__init__ in 0.27.1, it is absorbed by **kwargs and forwarded to the
+#      engine args, so a name-based check would fail on a call that works.
+#      Binding also proves chat() still takes sampling_params second
+#      positionally, which is how the labeller passes it.
+#   4. SamplingParams built with the labeller's exact arguments — cheap, and it
+#      is the one object the script constructs whose accepted fields have moved
+#      across vLLM releases.
+RUN python -c 'import importlib.metadata as md, inspect; \
+import numpy as np; \
+from vllm import LLM, SamplingParams; \
+print("vllm", md.version("vllm"), "| transformers", md.version("transformers"), "| torch", md.version("torch"), "| numpy", np.__version__); \
+assert int(np.__version__.split(".")[0]) >= 2, "numpy %s is below 2.x. That is the training stack ceiling (requirements.txt: numpy<=1.26.4), and vLLM cannot run under it; something in this image pulled numpy back down." % np.__version__; \
+inspect.signature(LLM.__init__).bind_partial(None, model="/staged/models/Qwen2.5-14B-Instruct", tensor_parallel_size=1, gpu_memory_utilization=0.9, max_model_len=2048, dtype="bfloat16", seed=0); \
+print("LLM.__init__ accepts the labeller arguments"); \
+inspect.signature(LLM.chat).bind_partial(None, [[{"role": "user", "content": "x"}]], SamplingParams(), use_tqdm=False); \
+print("LLM.chat accepts (conversations, sampling_params, use_tqdm=False)"); \
+p=SamplingParams(temperature=0.0, top_p=1.0, max_tokens=8, logprobs=1); \
+print("SamplingParams OK:", p.temperature, p.top_p, p.max_tokens, p.logprobs)'
+
+# The chat template side, which the layer above does not cover. vLLM owns the
+# model *implementation*; transformers owns the tokenizer and the chat template
+# that turns the labeller's [{"role": ...}] messages into the token sequence
+# Qwen2.5 was instruction-tuned on. A wrong or missing template does not raise —
+# it produces a model that answers something other than a bare class name, which
+# parse_response rejects, which becomes label: null, which the merge masks. The
+# run then finishes, writes a complete-looking file, and supervises nothing.
+#
+# That is the failure this cluster is worst at surfacing, because the scheduler
+# discards the batch script's exit code: a broken image reports a successful job.
+# So transformers is imported for real rather than trusted from its metadata,
+# and AutoConfig.for_model("qwen2") is asked to build the config class for the
+# staged checkpoint's model_type (Qwen2.5-14B-Instruct declares "qwen2" /
+# Qwen2ForCausalLM). It raises ValueError on an unrecognised type, needs no
+# weights and no network, and is public API — so it proves this transformers
+# knows the architecture without pretending to prove the whole load path.
+#
+# The >=4.45 floor is the labeller's own requirement, checked separately from
+# vLLM's much higher one so that the reason for it stays visible: if vLLM ever
+# relaxes its transformers pin, this is the bound that still has to hold.
+RUN python -c 'import transformers; \
+from packaging.version import Version; \
+from transformers import AutoConfig, AutoTokenizer; \
+print("transformers", transformers.__version__); \
+assert Version(transformers.__version__) >= Version("4.45"), "transformers %s predates the Qwen2.5 chat template (>=4.45 required by scripts/label_emotions_text.py)" % transformers.__version__; \
+cfg=AutoConfig.for_model("qwen2"); \
+print("qwen2 config class:", type(cfg).__name__); \
+print("AutoTokenizer available:", AutoTokenizer.__name__)'
+
+# The script itself. Bind-mounted from the named build context for the duration
+# of this one command, so it leaves nothing in any layer — the copy that runs on
+# the node comes from the repo bind mount, exactly as in Dockerfile.cluster.
+#
+# Worth being precise about what this proves and what it does not: the file
+# checked here is the build-context copy, not the one the job will mount, so
+# this verifies that *the image satisfies the script's imports*, not that the
+# runtime copy is identical. That is the half that can go wrong silently.
+#
+# The laziness assertion is the interesting one. The labeller imports vLLM
+# inside VllmLabeller._ensure_loaded specifically so the module, and its unit
+# tests, stay importable without a GPU stack; if that ever regresses to a
+# top-level import, every test machine without vLLM starts failing and the
+# reason will not be obvious. Checking it here, where vLLM *is* installed and so
+# a regression would otherwise pass unnoticed, is the cheapest place to catch it.
+#
+# PYTHONDONTWRITEBYTECODE keeps the check from trying to drop __pycache__ into
+# the mounted context.
+RUN --mount=from=scripts,target=/mnt/scripts \
+    PYTHONDONTWRITEBYTECODE=1 python -c 'import sys; \
+sys.path.insert(0, "/mnt/scripts"); \
+import label_emotions_text as t; \
+assert "vllm" not in sys.modules, "importing label_emotions_text pulled in vllm at module level; the backend import is supposed to stay lazy so the module and its unit tests run without a GPU stack."; \
+msgs=t.build_prompt("test"); \
+assert [m["role"] for m in msgs] == ["system", "user"], msgs; \
+print("label_emotions_text imported OK | classes:", len(t.TEXT_CLASSES), "| default model:", t.DEFAULT_MODEL)'
+
+# Qwen2.5-14B-Instruct is roughly 28 GB in bf16 and is deliberately NOT baked
+# in. Two reasons, both practical: a layer that size makes every node pull slow
+# and the cluster's storage quota is already tight, and weights that live in the
+# image can only be changed by rebuilding and repushing it.
+#
+# They are staged on the shared filesystem instead and passed by path, following
+# the same convention as the acoustic labeller's emotion2vec directory:
+#
+#   #CONTAINER -v /home/share/<user>/models:/staged/models
+#
+#   python scripts/label_emotions_text.py \
+#       --manifest /corpus/vn/train.jsonl \
+#       --model /staged/models/Qwen2.5-14B-Instruct \
+#       --out /outputs/emo_text.jsonl
+#
+# Do not mount them under /data. The site mounts a local scratch filesystem
+# there after the bind mounts are applied, so the mount silently resolves to
+# someone else's directory — documented in docs/chunk_training.md, and it fails
+# invisibly rather than loudly.
+#
+# The sbatch script also needs `#CONTAINER --shm-size 32G` if it ever runs with
+# --tensor-parallel-size > 1: vLLM's workers are separate processes that talk
+# through shared memory, and Docker's 64 MB default is not enough for them.
+
+# A local path is the expected --model, so nothing should reach the hub, and a
+# compute node with no egress turns an accidental hub call into a hang rather
+# than an error. Failing fast is better; override with `-e HF_HUB_OFFLINE=0` on
+# a node that does have egress and genuinely wants to download.
+ENV HF_HUB_OFFLINE=1
+
+# No ENTRYPOINT: the site sbatch wrapper passes --disable-entrypoint, so one set
+# here would be bypassed and would only mislead whoever reads this file.
+#
+# Nothing from the repo is COPY'd — it is bind-mounted at runtime by the job
+# script, so no credentials and no stale code are baked in.
+WORKDIR /workspace
