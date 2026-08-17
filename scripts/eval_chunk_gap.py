@@ -52,6 +52,33 @@ seen mid-stream; it stops short of the tail (up to ``chunk_size - 1`` buffered
 frames plus ``pad_right`` withheld ones), so its CER carries deletions that are
 an artefact of where the stream was cut, not a quality signal.  Both are in the
 JSON; only the former is scored.
+
+Emotion (SER)
+-------------
+
+Rounds 1 and 2 trained the emotion slot against a constant ``<|NEUTRAL|>``
+target and collapsed the head, and *this script could not see it*: every CER
+path runs ``strip_rich_tags`` first, so the emotion token never reached a
+metric.  The ``ser`` block under ``japanese.val.metrics`` closes that hole.  It
+reads ``emo_target`` from the manifest, parses the predicted emotion out of the
+**full-attention** decode (in the streaming product the authoritative final
+result is a full-attention pass, so that is the prediction a user actually
+gets), and reports accuracy, macro-F1, per-class P/R/F1 and a confusion matrix.
+
+Two properties of that block matter more than the numbers in it:
+
+* It states its own ``num_scored``.  Clips whose ``emo_target`` is the
+  ``<|SER|>`` mask sentinel, absent, or not an emotion token are excluded and
+  counted separately, so the population behind the accuracy is never implicit.
+* It refuses to report a meaningless number silently.  A manifest with no
+  ``emo_target`` at all comes back ``status="na"``; one whose every reference is
+  the same token - exactly the round-2 all-``<|NEUTRAL|>`` case - comes back
+  ``status="degenerate"`` rather than as a healthy-looking 100% accuracy.
+
+Because the val-set emotion labels are themselves model-generated, scoring
+against them is partly circular.  ``scripts/eval_ser_jvnv.py`` is the external,
+human-labelled counterpart, and it imports the metric maths from here so the two
+report the same arithmetic.
 """
 
 from __future__ import annotations
@@ -75,6 +102,8 @@ import argparse
 import gc
 import glob
 import json
+import re
+import textwrap
 import unicodedata
 import warnings
 from dataclasses import dataclass, field
@@ -96,7 +125,16 @@ from streaming.config import StreamingConfig  # noqa: E402
 from streaming.ctc_decode import strip_rich_tags  # noqa: E402
 from streaming.streaming_model import StreamingSenseVoice  # noqa: E402
 
-__all__ = ["main"]
+#: ``main`` is the entry point; the rest is the surface
+#: ``scripts/eval_ser_jvnv.py`` reuses so the two reports cannot drift into
+#: computing differently-named versions of the same metric.
+__all__ = [
+    "main",
+    "classification_metrics",
+    "extract_emotion_tag",
+    "leading_rich_tags",
+    "summarise_ser",
+]
 
 #: The dynamic chunk-mask configuration used in training (``finetune_chunk.sh``).
 #: Evaluation decodes with one of *these* geometries so the encoder is asked for
@@ -138,6 +176,44 @@ _PUNCTUATION = frozenset(
     "、。，．,.!?！？;；:：…‥・「」『』()（）[]{}〈〉《》"
     "\"'`|/\\-‐—―~〜_＿*＊&＆%％#＃@＠+＋=＝<>＜＞"
 )
+
+#: The seven emotion tokens SenseVoice's emotion slot is trained over, and the
+#: only values a manifest ``emo_target`` may take to be scorable.  Order is the
+#: README's; report keys are sorted separately, so nothing depends on it.
+EMOTION_TOKENS: Tuple[str, ...] = (
+    "<|HAPPY|>",
+    "<|SAD|>",
+    "<|ANGRY|>",
+    "<|NEUTRAL|>",
+    "<|FEARFUL|>",
+    "<|DISGUSTED|>",
+    "<|SURPRISED|>",
+)
+
+#: Written into ``emo_target`` by ``scripts/prepare_vn_data.py`` for utterances
+#: that carry no emotion label; ``model.py`` maps it to ``ignore_id`` so the
+#: slot contributes no gradient.  It is not a class, so clips carrying it are
+#: excluded from SER scoring rather than counted as a seventh-plus category.
+EMO_MASK_TOKEN = "<|SER|>"
+
+#: The model's "I have no emotion for this" output (``emo_dict["unk"]``).  It is
+#: never a *reference* class, but it very much is a prediction, and suppressing
+#: it is exactly what ``ban_emo_unk`` does - so it is recognised on the
+#: prediction side and shows up in the confusion matrix as a wrong answer rather
+#: than being silently reported as "no prediction".
+EMO_UNKNOWN_TOKEN = "<|EMO_UNKNOWN|>"
+
+#: Everything the emotion slot can emit, i.e. what may be parsed out of a decode.
+EMOTION_PREDICTION_TOKENS: Tuple[str, ...] = EMOTION_TOKENS + (EMO_UNKNOWN_TOKEN,)
+
+#: Confusion-matrix column for a decode that carried no emotion tag at all.  A
+#: real string rather than ``None`` because JSON object keys must be strings,
+#: and it is deliberately not a valid tag so it cannot collide with one.
+NO_PREDICTION = "<none>"
+
+#: One ``<|...|>`` rich tag.  ``[^|]*`` stops the match at the ``|`` of the next
+#: tag, matching ``streaming.ctc_decode``'s own pattern.
+_TAG_RE = re.compile(r"<\|[^|]*\|>")
 
 
 # --------------------------------------------------------------------- scoring
@@ -290,6 +366,173 @@ def corpus_metrics(
     }
 
 
+# --------------------------------------------------------------- SER scoring
+
+
+def leading_rich_tags(text: str) -> List[str]:
+    """Return the unbroken run of ``<|...|>`` tags at the start of ``text``.
+
+    SenseVoice emits its four metadata slots as a tag block before the
+    transcript (``<|ja|><|HAPPY|><|Speech|><|woitn|>...``).  Only that leading
+    block is metadata: an identical-looking token later in the string is
+    transcript content, which is why this stops at the first character that is
+    not part of a tag instead of scanning the whole string.  Leading whitespace
+    is tolerated, tag *order* is not assumed.
+
+    Args:
+        text: Raw decoded text, tags intact.
+
+    Returns:
+        The tags in the order they appear, ``[]`` if the text does not start
+        with one.
+    """
+    tags: List[str] = []
+    position = len(text) - len(text.lstrip())
+    while True:
+        match = _TAG_RE.match(text, position)
+        if match is None:
+            return tags
+        tags.append(match.group(0))
+        position = match.end()
+
+
+def extract_emotion_tag(text: str) -> Optional[str]:
+    """Parse the predicted emotion out of a raw decode.
+
+    Args:
+        text: Raw decoded text with rich tags intact - i.e. the output of
+            :meth:`CheckpointRecogniser.decode_full`, *before* any
+            normalisation, since ``strip_rich_tags`` destroys exactly this.
+
+    Returns:
+        The emotion token, or ``None`` when the leading tag block holds none.
+        ``None`` is a real outcome, not an error: it is scored as a wrong
+        answer rather than dropped, because dropping it would let a model that
+        emits no emotion at all inflate its own accuracy.
+    """
+    for tag in leading_rich_tags(text):
+        if tag in EMOTION_PREDICTION_TOKENS:
+            return tag
+    return None
+
+
+def classification_metrics(
+    references: Sequence[str],
+    predictions: Sequence[Optional[str]],
+) -> Dict[str, Any]:
+    """Accuracy, macro-F1, per-class P/R/F1 and a confusion matrix.
+
+    Shared by the val-set SER block here and by ``scripts/eval_ser_jvnv.py``, so
+    the in-domain and the external benchmark cannot drift into reporting
+    differently-computed numbers under the same names.  Implemented directly
+    rather than via scikit-learn: this repo's dependency set is pinned against a
+    numpy ceiling, and the arithmetic is a dozen lines.
+
+    Macro-F1 averages over the classes **present in the reference** only.  A
+    class the model never predicts still enters that average with F1 ``0.0``
+    (its precision is ``0.0`` by the empty-denominator convention below), which
+    is the whole point: a model that answers ``<|NEUTRAL|>`` for everything must
+    be punished for the six classes it abandoned, not scored on the one it kept.
+    Averaging over predicted classes instead would hand that model a high
+    number.
+
+    Args:
+        references: Ground-truth label per clip; every entry must be a real
+            label, so masked and unlabelled clips are filtered out by the
+            caller and counted there.
+        predictions: Predicted label per clip, ``None`` where none could be
+            parsed.  Aligned with ``references``.
+
+    Returns:
+        A metric dict.  ``accuracy`` and ``macro_f1`` are ``None`` for an empty
+        population rather than ``0.0``, so "no data" cannot be misread as "the
+        model got everything wrong".  ``num_scored`` is always present: every
+        metric block in this report states the population it was computed over.
+
+    Raises:
+        ValueError: If the two sequences have different lengths, which would
+            silently misalign every pair.
+    """
+    if len(references) != len(predictions):
+        raise ValueError(
+            f"references ({len(references)}) and predictions "
+            f"({len(predictions)}) must be the same length"
+        )
+
+    labels = sorted(set(references))
+    distribution: Dict[str, int] = {}
+    counts: Dict[str, Dict[str, int]] = {label: {} for label in labels}
+    num_correct = 0
+    for reference, prediction in zip(references, predictions):
+        column = NO_PREDICTION if prediction is None else prediction
+        counts[reference][column] = counts[reference].get(column, 0) + 1
+        distribution[column] = distribution.get(column, 0) + 1
+        if prediction is not None and prediction == reference:
+            num_correct += 1
+
+    # Zero-filled so every row has the same columns: a confusion matrix with
+    # ragged rows is unreadable in a diff and awkward to load.  ``<none>`` is
+    # pinned last, after the sorted labels, because it is not a class.
+    columns = sorted(set(labels) | (set(distribution) - {NO_PREDICTION}))
+    if NO_PREDICTION in distribution:
+        columns.append(NO_PREDICTION)
+    confusion = {
+        label: {column: counts[label].get(column, 0) for column in columns}
+        for label in labels
+    }
+
+    per_class: Dict[str, Dict[str, Any]] = {}
+    f1_scores: List[float] = []
+    for label in labels:
+        support = sum(counts[label].values())
+        num_predicted = distribution.get(label, 0)
+        true_positives = counts[label].get(label, 0)
+        # Empty denominator -> 0.0, not undefined: a class that was never
+        # predicted has to score, or it would drop out of the macro average.
+        precision = true_positives / num_predicted if num_predicted else 0.0
+        recall = true_positives / support if support else 0.0
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if precision + recall
+            else 0.0
+        )
+        per_class[label] = {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "support": support,
+            "num_predicted": num_predicted,
+        }
+        f1_scores.append(f1)
+
+    num_scored = len(references)
+    # The diagnosis for a collapsed emotion head is "it answers one class for
+    # everything", which is a property of the predictions alone - a low accuracy
+    # does not distinguish it from a model that is merely wrong in varied ways.
+    # Ties break on the label so the field is deterministic across runs.
+    dominant_label, dominant_count = (
+        max(distribution.items(), key=lambda item: (item[1], item[0]))
+        if distribution
+        else (None, 0)
+    )
+    return {
+        "num_scored": num_scored,
+        "num_correct": num_correct,
+        "accuracy": num_correct / num_scored if num_scored else None,
+        "macro_f1": sum(f1_scores) / len(f1_scores) if f1_scores else None,
+        "macro_f1_classes": labels,
+        "num_pred_none": distribution.get(NO_PREDICTION, 0),
+        "dominant_prediction": {
+            "label": dominant_label,
+            "count": dominant_count,
+            "share": dominant_count / num_scored if num_scored else None,
+        },
+        "per_class": per_class,
+        "confusion": confusion,
+        "prediction_distribution": dict(sorted(distribution.items())),
+    }
+
+
 # ------------------------------------------------------------------- clip I/O
 
 
@@ -306,6 +549,11 @@ class EvalClip:
         use_itn: Whether to ask for inverse text normalisation.
         scope: ``"japanese"`` for clips on the selection axis, ``"reference"``
             for informational ones.
+        emo_target: The manifest's emotion label, or ``None`` when the record
+            carries no ``emo_target`` field at all.  ``<|SER|>`` (the mask
+            sentinel) and anything that is not an emotion token are kept
+            verbatim here and classified by :func:`summarise_ser`, so the
+            report can distinguish "masked" from "missing" from "junk".
     """
 
     key: str
@@ -314,6 +562,7 @@ class EvalClip:
     language: str
     use_itn: bool
     scope: str = "japanese"
+    emo_target: Optional[str] = None
 
 
 @dataclass
@@ -407,6 +656,10 @@ def load_val_clips(
                 continue
 
             itn = record.get("with_or_wo_itn")
+            # Read verbatim, not validated here: an unexpected value is a
+            # finding the SER block reports, not a reason to drop the clip from
+            # the CER metrics it has nothing to do with.
+            emo_target = record.get("emo_target")
             clips.append(
                 EvalClip(
                     key=str(record.get("key") or f"val_{lineno:05d}"),
@@ -416,6 +669,7 @@ def load_val_clips(
                     use_itn=(
                         "withitn" in itn if isinstance(itn, str) else default_use_itn
                     ),
+                    emo_target=None if emo_target is None else str(emo_target),
                 )
             )
             if limit is not None and len(clips) >= limit:
@@ -687,6 +941,11 @@ def build_config(args: argparse.Namespace) -> Tuple[StreamingConfig, Dict[str, A
         chunk_stride=stride,
         chunk_pad_right=pad_right,
         chunk_encoder_look_back=look_back,
+        # Off by default, which is what every run before the SER metrics existed
+        # did.  It changes only which token the emotion slot may emit, never the
+        # transcript, so the CER numbers are identical either way - but the SER
+        # numbers are not, which is why the report records the setting.
+        ban_emo_unk=getattr(args, "ban_emo_unk", False),
     )
     config.validate()
 
@@ -742,10 +1001,128 @@ def _delta(new: Optional[float], old: Optional[float]) -> Optional[float]:
     return new - old
 
 
+def summarise_ser(
+    clips: Sequence[EvalClip],
+    decodes: Dict[str, Dict[str, ClipDecode]],
+    ban_emo_unk: bool,
+) -> Dict[str, Any]:
+    """Score the emotion slot against the manifest's ``emo_target``.
+
+    The prediction is parsed from each model's **full-attention** decode.  That
+    is the product-relevant one: the streaming path's authoritative final result
+    for a segment is a full-attention pass, so the emotion a user ends up seeing
+    is this one, not whatever a mid-stream partial guessed.
+
+    The population is stated rather than implied.  Only clips whose
+    ``emo_target`` is one of :data:`EMOTION_TOKENS` are scored; masked, missing
+    and unparseable ones are excluded and counted.  A clip the model produced no
+    emotion for *is* scored, as a miss - see :func:`extract_emotion_tag`.
+
+    Args:
+        clips: The val clips, in manifest order.
+        decodes: ``{model_name: {clip_key: ClipDecode}}``; every clip must be
+            present for every model, which the caller guarantees.
+        ban_emo_unk: The setting the decodes actually ran under, recorded
+            because banning ``<|EMO_UNKNOWN|>`` changes what the head is able to
+            emit and therefore what these numbers mean.
+
+    Returns:
+        A block whose ``status`` is one of:
+
+        ``"na"``
+            Nothing scorable.  Either no clip carries ``emo_target`` at all, or
+            every one that does is masked/unparseable.  No numbers are reported,
+            because there are none to report.
+        ``"degenerate"``
+            Every reference is the same token, which makes accuracy meaningless
+            - always answering that token scores 1.0.  The numbers *are*
+            reported, but under a status that stops them being read as quality.
+            The round-2 manifest, whose ``emo_target`` was a constant
+            ``<|NEUTRAL|>``, lands here.
+        ``"ok"``
+            At least two reference classes are present.
+    """
+    num_missing = num_mask = num_unparseable = 0
+    scored: List[EvalClip] = []
+    for clip in clips:
+        target = clip.emo_target
+        if target is None or not target.strip():
+            num_missing += 1
+        elif target == EMO_MASK_TOKEN:
+            num_mask += 1
+        elif target in EMOTION_TOKENS:
+            scored.append(clip)
+        else:
+            num_unparseable += 1
+
+    block: Dict[str, Any] = {
+        "status": "ok",
+        "reason": None,
+        "prediction_source": "full-attention decode (the streaming path's final result)",
+        "ban_emo_unk": ban_emo_unk,
+        "classes": list(EMOTION_TOKENS),
+        "population": {
+            "num_val_clips": len(clips),
+            "num_scored": len(scored),
+            "num_excluded_mask": num_mask,
+            "num_excluded_missing": num_missing,
+            "num_excluded_unparseable": num_unparseable,
+        },
+    }
+
+    if not scored:
+        block["status"] = "na"
+        block["reason"] = (
+            "manifest has no emo_target field"
+            if num_mask == num_unparseable == 0
+            else (
+                f"no scorable emo_target: {num_mask} masked ({EMO_MASK_TOKEN}), "
+                f"{num_missing} missing, {num_unparseable} not an emotion token"
+            )
+        )
+        return block
+
+    references = [clip.emo_target or "" for clip in scored]
+    reference_classes = sorted(set(references))
+    block["reference_classes"] = reference_classes
+    if len(reference_classes) == 1:
+        block["status"] = "degenerate"
+        block["reason"] = (
+            f"every scored clip carries the same reference emotion "
+            f"{reference_classes[0]}, so accuracy is not a quality signal - a "
+            "model that always answers that one token scores 1.0.  This is the "
+            "shape of the round-2 manifest, whose emo_target was a constant "
+            "<|NEUTRAL|>; the numbers below are reported but must not be read "
+            "as emotion recognition quality"
+        )
+
+    per_model: Dict[str, Any] = {}
+    for name, by_key in decodes.items():
+        predictions = [extract_emotion_tag(by_key[clip.key].full) for clip in scored]
+        per_model[name] = classification_metrics(references, predictions)
+    block["per_model"] = per_model
+
+    if "base" in per_model and "finetuned" in per_model:
+        base, tuned = per_model["base"], per_model["finetuned"]
+        # Higher is better here, unlike every CER delta in this report, so the
+        # sign convention is spelled out in the key rather than assumed.
+        block["delta"] = {
+            "accuracy_finetuned_minus_base": _delta(
+                tuned["accuracy"], base["accuracy"]
+            ),
+            "macro_f1_finetuned_minus_base": _delta(
+                tuned["macro_f1"], base["macro_f1"]
+            ),
+            "note": "positive is an improvement (unlike the CER deltas)",
+        }
+    return block
+
+
 def summarise_val(
     clips: Sequence[EvalClip],
     decodes: Dict[str, Dict[str, ClipDecode]],
     keep_punctuation: bool,
+    ban_emo_unk: bool = False,
 ) -> Dict[str, Any]:
     """Score the referenced Japanese val clips for every loaded model.
 
@@ -753,10 +1130,12 @@ def summarise_val(
         clips: The val clips, each carrying a reference transcript.
         decodes: ``{model_name: {clip_key: ClipDecode}}``.
         keep_punctuation: Passed to the scorers.
+        ban_emo_unk: The decode setting, recorded in the ``ser`` block.
 
     Returns:
-        Per-model ``chunk`` / ``full`` / gap metrics plus the base-vs-finetuned
-        deltas.  Empty dict when there are no clips.
+        Per-model ``chunk`` / ``full`` / gap metrics, the base-vs-finetuned
+        deltas, and the ``ser`` emotion block.  Empty dict when there are no
+        clips.
     """
     if not clips:
         return {}
@@ -795,6 +1174,9 @@ def summarise_val(
                 tuned["chunk_vs_full_cer"], base["chunk_vs_full_cer"]
             ),
         }
+    # A sibling of the CER metrics, never a component of them: nothing above
+    # reads it and the selection metric is untouched.
+    result["ser"] = summarise_ser(clips, decodes, ban_emo_unk)
     return result
 
 
@@ -907,6 +1289,59 @@ def _signed(value: Optional[float], width: int = 9) -> str:
     return f"{'-':>{width}}" if value is None else f"{value:>+{width}.4f}"
 
 
+def _ser_lines(ser: Optional[Dict[str, Any]]) -> List[str]:
+    """Render the SER block for the terminal summary.
+
+    The headline carries ``num_scored`` and the exclusion counts, because an
+    accuracy whose population is not on the same screen is the kind of number
+    this repo has already published wrongly once.  A non-``ok`` status is shouted
+    rather than mentioned: a degenerate reference set produces a *high* accuracy,
+    so nothing about the numbers themselves warns the reader.
+
+    Args:
+        ser: The block from :func:`summarise_ser`, or ``None`` when the report
+            predates it.
+
+    Returns:
+        Lines to print, empty when there is no block.
+    """
+    if not ser:
+        return []
+    population = ser.get("population", {})
+    lines = [
+        "SER (full-attn)       "
+        f"n={population.get('num_scored', 0)} scored of "
+        f"{population.get('num_val_clips', 0)} val clips  "
+        f"(excluded: mask {population.get('num_excluded_mask', 0)}, "
+        f"missing {population.get('num_excluded_missing', 0)}, "
+        f"unparseable {population.get('num_excluded_unparseable', 0)}; "
+        f"ban_emo_unk={ser.get('ban_emo_unk')})"
+    ]
+    for name, metrics in (ser.get("per_model") or {}).items():
+        dominant = metrics.get("dominant_prediction") or {}
+        share = dominant.get("share")
+        lines.append(
+            f"  {name:<20}accuracy={_fmt(metrics['accuracy'], 0)}  "
+            f"macro-F1={_fmt(metrics['macro_f1'], 0)}  "
+            f"no-emotion-emitted={metrics['num_pred_none']}  "
+            # A collapsed head is diagnosed here, not by the accuracy: "answers
+            # one class for everything" is a fact about the predictions.
+            f"most-predicted={dominant.get('label')}"
+            f"{'' if share is None else f' ({share:.0%})'}"
+        )
+    if ser.get("status") != "ok":
+        lines.append(f"  *** SER {str(ser.get('status')).upper()} ***")
+        lines.append(
+            textwrap.fill(
+                str(ser.get("reason")),
+                width=68,
+                initial_indent="      ",
+                subsequent_indent="      ",
+            )
+        )
+    return lines
+
+
 def _clip_line(clip: Dict[str, Any]) -> str:
     """One summary line for a clip that has no ground truth.
 
@@ -1008,6 +1443,11 @@ def print_summary(payload: Dict[str, Any], warnings_: Sequence[str]) -> None:
                 f"{_signed(delta_value, 10)}"
             )
         print("  (full-attn CER is the forgetting check: Japanese only)")
+        ser_lines = _ser_lines(val["metrics"].get("ser"))
+        if ser_lines:
+            print()
+            for ser_line in ser_lines:
+                print(ser_line)
 
     for clip in payload["japanese"]["clips"]:
         print(_clip_line(clip) + "   (informational)")
@@ -1261,6 +1701,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ban-emo-unk",
+        action="store_true",
+        help=(
+            "forbid the emotion slot from emitting <|EMO_UNKNOWN|>, forcing it "
+            "to commit to one of the seven emotions.  Affects the SER metrics "
+            "only - the transcript, and therefore every CER number, is "
+            "unchanged - and the report records which setting it ran under"
+        ),
+    )
+    parser.add_argument(
         "--keep-punctuation",
         action="store_true",
         help="score punctuation instead of stripping it before CER/WER",
@@ -1445,7 +1895,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ja_clips = [c for c in ja_clips if c.key in complete]
     reference_clips = [c for c in reference_clips if c.key in complete]
 
-    val_metrics = summarise_val(val_clips, decodes, args.keep_punctuation)
+    val_metrics = summarise_val(
+        val_clips, decodes, args.keep_punctuation, config.ban_emo_unk
+    )
     selection_value = (
         val_metrics["per_model"]
         .get("finetuned", val_metrics["per_model"].get("base", {}))
@@ -1471,6 +1923,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "wer_note": (
                 "whitespace tokens; near-meaningless for unsegmented Japanese "
                 "and Chinese - read CER"
+            ),
+            "ser": (
+                "emotion token parsed from the leading rich-tag block of the "
+                "full-attention decode and compared with the manifest's "
+                "emo_target; macro-F1 over the reference-present classes, "
+                "unpredicted classes entering the average with F1 0.0"
             ),
         },
         "models": {
