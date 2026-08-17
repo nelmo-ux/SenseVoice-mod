@@ -40,6 +40,7 @@ import ast
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import urllib.error
 import wave
@@ -410,6 +411,100 @@ def test_a_line_of_only_escape_residue_becomes_empty():
     assert vn.normalize_text(r"\"") == ""
 
 
+# --- the stray "n" of a line break that lost its backslash ---
+#
+# The game script's line breaks were escaped as "\n"; somewhere upstream the
+# backslash was lost and the "n" stayed, wedged between two Japanese characters.
+# 89 occurrences in a 4,000-clip sample -- ~12,000 clips of the 549,404-clip
+# manifest -- and invisible in the transcripts alone: they read as ordinary
+# Japanese until the clips are ranked by CER against an in-domain teacher ASR
+# model.  The transcript is otherwise correct, so this is repaired rather than
+# dropped, and the repair must be narrow enough to leave every legitimate "n"
+# alone (the counter-examples below are the real test).
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # All three verbatim from the corpus.
+        (
+            "だってだってぇ、お風呂上がりはこの飲むプリンで一n杯きゅーって行くのが最高で",
+            "だってだってぇ、お風呂上がりはこの飲むプリンで一杯きゅーって行くのが最高で",
+        ),
+        (
+            "あ、それって、あたしがあnんまりにも色気がありすぎちゃったから、"
+            "にーちゃんのn我慢が限界になって",
+            "あ、それって、あたしがあんまりにも色気がありすぎちゃったから、"
+            "にーちゃんの我慢が限界になって",
+        ),
+        (
+            "はいっ！わたくしとしては、教師と生徒の愛ある調n教する話は",
+            "はいっ！わたくしとしては、教師と生徒の愛ある調教する話は",
+        ),
+    ],
+)
+def test_a_lone_n_between_japanese_characters_is_deleted(raw, expected):
+    assert vn.normalize_text(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("一n杯", "一杯"),  # kanji on both sides
+        ("あnん", "あん"),  # hiragana on both sides
+        ("ンnン", "ンン"),  # katakana on both sides
+        ("ーnー", "ーー"),  # the long-vowel mark counts as Japanese
+        ("そのn人", "その人"),  # kana then kanji
+    ],
+)
+def test_the_repair_needs_a_kana_or_kanji_on_each_side(raw, expected):
+    assert vn.normalize_text(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A Latin word embedded in Japanese: its "n" has a Latin neighbour.
+        "今日はfineな気分",
+        "ワンnight",
+        "nightは夜",
+        # A romanised name -- the reason the rule may not simply delete "n"
+        # between any two characters.
+        "Nanaseと呼んで",
+        "田中nakaさん",
+        # Doubled "n": each one has the other beside it, so neither is isolated.
+        "あnnまり",
+        "一nn杯",
+        # A digit neighbour is not Japanese either.
+        "第2n回",
+        "n2は変数",
+        # Uppercase is left alone: the lost escape is lowercase "\n", while an
+        # uppercase N between Japanese characters is a real placeholder or
+        # abbreviation ("第N回", "N響").
+        "第N回",
+        # Nothing to sit between.
+        "n",
+        "んn",
+    ],
+)
+def test_a_legitimate_n_is_never_touched(text):
+    # normalize_text may still fold width or punctuation elsewhere in the line;
+    # what must hold is that the "n" count does not change.
+    assert vn.normalize_text(text).count("n") == text.count("n")
+
+
+def test_an_escape_that_still_has_its_backslash_is_also_repaired():
+    # The backslash deletion runs first and would otherwise *create* exactly the
+    # defect above: "\n" -> "n" wedged inside the word.
+    assert vn.normalize_text("に\\nぇ") == "にぇ"
+
+
+def test_a_real_line_break_is_still_whitespace_not_a_stray_n():
+    # An actual newline character is collapsed by the whitespace rule; only the
+    # leftover literal "n" is deleted.
+    assert vn.normalize_text("あ\nい") == "あ い"
+
+
 # --- wrapping quotes and brackets ---
 
 
@@ -534,6 +629,11 @@ def test_sentence_marks_are_never_deleted_from_a_line(mark):
         "   ",
         "！？。",
         "あ「い」う",
+        # The stray-"n" repair: deleting the "n" joins its two neighbours, and a
+        # second pass must not then find a new "n" to delete.
+        "一n杯",
+        "あnnまり",
+        "今日はfineな気分",
     ],
 )
 def test_normalisation_is_idempotent(raw):
@@ -1368,6 +1468,497 @@ def test_one_name_across_two_titles_is_one_voice_and_stays_on_one_side():
     assert len(train) == 8
     assert val == []
     assert speakers_of(train) & speakers_of(val) == set()
+
+
+# ===========================================================================
+# --pin-val-keys: a val set that survives a corpus rebuild
+#
+# split_by_speaker computes a fresh split over whatever corpus it is handed, so
+# a bigger corpus yields a *different* val set and round 2's metrics cannot be
+# compared with round 1's.  Worse, round 1's val clips end up in round 2's
+# training set -- measured once at 547 of 772 clips (70.9%), which is why a plan
+# to re-score an old val had to be abandoned: it would have been scoring on
+# training data.  test_growing_the_corpus_moves_round_one_val_clips_into_train
+# reproduces that failure, and everything after it pins the fix.
+#
+# The two properties that matter:
+#   1. val is EXACTLY the pinned clips -- not a superset, so the two rounds are
+#      measured on the same data;
+#   2. speaker-disjointness still holds -- a pinned clip's speaker is kept out
+#      of train entirely, exactly as the unpinned split does it.
+# ===========================================================================
+
+
+def round_corpus(titles, speakers=5, clips=6):
+    """A corpus of title-local speakers, sized so each title fills a val quota."""
+    return [
+        make_record(title, f"spk_{title}_{index}", f"v{clip}")
+        for title in titles
+        for index in range(speakers)
+        for clip in range(clips)
+    ]
+
+
+def pin_split(records, keys):
+    return vn.split_by_pinned_keys(records, keys)
+
+
+# --- the failure this flag exists to prevent -------------------------------
+
+
+def test_growing_the_corpus_moves_round_one_val_clips_into_train():
+    """The hazard, seen failing.  A green fix test alone would prove nothing.
+
+    Round 2 adds archives that sort *before* the round-1 titles, which shifts
+    the per-title candidate shuffle and therefore which speakers are held out.
+    Every round-1 val clip then lands in round-2 train.  The 100% here is this
+    fixture's number, not a law -- the real corpus measured 70.9%.
+    """
+    round1 = round_corpus(["t0", "t1"])
+    _, val1 = vn.split_by_speaker(round1, 0.2, seed=0)
+    round2 = round1 + round_corpus(["a0", "a1"])
+
+    train2, _ = vn.split_by_speaker(round2, 0.2, seed=0)
+
+    pinned = {r["key"] for r in val1}
+    assert pinned
+    assert pinned <= {r["key"] for r in train2}
+
+
+def test_pinning_keeps_every_round_one_val_clip_out_of_round_two_train():
+    # Same corpora, same seed, with the pin: the exact clips round 1 was scored
+    # on are held out of round 2's training set.
+    round1 = round_corpus(["t0", "t1"])
+    _, val1 = vn.split_by_speaker(round1, 0.2, seed=0)
+    round2 = round1 + round_corpus(["a0", "a1"])
+
+    train2, val2, _ = pin_split(round2, keys_of(val1))
+
+    assert keys_of(val2) == keys_of(val1)
+    assert set(keys_of(train2)) & set(keys_of(val1)) == set()
+
+
+def test_the_pinned_val_is_identical_however_the_corpus_grows():
+    # The whole point: one pin file, several corpora, one val set.  If this
+    # holds, two rounds' numbers are measured on the same clips.
+    round1 = round_corpus(["t0", "t1"])
+    _, val1 = vn.split_by_speaker(round1, 0.2, seed=0)
+    keys = keys_of(val1)
+
+    for extra in (["a0"], ["a0", "a1"], ["m0", "m1", "z9"]):
+        _, val2, _ = pin_split(round1 + round_corpus(extra), keys)
+
+        assert keys_of(val2) == keys
+
+
+# --- pinned clips reach val ------------------------------------------------
+
+
+def test_every_pinned_clip_that_exists_lands_in_val():
+    records = corpus()
+    keys = [records[0]["key"], records[7]["key"], records[-1]["key"]]
+
+    _, val, _ = pin_split(records, keys)
+
+    assert set(keys) <= set(keys_of(val))
+
+
+def test_val_is_exactly_the_pinned_set_and_never_a_superset():
+    # No top-up toward --val-frac: a val that grows with the corpus is the
+    # thing being fixed, so "pinned plus extra speakers" is not offered.
+    records = corpus()
+    keys = keys_of(records[:3])
+
+    _, val, _ = pin_split(records, keys)
+
+    assert keys_of(val) == sorted(keys)
+
+
+def test_a_pinned_clip_never_appears_in_train():
+    records = franchise_corpus()
+    keys = keys_of([r for r in records if vn.speaker_group_key(r) == "aoi"])
+
+    train, val, _ = pin_split(records, keys)
+
+    assert set(keys_of(train)) & set(keys) == set()
+    assert keys_of(val) == sorted(keys)
+
+
+def test_the_per_speaker_cap_does_not_trim_the_pinned_set():
+    # The unpinned split caps a speaker at VAL_MAX_CLIPS_PER_SPEAKER (40) to
+    # stop one voice owning val.  A pin file is an explicit instruction and is
+    # honoured whole -- trimming it would silently change what round 2 is
+    # scored on, which is exactly the failure being fixed.
+    records = over_cap_corpus()
+    one_speaker = [r for r in records if vn.speaker_group_key(r) == "spk_titleA_0"]
+    assert len(one_speaker) > vn.VAL_MAX_CLIPS_PER_SPEAKER
+
+    _, val, _ = pin_split(records, keys_of(one_speaker))
+
+    assert len(val) == len(one_speaker)
+
+
+def test_the_val_fraction_does_not_bound_the_pinned_set():
+    # Half the corpus pinned is far past the 2.5% default; the pin wins.
+    records = corpus(titles=2, speakers_per_title=4, clips_per_speaker=5)
+    half = [r for r in records if vn.speaker_group_key(r).endswith(("_0", "_1"))]
+
+    _, val, _ = pin_split(records, keys_of(half))
+
+    assert len(val) == len(half) == len(records) // 2
+
+
+# --- speaker-disjointness, which pinning must not quietly break ------------
+
+
+def test_a_pinned_speaker_is_absent_from_train():
+    records = corpus()
+    keys = [records[0]["key"]]
+
+    train, val, _ = pin_split(records, keys)
+
+    assert speakers_of(train) & speakers_of(val) == set()
+
+
+@pytest.mark.parametrize("index", [0, 5, 11, 23, 44])
+def test_no_speaker_leaks_whichever_single_clip_is_pinned(index):
+    records = corpus()
+
+    train, val, _ = pin_split(records, [records[index]["key"]])
+
+    assert speakers_of(train) & speakers_of(val) == set()
+
+
+def test_pinning_one_clip_of_a_recurring_voice_holds_out_every_title():
+    # The franchise case: pinning a titleA clip of nanase must also keep
+    # nanase's titleB clips out of train, because it is one voice actor.
+    records = franchise_corpus()
+    one = next(
+        r
+        for r in records
+        if vn.speaker_group_key(r) == "nanase" and vn.record_title(r) == "titleA"
+    )
+
+    train, _, _ = pin_split(records, [one["key"]])
+
+    assert not [r for r in train if vn.speaker_group_key(r) == "nanase"]
+
+
+def test_the_non_pinned_clips_of_a_pinned_speaker_are_dropped_from_both_sides():
+    # They cannot go to train (that is the leak) and they cannot go to val
+    # (that would make val bigger than the pinned set), so they are dropped --
+    # the same trade the unpinned split makes with surplus clips.
+    records = corpus(titles=2, speakers_per_title=3, clips_per_speaker=5)
+    speaker_clips = [r for r in records if vn.speaker_group_key(r) == "spk0_0"]
+    pinned, rest = speaker_clips[:2], speaker_clips[2:]
+
+    train, val, report = pin_split(records, keys_of(pinned))
+
+    assert keys_of(val) == keys_of(pinned)
+    assert set(keys_of(train)) & set(keys_of(rest)) == set()
+    assert report.train_clips_dropped == len(rest) == 3
+    assert len(train) + len(val) + report.train_clips_dropped == len(records)
+
+
+# --- reporting -------------------------------------------------------------
+
+
+def test_missing_pinned_keys_are_reported_not_silently_ignored():
+    # A stale or typo'd pin file that quietly pins less than it names would
+    # produce a val set that looks healthy and is not the intended one.
+    records = corpus()
+    keys = [records[0]["key"], "titleZ_ghost_v9", records[1]["key"], "typo"]
+
+    _, val, report = pin_split(records, keys)
+
+    assert report.requested == 4
+    assert report.found == 2
+    assert report.missing == ["titleZ_ghost_v9", "typo"]
+    assert len(val) == 2
+
+
+def test_the_report_counts_reconcile_with_the_split():
+    records = franchise_corpus()
+    keys = keys_of(records[:6]) + ["absent"]
+
+    train, val, report = pin_split(records, keys)
+
+    assert report.requested == report.found + len(report.missing)
+    assert report.found == len(val)
+    assert report.speakers == len(speakers_of(val))
+    assert report.train_clips_dropped == len(records) - len(train) - len(val)
+
+
+def test_duplicate_pinned_keys_are_counted_and_pinned_once():
+    records = corpus()
+    key = records[0]["key"]
+
+    _, val, report = pin_split(records, [key, key, key])
+
+    assert report.requested == 1
+    assert keys_of(val) == [key]
+
+
+def test_the_pin_report_reaches_the_manifest_with_the_full_missing_list():
+    records = corpus()
+    _, _, report = pin_split(records, [records[0]["key"], "gone_a", "gone_b"])
+    report.keys_file = "/pins/round1.txt"
+
+    payload = report.as_dict()
+
+    assert payload["keys_file"] == "/pins/round1.txt"
+    assert payload["keys_requested"] == 3
+    assert payload["keys_found"] == 1
+    assert payload["keys_missing"] == 2
+    # The full list, never a sample: this is the record of which round-1 clips
+    # the new corpus could not reproduce, and a truncated one cannot be diffed
+    # against the next rebuild.
+    assert payload["missing_keys"] == ["gone_a", "gone_b"]
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_the_log_states_requested_found_missing_and_the_dropped_clips(capsys):
+    report = vn.PinnedValReport(
+        requested=772,
+        found=770,
+        missing=["stale_a", "stale_b"],
+        speakers=23,
+        train_clips_dropped=1_234,
+        keys_file="/pins/round1.txt",
+    )
+
+    vn.log_pinned_val_report(report)
+
+    out = capsys.readouterr().out
+    assert "772 keys requested" in out
+    assert "770 found in corpus" in out
+    assert "2 missing" in out
+    assert "23 pinned speaker(s) held out of train" in out
+    assert "1234 further clip(s)" in out
+    assert "stale_a" in out and "stale_b" in out
+    # The decision, restated where the operator will see it.
+    assert "val is EXACTLY the pinned set" in out
+
+
+def test_a_long_missing_list_is_truncated_in_the_log_but_still_counted(capsys):
+    missing = [f"gone_{i}" for i in range(vn.PIN_MISSING_KEYS_LOGGED + 5)]
+    report = vn.PinnedValReport(requested=100, found=75, missing=missing)
+
+    vn.log_pinned_val_report(report)
+
+    out = capsys.readouterr().out
+    # Truncation keeps a genuinely different corpus from flooding the log; the
+    # count and manifest.json still carry every key.
+    assert f"gone_{vn.PIN_MISSING_KEYS_LOGGED - 1}" in out
+    assert f"gone_{vn.PIN_MISSING_KEYS_LOGGED}" not in out
+    assert "... and 5 more missing key(s)" in out
+    assert f"{len(missing)} missing" in out
+
+
+# --- loud failures ---------------------------------------------------------
+
+
+def test_a_pin_file_matching_nothing_is_fatal():
+    # The silent-failure case: falling back to an ordinary split here would
+    # write a perfectly healthy-looking val set that is not the pinned one.
+    records = corpus()
+
+    with pytest.raises(SystemExit) as excinfo:
+        pin_split(records, ["not_a_key", "also_not_a_key"])
+
+    message = str(excinfo.value)
+    assert "--pin-val-keys" in message
+    assert "2 pinned keys" in message
+
+
+def test_pinning_every_speaker_is_refused_rather_than_emptying_train():
+    records = corpus(titles=2, speakers_per_title=2, clips_per_speaker=3)
+
+    with pytest.raises(SystemExit) as excinfo:
+        pin_split(records, keys_of(records))
+
+    assert "train empty" in str(excinfo.value)
+
+
+def test_an_empty_key_list_is_refused():
+    with pytest.raises(SystemExit):
+        pin_split(corpus(), [])
+
+
+# --- the pin file ----------------------------------------------------------
+
+
+def test_the_pin_file_is_one_key_per_line(tmp_path):
+    path = tmp_path / "pins.txt"
+    path.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+    assert vn.read_pin_val_keys(path) == ["alpha", "beta", "gamma"]
+
+
+def test_the_pin_file_ignores_blank_lines_comments_and_stray_whitespace(tmp_path):
+    path = tmp_path / "pins.txt"
+    path.write_text(
+        "# round 1 val, 2026-08-14\n\n  alpha  \n\n# a note\nbeta\n\n",
+        encoding="utf-8",
+    )
+
+    # Comments matter: the file records which run it came from, and no
+    # production key can start with '#' -- keys are built from slugify output.
+    assert vn.read_pin_val_keys(path) == ["alpha", "beta"]
+
+
+def test_the_pin_file_collapses_duplicates_keeping_the_first_position(tmp_path):
+    path = tmp_path / "pins.txt"
+    path.write_text("alpha\nbeta\nalpha\n", encoding="utf-8")
+
+    assert vn.read_pin_val_keys(path) == ["alpha", "beta"]
+
+
+def test_a_missing_pin_file_fails_loudly(tmp_path):
+    with pytest.raises(SystemExit) as excinfo:
+        vn.read_pin_val_keys(tmp_path / "nope.txt")
+
+    assert "--pin-val-keys" in str(excinfo.value)
+
+
+def test_a_pin_file_with_no_keys_fails_loudly(tmp_path):
+    path = tmp_path / "pins.txt"
+    path.write_text("# only a comment\n\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.read_pin_val_keys(path)
+
+    assert "no keys" in str(excinfo.value)
+
+
+def test_a_real_val_jsonl_round_trips_through_the_pin_file(tmp_path):
+    # How the flag is actually used: keys are cut out of a written val.jsonl.
+    records = corpus()
+    _, val = vn.split_by_speaker(records, 0.2, seed=0)
+    val_path = tmp_path / "val.jsonl"
+    vn.write_jsonl(val, val_path)
+    pins = tmp_path / "pins.txt"
+    pins.write_text(
+        "".join(f"{r['key']}\n" for r in read_jsonl(val_path)), encoding="utf-8"
+    )
+
+    _, pinned, report = pin_split(records, vn.read_pin_val_keys(pins))
+
+    assert keys_of(pinned) == keys_of(val)
+    assert report.missing == []
+
+
+# --- the CLI ---------------------------------------------------------------
+
+
+def test_pin_val_keys_defaults_to_none_so_the_flag_is_opt_in():
+    assert vn.parse_args([]).pin_val_keys is None
+
+
+def test_pin_val_keys_is_parsed_as_a_path():
+    assert vn.parse_args(["--pin-val-keys", "pins.txt"]).pin_val_keys == Path("pins.txt")
+
+
+def test_the_cli_surface_is_exactly_these_options():
+    """The CLI surface, pinned deliberately.
+
+    Listed exhaustively so that adding an option is a conscious edit here: this
+    script's flags are recorded in manifest.json's ``config`` and quoted in the
+    training docs, and a silently grown CLI makes an old command line's meaning
+    ambiguous.  Four options have been added under this rule so far --
+    ``--pin-val-keys``, ``--manifest-only``, ``--drop-kana-only-titles`` and its
+    ``--kana-only-title-threshold``.
+    """
+    assert sorted(vars(vn.parse_args([]))) == [
+        "archives",
+        "download_workers",
+        "drop_kana_only_titles",
+        "kana_only_title_threshold",
+        "limit_hours",
+        "list_archives",
+        "list_format",
+        "manifest_only",
+        "max_seconds",
+        "min_seconds",
+        "out_dir",
+        "pin_val_keys",
+        "seed",
+        "skip_download",
+        "val_cover_all_titles",
+        "val_frac",
+        "val_max_clips_per_speaker",
+        "workers",
+    ]
+
+
+def test_the_pin_file_is_read_before_any_download(monkeypatch):
+    # Fail-fast, like the basename guard: a typo'd path must cost nothing, not
+    # surface after a 1000-hour corpus has been fetched and converted.
+    def explode(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("download attempted despite an unreadable pin file")
+
+    monkeypatch.setattr(vn, "download_all", explode)
+    monkeypatch.setattr(vn, "read_hf_token", explode)
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.main(["--pin-val-keys", "/nonexistent/pins.txt"])
+
+    assert "--pin-val-keys" in str(excinfo.value)
+
+
+# --- the unpinned path must be exactly what it was -------------------------
+
+
+def test_the_unpinned_split_is_unchanged_by_the_pinning_code():
+    """Golden result for the default path, so a rebuild reproduces round 1.
+
+    The existing corpus was built by this splitter and its train/val files are
+    fingerprinted; nothing added for --pin-val-keys may perturb the unpinned
+    split.  The keys below were produced by the splitter as it stood before the
+    flag existed.
+    """
+    train, val = vn.split_by_speaker(franchise_corpus(), 0.2, seed=0)
+
+    assert keys_of(val) == [
+        "titleA_aoi_v0",
+        "titleA_aoi_v1",
+        "titleA_aoi_v2",
+        "titleA_aoi_v3",
+        "titleA_aoi_v4",
+        "titleB_rin_v0",
+        "titleB_rin_v1",
+        "titleB_rin_v2",
+        "titleB_rin_v3",
+        "titleB_rin_v4",
+    ]
+    assert len(train) == 35
+
+
+def test_the_unpinned_manifest_carries_no_pin_section():
+    # An unpinned run's manifest.json must be byte-for-byte what it was before
+    # the flag existed, so the two corpora's manifests stay comparable.
+    records = corpus()
+    train, val = vn.split_by_speaker(records, 0.2, seed=0)
+    args = vn.parse_args([])
+    stats = vn.FilterStats(index_entries=len(records), kept=len(records))
+
+    manifest = vn.build_manifest(args, {}, stats, train, val, 0)
+
+    assert "val_pin" not in manifest
+    assert "pin_val_keys" not in manifest["config"]
+
+
+def test_a_pinned_run_records_the_pin_in_the_manifest():
+    records = corpus()
+    train, val, report = pin_split(records, keys_of(records[:2]))
+    report.keys_file = "/pins/round1.txt"
+    args = vn.parse_args([])
+    stats = vn.FilterStats(index_entries=len(records), kept=len(records))
+
+    manifest = vn.build_manifest(args, {}, stats, train, val, 0, pin_report=report)
+
+    assert manifest["val_pin"]["keys_file"] == "/pins/round1.txt"
+    assert manifest["val_pin"]["keys_found"] == 2
 
 
 # ===========================================================================
@@ -2240,3 +2831,1369 @@ def test_the_resume_check_works_on_the_nested_archive_layout(tmp_path, capsys):
 
     assert "incomplete extraction" in capsys.readouterr().out
     assert (root / "spk" / "v000.ogg").is_file()
+
+
+# ===========================================================================
+# --manifest-only: rebuilding the split after the audio sources are pruned
+# ===========================================================================
+# A ~1,000 h corpus does not fit on the cluster alongside its own intermediates,
+# so it is built in batches and each batch's .7z and extracted .ogg files are
+# deleted once converted, leaving raw/<stem>/index.json as the only survivor of
+# the raw tree.  --manifest-only produces the final whole-corpus split from that
+# state: index.json plus the converted wavs, no archives, no credentials.
+#
+# Reading a wav header needs soundfile, and a *full* run additionally decodes
+# with librosa.  Both are skipped rather than imported eagerly, so the rest of
+# this file keeps its promise of running with no audio dependency at all.
+# ---------------------------------------------------------------------------
+
+requires_soundfile = pytest.mark.skipif(
+    importlib.util.find_spec("soundfile") is None, reason="soundfile is not installed"
+)
+requires_audio_stack = pytest.mark.skipif(
+    importlib.util.find_spec("soundfile") is None
+    or importlib.util.find_spec("librosa") is None,
+    reason="soundfile and librosa are needed to run a real conversion",
+)
+
+MANIFEST_ONLY_ARCHIVES = ["GalGame/Studio_A.7z", "GalGame/Studio_B.7z"]
+
+
+def forbid_acquisition(monkeypatch, *, extraction=True):
+    """Make every credential read and every archive touch fail the test loudly.
+
+    --manifest-only claims to need no HF token, no archive password and no
+    archive.  The claim is only worth anything if breaking it is an error rather
+    than a fallback, so the whole acquisition half is booby-trapped.
+    """
+
+    def explode(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("--manifest-only touched the acquisition path")
+
+    for name in ("read_hf_token", "read_archive_password", "find_archive_password",
+                 "download_all", "list_repo_archives"):
+        monkeypatch.setattr(vn, name, explode)
+    if extraction:
+        monkeypatch.setattr(vn, "extract_archive", explode)
+        monkeypatch.setattr(vn, "extraction_password_need", explode)
+
+
+def write_index(root, entries):
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "index.json").write_text(
+        json.dumps(entries, ensure_ascii=False), encoding="utf-8"
+    )
+    return root / "index.json"
+
+
+def build_pruned_corpus(out_dir, clips_per_speaker=4, speakers=3):
+    """The exact on-disk state a pruned batch leaves behind.
+
+    ``raw/<stem>/index.json`` and nothing else in the raw tree; the converted
+    wavs under ``audio/``; no archives directory at all.  Entries use the
+    ``FilePath`` shape, so the (absent) sources would have been ``.ogg`` beside
+    the index -- what pruning deletes.
+    """
+    for archive in MANIFEST_ONLY_ARCHIVES:
+        stem = Path(archive).stem
+        title = vn.slugify(stem, "unknown_title")
+        entries = []
+        for speaker_index in range(speakers):
+            speaker = f"spk{speaker_index}"
+            for voice_index in range(clips_per_speaker):
+                voice = f"v{voice_index}"
+                write_wav(
+                    out_dir / "audio" / title / speaker / f"{voice}.wav",
+                    1.0 + 0.25 * voice_index,
+                )
+                entries.append(
+                    {
+                        "Speaker": speaker,
+                        "FilePath": f"{speaker}\\{voice}.ogg",
+                        "Text": f"「{stem}の\\\"せりふ{voice_index}です……!?」",
+                    }
+                )
+        write_index(out_dir / "raw" / stem, entries)
+    return out_dir
+
+
+def manifest_only_argv(out_dir, *extra):
+    return [
+        "--out-dir", str(out_dir),
+        "--archives", *MANIFEST_ONLY_ARCHIVES,
+        "--manifest-only", *extra,
+    ]
+
+
+# --- a real full build, for the equivalence tests ---------------------------
+# The sources are addressed through the ``FilePath`` entry shape, which carries
+# its own extension, so they can be the same stdlib-written wavs used
+# everywhere else in this file: the real decoder runs over them without the
+# fixture needing an ogg encoder.  Pruning then deletes them exactly as the
+# cluster does.
+
+
+def build_full_corpus(out_dir, include_out_of_range=False, speakers=3, clips=4):
+    for archive in MANIFEST_ONLY_ARCHIVES:
+        stem = Path(archive).stem
+        root = out_dir / "raw" / stem
+        entries = []
+        for speaker_index in range(speakers):
+            speaker = f"spk{speaker_index}"
+            for voice_index in range(clips):
+                voice = f"v{voice_index}"
+                seconds = 1.0 + 0.25 * voice_index
+                if include_out_of_range:
+                    seconds = {0: 0.2, 1: 21.0}.get(voice_index, seconds)
+                write_wav(root / speaker / f"{voice}.wav", seconds)
+                entries.append(
+                    {
+                        "Speaker": speaker,
+                        "FilePath": f"{speaker}\\{voice}.wav",
+                        "Text": f"「{stem}の\\\"せりふ{voice_index}です……!?」",
+                    }
+                )
+        # One entry the archive never shipped: dropped_missing_audio on both
+        # sides, so the reclassification arithmetic has a non-zero baseline.
+        entries.append(
+            {"Speaker": "spk0", "FilePath": "spk0\\absent.wav", "Text": "ない"}
+        )
+        write_index(root, entries)
+    return out_dir
+
+
+def stub_extraction(monkeypatch):
+    """Skip download and extraction only; planning and conversion stay real."""
+    monkeypatch.setattr(vn, "read_hf_token", lambda: "")
+    monkeypatch.setattr(vn, "extraction_password_need", lambda archive, raw_dir: "skip")
+    monkeypatch.setattr(
+        vn, "extract_archive", lambda archive, raw_dir, password: raw_dir / archive.stem
+    )
+
+    def download_all(archives, archive_dir, token, workers):
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        placed = {}
+        for remote in archives:
+            local = archive_dir / Path(remote).name
+            local.touch()
+            placed[remote] = local
+        return placed
+
+    monkeypatch.setattr(vn, "download_all", download_all)
+    # The conversion pool spawns fresh interpreters, which re-import the module
+    # by name; this test file loads it from a path, so the directory holding it
+    # has to be importable in the children too.
+    monkeypatch.syspath_prepend(str(SCRIPT_PATH.parent))
+
+
+def full_argv(out_dir, *extra):
+    return [
+        "--out-dir", str(out_dir),
+        "--archives", *MANIFEST_ONLY_ARCHIVES,
+        "--workers", "1", *extra,
+    ]
+
+
+def prune_corpus(out_dir):
+    """Exactly what each cluster batch does once it has converted: drop the
+    archives and every extracted source, keep ``raw/<stem>/index.json``."""
+    shutil.rmtree(out_dir / "archives", ignore_errors=True)
+    for path in sorted((out_dir / "raw").rglob("*"), reverse=True):
+        if path.is_file() and path.name != "index.json":
+            path.unlink()
+        elif path.is_dir() and not any(path.iterdir()):
+            path.rmdir()
+
+
+# --- the CLI option ---------------------------------------------------------
+
+
+def test_manifest_only_is_off_by_default():
+    assert vn.parse_args([]).manifest_only is False
+
+
+def test_manifest_only_is_a_flag():
+    assert vn.parse_args(["--manifest-only"]).manifest_only is True
+
+
+# --- locating the pruned inputs --------------------------------------------
+
+
+def test_pruned_indexes_are_found_from_the_archive_names(tmp_path):
+    raw_dir = tmp_path / "raw"
+    for archive in MANIFEST_ONLY_ARCHIVES:
+        write_index(raw_dir / Path(archive).stem, [])
+
+    found = vn.locate_pruned_indexes(MANIFEST_ONLY_ARCHIVES, raw_dir)
+
+    assert found == [
+        ("Studio_A", raw_dir / "Studio_A" / "index.json"),
+        ("Studio_B", raw_dir / "Studio_B" / "index.json"),
+    ]
+
+
+def test_pruned_indexes_are_found_in_the_nested_archive_layout(tmp_path):
+    # The other real layout: everything one directory down.  Pruning keeps the
+    # index where the archive put it, so the lookup has to descend too.
+    raw_dir = tmp_path / "raw"
+    write_index(raw_dir / "Studio_A" / "Studio_A", [])
+
+    found = vn.locate_pruned_indexes(["GalGame/Studio_A.7z"], raw_dir)
+
+    assert found == [("Studio_A", raw_dir / "Studio_A" / "Studio_A" / "index.json")]
+
+
+def test_a_missing_index_json_is_fatal_rather_than_skipped(tmp_path):
+    """Silently dropping an archive would emit a quietly smaller corpus.
+
+    That is the same failure the extraction markers exist to prevent, and here
+    it is worse: by this point the archive is deleted, so the omission cannot be
+    reconstructed later from anything on disk.
+    """
+    raw_dir = tmp_path / "raw"
+    write_index(raw_dir / "Studio_A", [])
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.locate_pruned_indexes(MANIFEST_ONLY_ARCHIVES, raw_dir)
+
+    message = str(excinfo.value)
+    assert "Studio_B" in message
+    assert "1 of 2 archive(s)" in message
+
+
+def test_the_missing_index_list_is_truncated_but_counted(tmp_path):
+    archives = [f"GalGame/S{i:02d}.7z" for i in range(25)]
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.locate_pruned_indexes(archives, tmp_path / "raw")
+
+    message = str(excinfo.value)
+    assert f"+{25 - vn.MANIFEST_ONLY_MISSING_LOGGED} more" in message
+    assert "25 of 25" in message
+
+
+# --- planning against a pruned raw tree ------------------------------------
+
+
+def test_planning_keeps_clips_whose_source_ogg_has_been_deleted(tmp_path):
+    """The crux of the mode: the sources are gone by construction.
+
+    Without this, every entry would be dropped as missing audio and the mode
+    would rebuild an empty corpus from a perfectly good one.
+    """
+    index = write_index(
+        tmp_path / "raw" / "Studio_A",
+        [{"Speaker": "spk", "FilePath": "spk\\v0.ogg", "Text": "せりふ"}],
+    )
+    stats = vn.FilterStats()
+
+    tasks = vn.plan_archive(
+        index, "Studio_A", tmp_path / "audio", stats,
+        vn.ArchiveStats(archive="Studio_A", title="Studio_A"), manifest_only=True,
+    )
+
+    assert [task.key for task in tasks] == ["Studio_A__spk__v0"]
+    assert stats.missing_audio == 0
+
+
+def test_planning_without_the_flag_still_requires_the_source(tmp_path):
+    # The default path is unchanged: a missing ogg is still a missing clip.
+    index = write_index(
+        tmp_path / "raw" / "Studio_A",
+        [{"Speaker": "spk", "FilePath": "spk\\v0.ogg", "Text": "せりふ"}],
+    )
+    stats = vn.FilterStats()
+
+    tasks = vn.plan_archive(
+        index, "Studio_A", tmp_path / "audio", stats,
+        vn.ArchiveStats(archive="Studio_A", title="Studio_A"),
+    )
+
+    assert tasks == []
+    assert stats.missing_audio == 1
+
+
+def test_planning_with_the_flag_still_drops_empty_text(tmp_path):
+    # Only the audio check is relaxed; every text filter still applies.
+    index = write_index(
+        tmp_path / "raw" / "Studio_A",
+        [{"Speaker": "spk", "FilePath": "spk\\v0.ogg", "Text": "　"}],
+    )
+    stats = vn.FilterStats()
+
+    tasks = vn.plan_archive(
+        index, "Studio_A", tmp_path / "audio", stats,
+        vn.ArchiveStats(archive="Studio_A", title="Studio_A"), manifest_only=True,
+    )
+
+    assert tasks == []
+    assert stats.empty_text == 1
+
+
+# --- probing an already-converted wav --------------------------------------
+
+
+@requires_soundfile
+def test_probing_reports_a_converted_wav_and_its_duration(tmp_path):
+    wav = write_wav(tmp_path / "v0.wav", 2.0)
+
+    dst, duration, status, detail = vn.probe_converted(str(wav), 0.5, 20.0)
+
+    assert (dst, status, detail) == (str(wav), "ok", "")
+    assert duration == pytest.approx(2.0)
+
+
+@requires_soundfile
+def test_probing_a_wav_that_was_never_converted_reports_missing(tmp_path):
+    dst, duration, status, _ = vn.probe_converted(str(tmp_path / "gone.wav"), 0.5, 20.0)
+
+    assert status == "missing"
+    assert duration == 0.0
+
+
+@requires_soundfile
+@pytest.mark.parametrize(
+    "seconds,expected", [(0.25, "too_short"), (21.0, "too_long")]
+)
+def test_probing_applies_the_same_duration_bounds_as_conversion(
+    tmp_path, seconds, expected
+):
+    wav = write_wav(tmp_path / "v0.wav", seconds)
+
+    assert vn.probe_converted(str(wav), 0.5, 20.0)[2] == expected
+
+
+@requires_soundfile
+def test_probing_an_unreadable_wav_is_an_error_not_a_silent_drop(tmp_path):
+    # A conversion killed mid-write leaves a file that is not a wav; counting it
+    # as merely "missing" would hide a truncated batch.
+    broken = tmp_path / "v0.wav"
+    broken.write_bytes(b"not a wav at all")
+
+    assert vn.probe_converted(str(broken), 0.5, 20.0)[2] == "error"
+
+
+# --- the mode end to end ----------------------------------------------------
+
+
+@requires_soundfile
+def test_manifest_only_rebuilds_from_a_pruned_corpus(tmp_path, monkeypatch, capsys):
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+
+    assert vn.main(manifest_only_argv(tmp_path)) == 0
+
+    train = read_jsonl(tmp_path / "train.jsonl")
+    val = read_jsonl(tmp_path / "val.jsonl")
+    assert len(train) + len(val) == 24
+    assert not (tmp_path / "archives").exists()
+
+
+@requires_soundfile
+def test_manifest_only_announces_the_mode_in_the_log(tmp_path, monkeypatch, capsys):
+    """A rebuilt manifest is indistinguishable from a full build's on disk, so
+    the run that produced it has to say which it was."""
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+
+    vn.main(manifest_only_argv(tmp_path))
+
+    out = capsys.readouterr().out
+    assert "mode    : MANIFEST-ONLY" in out
+    assert "no download, no extraction, no conversion" in out
+    # The progress lines must not claim to be converting anything either.
+    assert "convert:" not in out
+    assert "scan   :" in out
+
+
+@requires_soundfile
+def test_manifest_only_records_the_mode_in_the_manifest(tmp_path, monkeypatch):
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+
+    vn.main(manifest_only_argv(tmp_path))
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert "--manifest-only" in manifest["manifest_only"]["note"]
+
+
+@requires_soundfile
+def test_manifest_only_needs_no_hf_token_or_archive_password(
+    tmp_path, monkeypatch, capsys
+):
+    """The mode does no work that requires a credential, so it must demand none.
+
+    Failing for a missing secret while doing nothing that needs it would strand
+    the final split on a machine that legitimately has neither.
+    """
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+    for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN",
+                 vn.ARCHIVE_PASSWORD_ENV):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(vn, "HF_TOKEN_FILE", tmp_path / "absent-token")
+    monkeypatch.setattr(vn, "ARCHIVE_PASSWORD_FILE", tmp_path / "absent-password")
+
+    assert vn.main(manifest_only_argv(tmp_path)) == 0
+
+
+@requires_soundfile
+def test_an_index_entry_without_a_converted_wav_counts_as_missing_audio(
+    tmp_path, monkeypatch
+):
+    build_pruned_corpus(tmp_path)
+    # One clip that was in the index but never produced a wav -- the shape of an
+    # upstream-missing ogg, and of a clip the full run dropped for duration.
+    (tmp_path / "audio" / "Studio_A" / "spk0" / "v0.wav").unlink()
+    forbid_acquisition(monkeypatch)
+
+    vn.main(manifest_only_argv(tmp_path))
+
+    stats = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert stats["filter_stats"]["dropped_missing_audio"] == 1
+    assert stats["filter_stats"]["kept"] == 23
+    assert stats["totals"]["clips"] + stats["totals"]["val_surplus_clips_dropped"] == 23
+
+
+@requires_soundfile
+def test_manifest_only_composes_with_the_split_options(tmp_path, monkeypatch):
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+
+    vn.main(manifest_only_argv(tmp_path, "--val-frac", "0.3", "--seed", "7"))
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["config"]["val_fraction"] == 0.3
+    assert manifest["config"]["seed"] == 7
+    # The speaker-disjointness guarantee is not weakened by the mode.
+    train_speakers = {r["key"].rsplit("__", 1)[0] for r in
+                      read_jsonl(tmp_path / "train.jsonl")}
+    val_speakers = {r["key"].rsplit("__", 1)[0] for r in
+                    read_jsonl(tmp_path / "val.jsonl")}
+    assert train_speakers.isdisjoint(val_speakers)
+
+
+@requires_soundfile
+def test_manifest_only_composes_with_pinned_val_keys(tmp_path, monkeypatch):
+    """The 58-archive final split is exactly this: both flags, one invocation."""
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+    vn.main(manifest_only_argv(tmp_path))
+    pinned = [record["key"] for record in read_jsonl(tmp_path / "val.jsonl")]
+    pins = tmp_path / "pins.txt"
+    pins.write_text("".join(f"{key}\n" for key in pinned), encoding="utf-8")
+
+    vn.main(manifest_only_argv(tmp_path, "--pin-val-keys", str(pins)))
+
+    assert [r["key"] for r in read_jsonl(tmp_path / "val.jsonl")] == sorted(pinned)
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["val_pin"]["keys_found"] == len(pinned)
+    assert manifest["val_pin"]["keys_missing"] == 0
+    assert "manifest_only" in manifest
+
+
+# --- refusing to write nothing ----------------------------------------------
+
+
+def test_manifest_only_fails_when_nothing_has_been_converted(tmp_path, monkeypatch):
+    """Pointed at an unbuilt corpus it must not overwrite good outputs with an
+    empty manifest -- and it must say so before doing any work."""
+    build_pruned_corpus(tmp_path)
+    shutil.rmtree(tmp_path / "audio")
+    forbid_acquisition(monkeypatch)
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.main(manifest_only_argv(tmp_path))
+
+    message = str(excinfo.value)
+    assert "--manifest-only" in message
+    assert "no converted wav" in message
+
+
+def test_manifest_only_fails_when_the_audio_tree_holds_no_wav(tmp_path, monkeypatch):
+    build_pruned_corpus(tmp_path)
+    for wav in (tmp_path / "audio").rglob("*.wav"):
+        wav.unlink()
+    forbid_acquisition(monkeypatch)
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.main(manifest_only_argv(tmp_path))
+
+    assert "no converted wav" in str(excinfo.value)
+
+
+def test_the_empty_corpus_check_runs_before_any_output_is_written(
+    tmp_path, monkeypatch
+):
+    build_pruned_corpus(tmp_path)
+    shutil.rmtree(tmp_path / "audio")
+    (tmp_path / "train.jsonl").write_text("PREVIOUS RUN\n", encoding="utf-8")
+    forbid_acquisition(monkeypatch)
+
+    with pytest.raises(SystemExit):
+        vn.main(manifest_only_argv(tmp_path))
+
+    assert (tmp_path / "train.jsonl").read_text(encoding="utf-8") == "PREVIOUS RUN\n"
+
+
+@requires_soundfile
+def test_manifest_only_fails_when_no_index_entry_has_audio(tmp_path, monkeypatch):
+    """A different failure from "nothing converted": there *is* audio, but none
+    of it belongs to the archives named."""
+    build_pruned_corpus(tmp_path)
+    write_index(
+        tmp_path / "raw" / "Studio_A",
+        [{"Speaker": "ghost", "FilePath": "ghost\\v9.ogg", "Text": "だれもいない"}],
+    )
+    write_index(
+        tmp_path / "raw" / "Studio_B",
+        [{"Speaker": "ghost", "FilePath": "ghost\\v9.ogg", "Text": "だれもいない"}],
+    )
+    forbid_acquisition(monkeypatch)
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.main(manifest_only_argv(tmp_path))
+
+    assert "would be empty" in str(excinfo.value)
+
+
+# --- equivalence with a full build ------------------------------------------
+
+
+@requires_audio_stack
+def test_manifest_only_reproduces_the_manifest_a_full_run_produced(
+    tmp_path, monkeypatch
+):
+    """The guarantee the mode exists to provide, end to end.
+
+    A full run (real planning, real conversion, real split) is followed by the
+    cluster's pruning -- archives deleted, every extracted source deleted,
+    ``index.json`` kept -- and then a manifest-only rebuild.  The two
+    ``train.jsonl`` / ``val.jsonl`` pairs must be byte-identical: if they are
+    not, the final 1,000 h split is not the corpus that was converted.
+    """
+    full = build_full_corpus(tmp_path / "full")
+    stub_extraction(monkeypatch)
+    assert vn.main(full_argv(full)) == 0
+    before = {
+        name: (full / name).read_bytes() for name in ("train.jsonl", "val.jsonl")
+    }
+
+    prune_corpus(full)
+    for name in before:
+        (full / name).unlink()
+    forbid_acquisition(monkeypatch)
+
+    assert vn.main(manifest_only_argv(full)) == 0
+
+    after = {
+        name: (full / name).read_bytes() for name in ("train.jsonl", "val.jsonl")
+    }
+    assert after == before
+
+
+@requires_audio_stack
+def test_manifest_only_reproduces_a_pinned_split_after_pruning(tmp_path, monkeypatch):
+    full = build_full_corpus(tmp_path / "full")
+    stub_extraction(monkeypatch)
+    vn.main(full_argv(full))
+    pins = full / "pins.txt"
+    pins.write_text(
+        "".join(f"{r['key']}\n" for r in read_jsonl(full / "val.jsonl")),
+        encoding="utf-8",
+    )
+    vn.main(full_argv(full, "--pin-val-keys", str(pins)))
+    before = {
+        name: (full / name).read_bytes() for name in ("train.jsonl", "val.jsonl")
+    }
+
+    prune_corpus(full)
+    forbid_acquisition(monkeypatch)
+    vn.main(manifest_only_argv(full, "--pin-val-keys", str(pins)))
+
+    after = {
+        name: (full / name).read_bytes() for name in ("train.jsonl", "val.jsonl")
+    }
+    assert after == before
+
+
+@requires_audio_stack
+def test_the_kept_clip_count_survives_pruning_though_the_reasons_shift(
+    tmp_path, monkeypatch
+):
+    """Duration drops are reclassified, the corpus is not.
+
+    A clip the full run dropped for being too short never produced a wav, and
+    its source is gone, so manifest-only can only call it missing audio.  That
+    moves counts between filter_stats reasons -- and must move nothing between
+    kept and dropped.
+    """
+    full = build_full_corpus(tmp_path / "full", include_out_of_range=True)
+    stub_extraction(monkeypatch)
+    vn.main(full_argv(full))
+    before = json.loads((full / "manifest.json").read_text(encoding="utf-8"))
+
+    prune_corpus(full)
+    forbid_acquisition(monkeypatch)
+    vn.main(manifest_only_argv(full))
+    after = json.loads((full / "manifest.json").read_text(encoding="utf-8"))
+
+    assert before["filter_stats"]["dropped_too_short"] > 0
+    assert before["filter_stats"]["dropped_too_long"] > 0
+    assert after["filter_stats"]["dropped_too_short"] == 0
+    assert after["filter_stats"]["dropped_too_long"] == 0
+    assert after["filter_stats"]["dropped_missing_audio"] == (
+        before["filter_stats"]["dropped_missing_audio"]
+        + before["filter_stats"]["dropped_too_short"]
+        + before["filter_stats"]["dropped_too_long"]
+    )
+    assert after["filter_stats"]["kept"] == before["filter_stats"]["kept"]
+    assert after["totals"]["clips"] == before["totals"]["clips"]
+
+
+# ---------------------------------------------------------------------------
+# Resolving an index entry to the audio actually on disk
+#
+# The bug this section pins: an index entry was resolved to
+# ``<Speaker>/<Voice>.ogg`` and nowhere else.  That layout is a property of
+# *most* archives, not of the dataset, and assuming it silently discarded
+# 54,420 clips (~90 h) of a 1,000 h build.  Silently, because every one of them
+# landed in ``dropped_missing_audio``, which reads as an upstream dataset gap
+# rather than as a bug here -- the audio was fully present in all four affected
+# titles (.ogg count == index entry count).
+#
+# Three distinct real causes, one synthetic tree each below:
+#   1. CIRCUS D.C. III P.P.  -- Voice already carries ".ogg" (16,214 clips);
+#   2. NanaWind Haruoto      -- the directory is not the index's Speaker
+#                               (23,478 clips);
+#   3. Libido Soft Hinekure  -- Voice names no file under the speaker's
+#                               directory at all (8,228 clips).
+#
+# The two properties that must NOT move while fixing that are pinned here too:
+# a title that already resolved must resolve to exactly the same file (the
+# existing corpora are fingerprinted), and the manifest's speaker must keep
+# coming from the index, because cause 2 is precisely a directory name that
+# disagrees with it and the speaker-disjoint split is keyed on that label.
+# ---------------------------------------------------------------------------
+
+
+def plan_tree(tmp_path, entries, files, *, title="Studio_A", manifest_only=False):
+    """Plan one synthetic title.  ``files`` are paths relative to the index."""
+    root = tmp_path / "raw" / title
+    for relative in files:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Planning only tests existence; conversion is a separate stage.
+        path.touch()
+    index = write_index(root, entries)
+    stats = vn.FilterStats()
+    tasks = vn.plan_archive(
+        index,
+        title,
+        tmp_path / "audio",
+        stats,
+        vn.ArchiveStats(archive=title, title=title),
+        manifest_only=manifest_only,
+    )
+    return tasks, stats, root
+
+
+# --- strip_audio_suffix -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("DC3PP_0518_FREE_AOI_AOI01.ogg", "DC3PP_0518_FREE_AOI_AOI01"),
+        ("clip.OGG", "clip"),  # compared case-folded
+        ("clip.wav", "clip"),
+        ("clip.mp3", "clip"),
+        ("clip.flac", "clip"),
+        ("clip.m4a", "clip"),
+        ("clip", "clip"),
+        # Only ONE extension comes off, so a doubled name loses one layer only.
+        ("clip.ogg.ogg", "clip.ogg"),
+        # Not extensions.  Path.stem would wrongly cut both of these, which is
+        # why the helper matches against AUDIO_SUFFIXES instead.
+        ("Mr.N", "Mr.N"),
+        ("2.5", "2.5"),
+        ("", ""),
+    ],
+)
+def test_strip_audio_suffix_removes_one_audio_extension_only(name, expected):
+    assert vn.strip_audio_suffix(name) == expected
+
+
+# --- the layout that already worked must not move ---------------------------
+
+
+def test_the_documented_layout_resolves_to_exactly_the_same_file(tmp_path):
+    """The reproducibility guarantee: <Speaker>/<Voice>.ogg still wins outright.
+
+    The existing corpora are fingerprinted, so a title that resolved 100% before
+    must produce byte-identical output.  The decoy is the sharp edge: the same
+    stem exists elsewhere in the title, and must lose to the literal path.
+    """
+    entries = [{"Speaker": "spk", "Voice": "v0", "Text": "せりふ"}]
+    tasks, stats, root = plan_tree(
+        tmp_path, entries, ["spk/v0.ogg", "elsewhere/v0.ogg"]
+    )
+
+    assert [task.src for task in tasks] == [str(root / "spk" / "v0.ogg")]
+    assert stats.resolved_exact == 1
+    assert (stats.resolved_extension_stripped, stats.resolved_stem_elsewhere) == (0, 0)
+    assert stats.missing_audio == 0
+
+
+def test_the_filepath_shape_also_resolves_at_its_literal_path(tmp_path):
+    # Criminal Border's shape: a Windows-style relative path with the extension.
+    entries = [{"Speaker": "琴子", "FilePath": "琴子\\ep2_kot0002.ogg", "Text": "せりふ"}]
+    tasks, stats, root = plan_tree(tmp_path, entries, ["琴子/ep2_kot0002.ogg"])
+
+    assert [task.src for task in tasks] == [str(root / "琴子" / "ep2_kot0002.ogg")]
+    assert stats.resolved_exact == 1
+
+
+# --- cause 1: Voice already carries the extension ---------------------------
+
+
+def test_a_voice_that_already_carries_its_extension_resolves(tmp_path):
+    """CIRCUS D.C. III P.P., 16,214 clips.
+
+    ``Voice`` is ``...AOI01.ogg``, so appending ".ogg" looked for "....ogg.ogg".
+    """
+    entries = [
+        {
+            "Speaker": "AOI",
+            "Voice": "DC3PP_0518_FREE_AOI_AOI01.ogg",
+            "Text": "せりふ",
+        }
+    ]
+    tasks, stats, root = plan_tree(
+        tmp_path, entries, ["AOI/DC3PP_0518_FREE_AOI_AOI01.ogg"]
+    )
+
+    assert [task.src for task in tasks] == [
+        str(root / "AOI" / "DC3PP_0518_FREE_AOI_AOI01.ogg")
+    ]
+    assert stats.missing_audio == 0
+    assert stats.resolved_extension_stripped == 1
+
+
+def test_the_doubled_extension_never_reaches_the_converted_wav_name(tmp_path):
+    """The wav must be ``<voice>.wav``, not ``<voice>_ogg.wav``.
+
+    ``Voice`` names the destination as well as the source, so an extension left
+    on it would be slugified into the wav name and into the manifest key -- and
+    --manifest-only, which recomputes both from the index alone, would then look
+    for a file the full run never wrote.
+    """
+    entries = [{"Speaker": "AOI", "Voice": "clip01.ogg", "Text": "せりふ"}]
+    tasks, _stats, _root = plan_tree(tmp_path, entries, ["AOI/clip01.ogg"])
+
+    assert Path(tasks[0].dst).name == "clip01.wav"
+    assert tasks[0].key == "Studio_A__AOI__clip01"
+
+
+# --- cause 2: the directory is not the index's Speaker ----------------------
+
+
+def test_audio_in_a_directory_other_than_the_speaker_resolves(tmp_path):
+    """NanaWind Haruoto Alice Gram, 23,478 clips.
+
+    The index says 女子生徒Ｂ; the file sits under 男子生徒ａ.  The stem is the
+    only reliable link between the two.
+    """
+    entries = [{"Speaker": "女子生徒Ｂ", "Voice": "com6_mob01_6", "Text": "せりふ"}]
+    tasks, stats, root = plan_tree(
+        tmp_path, entries, ["男子生徒ａ/com6_mob01_6.ogg"]
+    )
+
+    assert [task.src for task in tasks] == [
+        str(root / "男子生徒ａ" / "com6_mob01_6.ogg")
+    ]
+    assert stats.missing_audio == 0
+    assert stats.resolved_stem_elsewhere == 1
+
+
+def test_the_speaker_label_comes_from_the_index_not_the_directory(tmp_path):
+    """The split depends on this, so it must not follow the file.
+
+    Taking the speaker from the directory would relabel all 23,478 of cause 2's
+    clips as 男子生徒ａ, silently re-partitioning the speaker-disjoint split --
+    a change that shows up in no metric until val is measuring a voice train has
+    already seen.
+    """
+    entries = [{"Speaker": "女子生徒Ｂ", "Voice": "com6_mob01_6", "Text": "せりふ"}]
+    tasks, _stats, _root = plan_tree(
+        tmp_path, entries, ["男子生徒ａ/com6_mob01_6.ogg"]
+    )
+
+    assert tasks[0].speaker == f"Studio_A/{vn.slugify('女子生徒Ｂ')}"
+    assert "男子生徒" not in tasks[0].speaker
+    assert "男子生徒" not in tasks[0].dst
+    assert "男子生徒" not in tasks[0].key
+    # And the split key derived from the record is the index's speaker.
+    record = vn.build_record(tasks[0].key, tasks[0].text, tasks[0].dst, 1.0)
+    record["speaker"] = tasks[0].speaker
+    assert vn.speaker_group_key(record) == vn.slugify("女子生徒Ｂ")
+
+
+# --- cause 3: no file of that name under any spelling tried -----------------
+
+
+def test_a_stem_that_differs_only_in_case_resolves(tmp_path):
+    """Case-insensitivity is the mechanism, tested independently of the diagnosis.
+
+    Libido Soft (8,228 clips) is the one cause I could not settle against the
+    real archives -- they are not on this machine, and its index's ``Voice``
+    (``Mizuki001``) shares no stem with the sample of disk names I was given
+    (``朔夜・京子/kyoko0305.ogg``).  So this pins what the resolver does about
+    case, and ``filter_stats`` is what will say whether that was enough on the
+    real title; the test below pins that anything genuinely absent still drops.
+    """
+    entries = [{"Speaker": "Mizuki", "Voice": "Mizuki001", "Text": "せりふ"}]
+    # A different directory, so the case-insensitive filesystem this runs on
+    # cannot resolve it at the literal path and mask the stem lookup.
+    tasks, stats, root = plan_tree(tmp_path, entries, ["朔夜・京子/mizuki001.ogg"])
+
+    assert [task.src for task in tasks] == [str(root / "朔夜・京子" / "mizuki001.ogg")]
+    assert stats.resolved_stem_elsewhere == 1
+
+
+def test_a_voice_naming_no_file_anywhere_is_still_dropped(tmp_path):
+    """The resolver must not invent a match.
+
+    A wrong clip is worse than a missing one: it trains CTC against a transcript
+    that is certainly not what the audio says.
+    """
+    entries = [{"Speaker": "Mizuki", "Voice": "Mizuki001", "Text": "せりふ"}]
+    tasks, stats, _root = plan_tree(tmp_path, entries, ["朔夜・京子/kyoko0305.ogg"])
+
+    assert tasks == []
+    assert stats.missing_audio == 1
+    assert (stats.resolved_exact, stats.resolved_stem_elsewhere) == (0, 0)
+
+
+def test_an_entry_naming_no_audio_at_all_is_dropped(tmp_path):
+    entries = [{"Speaker": "spk", "Text": "せりふ"}]
+    tasks, stats, _root = plan_tree(tmp_path, entries, ["spk/v0.ogg"])
+
+    assert tasks == []
+    assert stats.missing_audio == 1
+
+
+# --- stem collisions --------------------------------------------------------
+
+
+def test_a_stem_collision_prefers_the_file_under_the_index_speaker(tmp_path):
+    """Two files, one stem: the entry's own speaker directory decides."""
+    entries = [{"Speaker": "spk", "Voice": "v0.ogg", "Text": "せりふ"}]
+    tasks, stats, root = plan_tree(
+        tmp_path, entries, ["aaa_first_by_sort/v0.ogg", "spk/v0.ogg"]
+    )
+
+    assert [task.src for task in tasks] == [str(root / "spk" / "v0.ogg")]
+    assert stats.stem_collisions == 1
+
+
+def test_a_stem_collision_with_no_speaker_match_is_deterministic(tmp_path):
+    """Sorted path order, so two machines build the same corpus.
+
+    Filesystem walk order is not stable across machines or across a re-extract,
+    so an arbitrary pick would make the corpus unreproducible -- exactly the
+    property the fingerprints rely on.
+    """
+    entries = [{"Speaker": "spk", "Voice": "v0", "Text": "せりふ"}]
+    files = ["zzz/v0.ogg", "aaa/v0.ogg", "mmm/v0.ogg"]
+    tasks, stats, root = plan_tree(tmp_path, entries, files)
+
+    assert [task.src for task in tasks] == [str(root / "aaa" / "v0.ogg")]
+    assert stats.stem_collisions == 1
+    # Same tree, planned again: same pick.
+    again, _stats, _root = plan_tree(
+        tmp_path / "again", entries, list(reversed(files))
+    )
+    assert Path(again[0].src).parent.name == "aaa"
+
+
+# --- cost: one walk per title, never per entry ------------------------------
+
+
+def test_the_on_disk_index_is_built_once_per_title(tmp_path, monkeypatch):
+    """Not once per entry: a title holds ~25,000 files and there are 58 of them.
+
+    Per-entry scanning would be quadratic -- ~625 million stat calls for one
+    title -- which is the difference between a walk that costs seconds and a
+    corpus build that never finishes.
+    """
+    builds = []
+    original = vn.TitleAudioIndex._build
+    monkeypatch.setattr(
+        vn.TitleAudioIndex,
+        "_build",
+        lambda self: builds.append(self.root) or original(self),
+    )
+    # 50 entries, none of which resolves at its literal path.
+    entries = [
+        {"Speaker": "spk", "Voice": f"v{i}", "Text": "せりふ"} for i in range(50)
+    ]
+    tasks, stats, _root = plan_tree(
+        tmp_path, entries, [f"other/v{i}.ogg" for i in range(50)]
+    )
+
+    assert len(tasks) == 50
+    assert stats.resolved_stem_elsewhere == 50
+    assert len(builds) == 1
+
+
+def test_a_title_that_resolves_exactly_never_walks_its_tree(tmp_path, monkeypatch):
+    # The lazy build is what keeps the fix free for the titles that were already
+    # fine -- 54 of the 58 archives.
+    builds = []
+    monkeypatch.setattr(
+        vn.TitleAudioIndex, "_build", lambda self: builds.append(self.root) or {}
+    )
+    entries = [
+        {"Speaker": "spk", "Voice": f"v{i}", "Text": "せりふ"} for i in range(20)
+    ]
+    tasks, stats, _root = plan_tree(
+        tmp_path, entries, [f"spk/v{i}.ogg" for i in range(20)]
+    )
+
+    assert len(tasks) == 20
+    assert stats.resolved_exact == 20
+    assert builds == []
+
+
+# --- the counters reach the summary -----------------------------------------
+
+
+def test_the_resolution_counters_are_reported_in_the_filter_summary():
+    """One collapsed number is what hid the loss; four named ones is the fix."""
+    summary = vn.FilterStats().as_dict()
+
+    for name in (
+        "resolved_audio_exact_path",
+        "resolved_audio_extension_stripped",
+        "resolved_audio_stem_match_elsewhere",
+        "audio_stem_collisions",
+        "dropped_missing_audio",
+    ):
+        assert name in summary
+
+
+def test_every_entry_with_text_is_accounted_for_by_exactly_one_counter(tmp_path):
+    """No clip may vanish between "resolved" and "dropped"."""
+    entries = [
+        {"Speaker": "spk", "Voice": "v0", "Text": "せりふ"},           # exact
+        {"Speaker": "spk", "Voice": "v1.ogg", "Text": "せりふ"},       # extension
+        {"Speaker": "spk", "Voice": "v2", "Text": "せりふ"},           # elsewhere
+        {"Speaker": "spk", "Voice": "gone", "Text": "せりふ"},         # missing
+        {"Speaker": "spk", "Voice": "v0", "Text": "……"},              # empty text
+    ]
+    _tasks, stats, _root = plan_tree(
+        tmp_path, entries, ["spk/v0.ogg", "spk/v1.ogg", "other/v2.ogg"]
+    )
+
+    assert (stats.resolved_exact, stats.resolved_extension_stripped) == (1, 1)
+    assert (stats.resolved_stem_elsewhere, stats.missing_audio) == (1, 1)
+    assert stats.empty_text == 1
+    assert stats.index_entries == 5
+
+
+# --- --manifest-only is unaffected ------------------------------------------
+
+
+def test_manifest_only_still_plans_without_touching_the_audio_tree(tmp_path):
+    """The oggs are gone by construction there, so nothing is resolved on disk.
+
+    The wav is what that mode checks, later, in probe_converted.
+    """
+    entries = [{"Speaker": "spk", "Voice": "v0.ogg", "Text": "せりふ"}]
+    tasks, stats, _root = plan_tree(tmp_path, entries, [], manifest_only=True)
+
+    assert [task.key for task in tasks] == ["Studio_A__spk__v0"]
+    assert stats.missing_audio == 0
+    assert (stats.resolved_exact, stats.resolved_stem_elsewhere) == (0, 0)
+
+
+# ===========================================================================
+# Kana-only titles (--drop-kana-only-titles)
+# ===========================================================================
+#
+# Some titles transcribe their dialogue in hiragana where the audio plainly
+# contains kanji -- the same clip reads "いちおうはでんとうとかくしきのあるめい
+# もんがくえんで…" in the corpus and "一応は伝統と格式のある名門学園で…" to an
+# in-domain teacher ASR model.  Neither is a transcription *error*, which is why
+# no per-clip text filter can see it; what it does is teach the model to emit
+# kana where kanji is expected.  Measured over 4,000 clips: 285 of the 2,872
+# transcripts longer than 10 characters (9.9%) hold no kanji at all, at a median
+# normalised CER of 0.417 against 0.103 for the rest -- two populations, not a
+# tail.  JADE_Love_Destination is 100% kanji-free among its substantial lines.
+#
+# Two properties are pinned here and must not be loosened:
+#   * the unit of the decision is the TITLE.  A short kana-only line ("うん",
+#     "そうなんだ") is ordinary Japanese, and a per-clip rule would strip the
+#     corpus of backchannels and interjections;
+#   * the filter is OPT-IN.  A corpus built without the flag must be exactly
+#     what it was, down to the manifest's filter_stats keys.
+
+# A substantial line (> KANA_ONLY_MIN_CHARS characters) with no kanji in it.
+KANA_ONLY_LINE = "いちおうはでんとうとかくしきのあるめいもんがくえんで"
+# The same utterance as the rest of the corpus writes it.
+KANJI_LINE = "一応は伝統と格式のある名門学園で"
+# Backchannels: kana-only, but far too short to say anything about a title.
+BACKCHANNEL_LINES = ["うん", "そうなんだ", "ふふっ"]
+
+
+def plan_kana_title(tmp_path, texts, *, title="Kana_Title", **kwargs):
+    """Plan a synthetic title whose transcripts are exactly ``texts``."""
+    root = tmp_path / "raw" / title
+    entries = []
+    for index, text in enumerate(texts):
+        source = root / "spk" / f"v{index}.ogg"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.touch()
+        entries.append({"Speaker": "spk", "Voice": f"v{index}", "Text": text})
+    index_path = write_index(root, entries)
+    stats = vn.FilterStats()
+    tasks = vn.plan_archive(
+        index_path,
+        title,
+        tmp_path / "audio",
+        stats,
+        vn.ArchiveStats(archive=title, title=title),
+        **kwargs,
+    )
+    return tasks, stats
+
+
+# --- has_kanji --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("一応は伝統と格式のある名門学園で", True),
+        ("いちおうはでんとうとかくしきのある", False),
+        ("カタカナダケノセリフデス", False),
+        ("うん", False),
+        ("", False),
+        ("ABC123", False),  # Latin is not kanji
+        ("ーーー", False),  # a drawn-out vocalisation
+        ("々", False),  # the repeat mark alone is not a kanji occurrence
+        ("あ亜", True),
+    ],
+)
+def test_has_kanji_recognises_only_kanji(text, expected):
+    assert vn.has_kanji(text) is expected
+
+
+# --- kana_only_fraction -----------------------------------------------------
+
+
+def test_a_title_written_entirely_in_kana_measures_one():
+    assert vn.kana_only_fraction([KANA_ONLY_LINE] * 5) == 1.0
+
+
+def test_a_title_written_with_kanji_measures_zero():
+    assert vn.kana_only_fraction([KANJI_LINE] * 5) == 0.0
+
+
+def test_backchannels_do_not_count_as_evidence():
+    """The reason the measurement has a length floor at all.
+
+    Every title is full of "うん"; counting them would put an ordinary title's
+    kanji-free fraction near a kana-only title's and destroy the separation the
+    9.9% / median-CER measurement found.
+    """
+    assert vn.kana_only_fraction(BACKCHANNEL_LINES + [KANJI_LINE] * 2) == 0.0
+
+
+def test_a_title_with_no_substantial_transcript_is_unmeasurable():
+    # None, not 0.0 and not 1.0: the fraction is undefined over an empty
+    # denominator, and a title too small to measure must not be dropped on a
+    # measurement that was never taken.
+    assert vn.kana_only_fraction(BACKCHANNEL_LINES) is None
+    assert vn.kana_only_fraction([]) is None
+
+
+@pytest.mark.parametrize("length,counted", [(10, False), (11, True)])
+def test_the_length_floor_is_strictly_greater_than_ten(length, counted):
+    # 10 is KANA_ONLY_MIN_CHARS, and the measurement that produced the 0.8
+    # default was taken over transcripts *longer than* 10 characters (2,872 of
+    # them).  A line of exactly 10 is below the floor, so it cannot vote.
+    assert vn.KANA_ONLY_MIN_CHARS == 10
+    line = "あ" * length
+
+    assert vn.kana_only_fraction([line]) == (1.0 if counted else None)
+
+
+def test_the_fraction_is_over_substantial_lines_only():
+    # 2 of 4 substantial lines are kanji-free; the backchannels are invisible.
+    texts = [KANA_ONLY_LINE, KANA_ONLY_LINE, KANJI_LINE, KANJI_LINE]
+
+    assert vn.kana_only_fraction(texts + BACKCHANNEL_LINES) == 0.5
+
+
+# --- the title-level filter -------------------------------------------------
+
+
+def test_a_kana_only_title_is_dropped_whole(tmp_path):
+    tasks, stats = plan_kana_title(
+        tmp_path,
+        [KANA_ONLY_LINE] * 4 + BACKCHANNEL_LINES,
+        drop_kana_only_titles=True,
+    )
+
+    assert tasks == []
+    assert stats.kana_only_titles == ["Kana_Title"]
+    # Every clip of the title, backchannels included: the title goes, not the
+    # lines that triggered the verdict.
+    assert stats.kana_only_title_clips == 7
+
+
+def test_an_ordinary_title_survives_the_filter(tmp_path):
+    tasks, stats = plan_kana_title(
+        tmp_path,
+        [KANJI_LINE] * 4 + BACKCHANNEL_LINES,
+        drop_kana_only_titles=True,
+    )
+
+    assert len(tasks) == 7
+    assert stats.kana_only_titles == []
+    assert stats.kana_only_title_clips == 0
+
+
+def test_a_title_of_only_backchannels_is_kept(tmp_path):
+    """Nothing measurable, so nothing to act on.
+
+    A title whose every line is a short interjection is unusual, but dropping it
+    on an undefined fraction would be dropping it on no evidence.
+    """
+    tasks, stats = plan_kana_title(
+        tmp_path, BACKCHANNEL_LINES, drop_kana_only_titles=True
+    )
+
+    assert len(tasks) == 3
+    assert stats.kana_only_titles == []
+
+
+def test_individual_kana_only_clips_are_never_dropped(tmp_path):
+    """The rule the module docstring is emphatic about.
+
+    A kana-only line inside a normal title is ordinary Japanese -- unvoiced
+    kanji, a backchannel, an interjection -- and dropping those would bias the
+    corpus against exactly the utterances an ASR model finds hardest.
+    """
+    tasks, stats = plan_kana_title(
+        tmp_path,
+        [KANJI_LINE] * 4 + [KANA_ONLY_LINE] + BACKCHANNEL_LINES,
+        drop_kana_only_titles=True,
+    )
+
+    assert sorted(task.text for task in tasks) == sorted(
+        [KANJI_LINE] * 4 + [KANA_ONLY_LINE] + BACKCHANNEL_LINES
+    )
+    assert stats.kana_only_title_clips == 0
+
+
+@pytest.mark.parametrize(
+    "kana_lines,kanji_lines,dropped",
+    [
+        (4, 1, False),  # exactly 0.8 -- at the threshold, not above it
+        (5, 1, True),   # 0.833
+        (5, 0, True),   # 1.0, i.e. JADE_Love_Destination
+        (1, 4, False),  # 0.2, an ordinary title
+    ],
+)
+def test_the_threshold_is_an_exclusive_bound(
+    tmp_path, kana_lines, kanji_lines, dropped
+):
+    # 0.8 is the default because the affected titles measure ~1.0 while ordinary
+    # ones sit far below (9.9% corpus-wide), so the bound is deliberately far
+    # from both populations.  Exclusive, so a title sitting exactly on it stays:
+    # the drop must be justified by evidence past the bound, not at it.
+    assert vn.KANA_ONLY_TITLE_THRESHOLD == 0.8
+    texts = [KANA_ONLY_LINE] * kana_lines + [KANJI_LINE] * kanji_lines
+    tasks, stats = plan_kana_title(tmp_path, texts, drop_kana_only_titles=True)
+
+    assert (tasks == []) is dropped
+    assert (stats.kana_only_titles == ["Kana_Title"]) is dropped
+
+
+def test_the_threshold_is_configurable(tmp_path):
+    texts = [KANA_ONLY_LINE, KANJI_LINE, KANJI_LINE, KANJI_LINE]  # 0.25
+
+    kept, _ = plan_kana_title(tmp_path, texts, drop_kana_only_titles=True)
+    dropped, stats = plan_kana_title(
+        tmp_path / "strict",
+        texts,
+        drop_kana_only_titles=True,
+        kana_only_threshold=0.2,
+    )
+
+    assert len(kept) == 4
+    assert dropped == []
+    assert stats.kana_only_titles == ["Kana_Title"]
+
+
+def test_the_excluded_title_is_named_in_the_log(tmp_path, capsys):
+    # An excluded title is otherwise indistinguishable in the output from one
+    # that was never passed to --archives, which is the failure mode the
+    # resolution counters were added for.
+    plan_kana_title(tmp_path, [KANA_ONLY_LINE] * 3, drop_kana_only_titles=True)
+
+    log = capsys.readouterr().out
+    assert "Kana_Title" in log
+    assert "no kanji" in log
+
+
+# --- opt-in: the default path is untouched ----------------------------------
+
+
+def test_without_the_flag_a_kana_only_title_is_kept_in_full(tmp_path):
+    """The no-op guarantee, stated against the worst case.
+
+    A training run is scored against corpora built before this filter existed,
+    so the default must reproduce them: even a 100% kana-only title keeps every
+    clip unless the flag is passed.
+    """
+    tasks, stats = plan_kana_title(tmp_path, [KANA_ONLY_LINE] * 5)
+
+    assert len(tasks) == 5
+    assert stats.kana_only_titles == []
+    assert stats.kana_only_title_clips == 0
+    assert stats.kana_only_filter_applied is False
+
+
+def test_the_filter_summary_gains_no_keys_when_the_filter_is_off(tmp_path):
+    # manifest.json's filter_stats must be byte-for-byte what it was, so the
+    # counters may not appear as zeroes on a default run.
+    _tasks, stats = plan_kana_title(tmp_path, [KANA_ONLY_LINE] * 5)
+
+    summary = stats.as_dict()
+
+    assert "dropped_kana_only_title_clips" not in summary
+    assert "excluded_kana_only_titles" not in summary
+
+
+def test_the_filter_summary_reports_the_exclusions_when_it_is_on(tmp_path):
+    _tasks, stats = plan_kana_title(
+        tmp_path, [KANA_ONLY_LINE] * 5, drop_kana_only_titles=True
+    )
+
+    summary = stats.as_dict()
+
+    assert summary["excluded_kana_only_titles"] == ["Kana_Title"]
+    assert summary["dropped_kana_only_title_clips"] == 5
+    # Reported alongside the existing counters, not instead of them.
+    assert summary["index_entries"] == 5
+    assert summary["kept"] == 0
+
+
+def test_an_engaged_filter_that_excludes_nothing_still_says_so(tmp_path):
+    # An empty list is a measurement; an absent key is "not measured".  The two
+    # must not be confused when reading a manifest.
+    _tasks, stats = plan_kana_title(
+        tmp_path, [KANJI_LINE] * 5, drop_kana_only_titles=True
+    )
+
+    summary = stats.as_dict()
+
+    assert summary["excluded_kana_only_titles"] == []
+    assert summary["dropped_kana_only_title_clips"] == 0
+
+
+# --- the CLI ----------------------------------------------------------------
+
+
+def test_drop_kana_only_titles_defaults_to_off():
+    assert vn.parse_args([]).drop_kana_only_titles is False
+    assert vn.parse_args(["--drop-kana-only-titles"]).drop_kana_only_titles is True
+
+
+def test_the_threshold_defaults_to_none_so_it_stays_out_of_the_manifest():
+    # Same trick as --list-format: None (not 0.8) is what makes "passed without
+    # --drop-kana-only-titles" detectable instead of silently ineffective.
+    assert vn.parse_args([]).kana_only_title_threshold is None
+    parsed = vn.parse_args(["--kana-only-title-threshold", "0.5"])
+    assert parsed.kana_only_title_threshold == 0.5
+
+
+def test_the_threshold_without_the_flag_is_an_error(monkeypatch):
+    def explode(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("pipeline started despite an inapplicable flag")
+
+    monkeypatch.setattr(vn, "download_all", explode)
+    monkeypatch.setattr(vn, "read_hf_token", explode)
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.main(["--kana-only-title-threshold", "0.5"])
+
+    assert "--kana-only-title-threshold" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("value", ["0", "0.0", "1.5", "-0.2"])
+def test_a_threshold_outside_zero_to_one_is_rejected(monkeypatch, value):
+    # A fraction of clips can only live in (0, 1].  0 would drop every title
+    # that holds a single kanji-free line; above 1 the filter can never fire and
+    # the run would silently be an unfiltered one.
+    def explode(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("pipeline started despite an invalid threshold")
+
+    monkeypatch.setattr(vn, "download_all", explode)
+    monkeypatch.setattr(vn, "read_hf_token", explode)
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.main(["--drop-kana-only-titles", "--kana-only-title-threshold", value])
+
+    assert "(0, 1]" in str(excinfo.value)
+
+
+# --- the manifest -----------------------------------------------------------
+
+
+def test_a_default_run_records_no_kana_filter_in_the_manifest():
+    records = corpus()
+    train, val = vn.split_by_speaker(records, 0.2, seed=0)
+    stats = vn.FilterStats(index_entries=len(records), kept=len(records))
+
+    manifest = vn.build_manifest(vn.parse_args([]), {}, stats, train, val, 0)
+
+    assert "drop_kana_only_titles" not in manifest["config"]
+    assert "kana_only_title_threshold" not in manifest["config"]
+
+
+def test_a_filtered_run_records_the_threshold_it_used():
+    # The title list in filter_stats is only reproducible against the threshold
+    # it was taken at, so the two travel together.
+    records = corpus()
+    train, val = vn.split_by_speaker(records, 0.2, seed=0)
+    args = vn.parse_args(
+        ["--drop-kana-only-titles", "--kana-only-title-threshold", "0.6"]
+    )
+    stats = vn.FilterStats(index_entries=len(records), kept=len(records))
+    stats.kana_only_filter_applied = True
+    stats.kana_only_titles.append("JADE_Love_Destination")
+
+    manifest = vn.build_manifest(args, {}, stats, train, val, 0)
+
+    assert manifest["config"]["drop_kana_only_titles"] is True
+    assert manifest["config"]["kana_only_title_threshold"] == 0.6
+    assert manifest["config"]["kana_only_min_chars"] == vn.KANA_ONLY_MIN_CHARS
+    assert manifest["filter_stats"]["excluded_kana_only_titles"] == [
+        "JADE_Love_Destination"
+    ]
+
+
+def test_the_default_threshold_reaches_the_manifest_when_unset():
+    records = corpus()
+    train, val = vn.split_by_speaker(records, 0.2, seed=0)
+    args = vn.parse_args(["--drop-kana-only-titles"])
+    stats = vn.FilterStats(index_entries=len(records), kept=len(records))
+
+    manifest = vn.build_manifest(args, {}, stats, train, val, 0)
+
+    assert manifest["config"]["kana_only_title_threshold"] == 0.8

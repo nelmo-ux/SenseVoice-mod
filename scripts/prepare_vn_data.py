@@ -11,8 +11,10 @@ Pipeline
    ``~/.cache/sensevoice/vn_archive_password``) and is deliberately never passed
    to a ``7z`` subprocess, whose argv ``ps`` would expose machine-wide.
 3. Read each archive's ``index.json`` -- a JSON *list* of
-   ``{"Speaker", "Voice", "Text"}`` where the audio lives at
-   ``<Speaker>/<Voice>.ogg`` (48 kHz OGG Vorbis, mixed mono/stereo).
+   ``{"Speaker", "Voice", "Text"}`` -- and resolve every entry against the audio
+   actually present in the extracted tree (48 kHz OGG Vorbis, mixed mono/stereo).
+   ``<Speaker>/<Voice>.ogg`` is the *preferred* location, not the only one; see
+   "Resolving an index entry to a file" below.
 4. Transcode every kept clip to 16 kHz mono PCM16 wav under
    ``<out-dir>/audio/<title>/<speaker>/<voice>.wav`` (multiprocessing).
 5. Emit ``train.jsonl`` / ``val.jsonl`` in the exact schema of
@@ -30,7 +32,9 @@ Dropped clips:
 
 * duration < ``--min-seconds`` (0.5 s)  -- too short to carry a transcript;
 * duration > ``--max-seconds`` (20.0 s) -- the MPS memory ceiling for batching;
-* the ``.ogg`` referenced by ``index.json`` is missing on disk;
+* the audio referenced by ``index.json`` cannot be found on disk at all (see
+  "Resolving an index entry to a file" -- this is a genuinely absent file, not
+  merely one whose path differs from ``<Speaker>/<Voice>.ogg``);
 * the decoder raises (corrupt/truncated ogg);
 * ``Text`` is empty, whitespace-only, or punctuation-only after normalisation
   (CTC cannot train on a zero-length target and the trainer crashes rather than
@@ -39,6 +43,60 @@ Dropped clips:
   observed).  There is no way to tell which line the clip contains, and a clip
   trained against a certainly-wrong target is worse than a missing clip, so the
   whole group is dropped.  Duplicates that agree are simply collapsed.
+
+Dropped titles (opt-in, ``--drop-kana-only-titles``):
+
+* a title that transcribes its dialogue in kana where the audio has kanji --
+  ground truth ``いちおうはでんとうとかくしきのあるめいもんがくえんで…`` for
+  what a teacher ASR reads as ``一応は伝統と格式のある名門学園で…``.  The clips
+  are correctly transcribed; the *orthography* is the problem, and training on
+  it teaches the model to emit kana where kanji is expected.  Measured over
+  4,000 clips: 285 of 2,872 substantial transcripts (9.9%) hold no kanji, at a
+  median CER of 0.417 against 0.103 for the rest.  Judged per title and never
+  per clip -- a short kana-only line (``うん``, ``そうなんだ``) is ordinary
+  Japanese, so a per-clip rule would bias the corpus against backchannels.
+  Off by default because it removes titles that existing corpora contain; the
+  excluded titles are named in ``filter_stats.excluded_kana_only_titles``.
+
+Resolving an index entry to a file
+---------------------------------
+``<Speaker>/<Voice>.ogg`` holds for most archives but is *not* a property of the
+dataset, and assuming it was cost **54,420 clips (~90 h)** of a 1,000 h build --
+silently, because every one of them landed in ``dropped_missing_audio``, which
+reads like an upstream dataset gap rather than a bug here.  In the four affected
+titles the audio was fully present (``.ogg`` count == index entry count); three
+distinct things broke the assumption:
+
+1. ``Voice`` already carries the extension (``DC3PP_0518_FREE_AOI_AOI01.ogg``),
+   so appending ``.ogg`` looked for ``....ogg.ogg`` -- 16,214 clips;
+2. the directory on disk is not the index's ``Speaker`` (index ``女子生徒Ｂ``,
+   disk ``男子生徒ａ/com6_mob01_6.ogg``) -- 23,478 clips;
+3. neither spelling exists: the index's ``Voice`` names no file under the
+   speaker's directory at all -- 8,228 clips.
+
+:class:`TitleAudioIndex` therefore indexes the audio actually on disk, once per
+title (one ``os.walk``, so linear in the ~25,000 files a title holds), and
+:func:`plan_archive` looks each entry up in it:
+
+* ``<Speaker>/<Voice>.ogg`` -- the literal legacy path -- is tried first and
+  wins whenever it exists, so a title that already resolved keeps resolving to
+  exactly the same file and the existing corpora stay reproducible;
+* otherwise the entry matches on **stem**, case-insensitively, anywhere in the
+  title's subtree, with any audio extension (``.ogg``/``.wav``/``.mp3``/
+  ``.flac``/``.m4a``) stripped off ``Voice`` first;
+* a file under the entry's own ``<Speaker>/`` directory is preferred over one
+  elsewhere; when a stem still names several files the choice is the first by
+  sorted path, and the entry is counted in ``audio_stem_collisions``.
+
+The manifest's speaker label always comes from the index's ``Speaker``, never
+from the directory the file was found in.  Cause 2 is precisely a directory name
+that disagrees with the index, and speaker identity drives the speaker-disjoint
+split, so taking it from the filesystem would quietly re-partition train/val.
+
+``filter_stats`` reports *how* each entry resolved -- ``resolved_audio_exact_path``,
+``resolved_audio_extension_stripped``, ``resolved_audio_stem_match_elsewhere``
+and the surviving ``dropped_missing_audio`` -- because collapsing all four into
+one number is what let the original loss go unnoticed.
 
 Text normalisation (``normalize_text``), in order:
 
@@ -57,12 +115,21 @@ Text normalisation (``normalize_text``), in order:
 2. delete every backslash -- a backslash never occurs in legitimate Japanese
    transcript text, it is always a VN engine escape artifact (e.g. the observed
    ``に\\"ぇっ！？``);
-3. repeatedly strip a quote/bracket pair that wraps the *whole* line
+3. delete a lone ``n`` that has a kana or kanji on **both** sides -- an escaped
+   line break (``\\n``) whose backslash was lost upstream, wedged inside a word:
+   ``一n杯`` -> ``一杯``, ``調n教`` -> ``調教``, ``にーちゃんのn我慢`` ->
+   ``にーちゃんの我慢``.  89 occurrences in a 4,000-clip sample (~12,000 clips of
+   the full manifest), invisible in the transcript alone and found only by
+   ranking clips against an in-domain teacher ASR model.  The rule is narrow on
+   purpose: an ``n`` beside any Latin letter or digit is left alone, so a
+   romanised name or an embedded English word (``今日はfineな気分``) and a
+   doubled ``nn`` both survive untouched;
+4. repeatedly strip a quote/bracket pair that wraps the *whole* line
    (``「」『』（）“”…``), only when the closing character's first occurrence is
    the final character, so ``「A」と「B」`` is left intact;
-4. delete residual ASCII double quotes, which are the leftovers of step 2's
+5. delete residual ASCII double quotes, which are the leftovers of step 2's
    escape sequences;
-5. collapse every run of whitespace to a single space and strip the ends.
+6. collapse every run of whitespace to a single space and strip the ends.
 
 Long-vowel marks, kana, kanji and sentence-final punctuation are preserved --
 they are pronounced content and the transcript must match the audio.
@@ -94,11 +161,85 @@ number is what checkpoints are chosen by.  Surplus clips of a val speaker are
 dropped rather than returned to train, so voice identity never straddles the
 split; ``totals.val_surplus_clips_dropped`` reports the cost.
 
+Pinning val across corpus rebuilds (``--pin-val-keys``)
+-------------------------------------------------------
+The split above is computed over *whatever corpus it is given*, so growing the
+corpus produces a different val set -- and two runs measured on different val
+sets cannot be compared.  This has already cost two comparisons: the MPS
+baseline's numbers were never strictly comparable to the cluster run's, and a
+plan to re-score an older val had to be abandoned once it was measured that 547
+of its 772 clips (70.9%) had landed in the newer *training* set, so scoring
+there would have been scoring on training data.
+
+``--pin-val-keys FILE`` takes a file of manifest ``key`` values, one per line
+(``#`` comments and blank lines ignored), and makes val **exactly** those clips:
+
+* every listed key present in the corpus goes to val, and never to train;
+* **speaker-disjointness still holds**: every pinned clip's speaker is excluded
+  from train entirely, exactly as the ordinary split does, so the non-pinned
+  clips of a pinned speaker are dropped from both sides rather than trained on;
+* ``--val-frac`` and ``--val-max-clips-per-speaker`` are *not* applied.  Val is
+  the pinned set and nothing else -- adding held-out speakers to reach the
+  fraction would make round 2's val a superset of round 1's, which is precisely
+  the incomparability the flag exists to remove.  There is deliberately no
+  "pinned plus top-up" mode;
+* keys listed but absent from the corpus are reported (log and
+  ``manifest.json``), never silently ignored: a typo'd or stale pin file that
+  quietly pins nothing would yield a val set that looks fine and is not the one
+  intended.  A pin file that matches *nothing* is a hard error, and so is one
+  whose speakers would empty train.
+
+Rebuilding the split without the audio sources (``--manifest-only``)
+--------------------------------------------------------------------
+A corpus larger than the free disk cannot be built in one pass: at ~1,000 h the
+three intermediate forms are ~40 GB of ``.7z`` + ~43 GB of extracted ``.ogg`` +
+~115 GB of converted wav, which do not coexist under 118 GB free.  So the
+corpus is built in batches and, after each batch, the ``.7z`` and the extracted
+``.ogg`` are deleted, keeping **only** ``raw/<stem>/index.json`` -- a few MB,
+and the one thing the manifest builder still needs from the raw tree.
+
+Conversion already tolerates that: :func:`convert_one` returns an existing wav
+from its header without opening the source.  A whole-corpus *final* pass does
+not, because :func:`classify_extraction` compares the archive's entry count
+against the files on disk, and a directory pruned down to one ``index.json``
+looks truncated -- so it would re-extract everything, from archives that are
+gone by then.
+
+``--manifest-only`` is that final pass.  It skips download, extraction and
+conversion outright and rebuilds ``train.jsonl`` / ``val.jsonl`` /
+``manifest.json`` from what survived pruning: the ``index.json`` files under
+``raw/`` and the converted wavs under ``audio/``.  Consequences worth knowing:
+
+* it needs **no archive, no archive password and no HF token** -- none of the
+  work that requires a credential is performed;
+* it composes with every selection and split option (``--limit-hours``,
+  ``--val-frac``, ``--seed``, ``--pin-val-keys``, ...), which is the point: the
+  final split for the whole corpus is produced in one pass, from batches that
+  were converted separately;
+* an ``index.json`` entry whose wav is absent is counted as
+  ``dropped_missing_audio``, exactly as a missing ``.ogg`` would be.  Clips the
+  full run dropped for duration land in that counter too (they never produced a
+  wav, and their ``.ogg`` is gone, so the two are indistinguishable now) -- the
+  totals move between reasons, the kept set does not;
+* it verifies nothing about the audio beyond the wav header, so it cannot
+  detect a batch that was pruned *before* it finished converting.  Run it
+  against the archive list you actually converted.
+
 Usage
 -----
     python scripts/prepare_vn_data.py                     # full ~54 h corpus
     python scripts/prepare_vn_data.py --limit-hours 0.5   # quick trial slice
     python scripts/prepare_vn_data.py --list-archives     # inventory, then exit
+
+    # after building in batches and pruning archives + oggs, one final split:
+    python scripts/prepare_vn_data.py --manifest-only --archives $(cat all.txt)
+
+    # drop the titles transcribed in kana where the audio has kanji:
+    python scripts/prepare_vn_data.py --drop-kana-only-titles
+
+    # round 2 on a bigger corpus, scored on exactly round 1's val:
+    cut -d'"' -f4 data/vn/val.jsonl > round1_val_keys.txt   # the "key" field
+    python scripts/prepare_vn_data.py --pin-val-keys round1_val_keys.txt
 
 ``--list-archives`` is a pure query: it lists every ``.7z`` in the dataset repo
 with its size and a running cumulative total, then exits without downloading,
@@ -148,6 +289,12 @@ ARCHIVE_PASSWORD_FILE = Path.home() / ".cache" / "sensevoice" / "vn_archive_pass
 # into *directories*, so nothing walks this file into a manifest.
 EXTRACT_MARKER_NAME = ".extract_complete"
 
+# Extensions treated as audio when indexing an extracted title and when
+# stripping a redundant extension off an index entry's ``Voice``.  ``.ogg`` is
+# what the dataset ships; the rest are cheap insurance against a repacked
+# archive, and are compared case-folded.
+AUDIO_SUFFIXES: tuple[str, ...] = (".ogg", ".wav", ".mp3", ".flac", ".m4a")
+
 DEFAULT_ARCHIVES: tuple[str, ...] = (
     "GalGame/Studio e.go!_Meguru Sekai de Towanaru Chikai o!.7z",
     "GalGame/GIGA_Ai Kiss 2.7z",
@@ -182,6 +329,39 @@ VAL_MAX_CLIPS_PER_SPEAKER = 40
 # training set.
 VAL_MAX_SPEAKER_CLIPS_MULTIPLE = 10
 VAL_MAX_SURPLUS_FRACTION = 0.03
+
+# How many pinned keys that are missing from the corpus get printed one by one
+# before the log collapses to a count.  20 is enough to recognise a systematic
+# mistake at a glance -- a renamed title, a stale key prefix, the wrong file --
+# while a legitimately different corpus, where hundreds of round-1 clips are
+# simply absent, cannot flood the run's log.  The full list always reaches
+# manifest.json, so nothing is lost by truncating here.
+PIN_MISSING_KEYS_LOGGED = 20
+
+# Same idea for --manifest-only's "these archives have no index.json" error: at
+# ~58 archives, naming ten is enough to see which batch went missing, and the
+# count carries the rest.
+MANIFEST_ONLY_MISSING_LOGGED = 10
+
+# Kana-only title filter (--drop-kana-only-titles).  A few titles transcribe
+# dialogue in hiragana where the audio plainly contains kanji -- same clip,
+# ground truth "いちおうはでんとうとかくしきのあるめいもんがくえんで…" against a
+# teacher ASR's "一応は伝統と格式のある名門学園で…".  Neither transcript is
+# *wrong*, but training on the kana spelling teaches the model to emit kana
+# where kanji is expected, and that shows up as CER on every other title.
+#
+# Measured by scoring 4,000 clips against an in-domain teacher ASR model: of the
+# 2,872 transcripts longer than KANA_ONLY_MIN_CHARS characters, 285 (9.9%)
+# contain no kanji at all, and their median normalised CER against the teacher
+# is 0.417 versus 0.103 for the rest -- a separate population, not a tail.
+# JADE_Love_Destination is 100% kanji-free among its substantial transcripts.
+#
+# The unit of the decision is the *title*, never the clip.  A short kana-only
+# line ("うん", "そうなんだ") is ordinary Japanese, so a per-clip rule would bias
+# the corpus against backchannels and interjections; a title whose substantial
+# lines are essentially all kana is a transcription convention.
+KANA_ONLY_MIN_CHARS = 10
+KANA_ONLY_TITLE_THRESHOLD = 0.8
 
 # One fbank frame is 10 ms.  ``source_len`` therefore counts 100 frames per
 # second -- see ``compute_source_len`` for why no LFR division is applied.
@@ -252,6 +432,35 @@ _DOT_RUN_RE = re.compile(r"\.{2,}")
 # into "…" or rewriting it to "。" would corrupt real text.  Only *runs* of
 # dots are treated as folded ellipses.
 
+# Kana and kanji -- "a Japanese character" for the two rules below.  Half-width
+# katakana is absent on purpose: NFKC has already folded it by the time either
+# rule runs.
+_JAPANESE_CLASS = (
+    r"぀-ゟ"  # hiragana
+    r"゠-ヿ"  # katakana (includes the "ー" long-vowel mark)
+    r"㐀-䶿一-鿿"  # kanji
+)
+
+# Kanji only -- what the kana-only title filter looks for.  Same two blocks
+# _CONTENT_RE uses, so "contains a kanji" means the same thing everywhere here.
+_KANJI_RE = re.compile(r"[㐀-䶿一-鿿]")
+
+# An escaped line break in the game script ("\n") that lost its backslash
+# upstream leaves a bare "n" wedged inside a word: "一n杯" for "一杯", "調n教"
+# for "調教", "にーちゃんのn我慢" for "にーちゃんの我慢".  Measured at 89
+# occurrences in a 4,000-clip sample (heavily concentrated in one title,
+# Mirage_Soft_Kimi_to_Tsunagaru_Koi_Flag), i.e. ~12,000 clips of the 549,404-clip
+# manifest.  The transcript is otherwise correct, so this is repaired, not
+# dropped.
+#
+# The rule is deliberately narrow, because "n" is also a legitimate character:
+# it fires only on a *single* "n" with a kana or kanji on BOTH sides.  A Latin
+# run inside Japanese text ("今日はfineな気分") keeps its "n" -- the neighbours
+# are Latin -- and so does a doubled "nn" ("あnnまり"), since each "n" has the
+# other beside it.  Digits and Latin letters are simply not in _JAPANESE_CLASS,
+# so "no adjacent Latin letter or digit" needs no separate guard.
+_STRAY_ESCAPE_N_RE = re.compile(rf"(?<=[{_JAPANESE_CLASS}])n(?=[{_JAPANESE_CLASS}])")
+
 
 # --------------------------------------------------------------------------
 # Pure helpers (unit-tested: normalize_text / build_record / split_by_speaker /
@@ -277,6 +486,12 @@ def normalize_text(text: str) -> str:
 
     # Backslashes only ever arrive here as engine escape artifacts.
     normalized = normalized.replace("\\", "")
+
+    # ... which is also where the stray "n" comes from: an escaped line break
+    # whose backslash was lost upstream (or removed on the line above) leaves
+    # the "n" inside a word.  Repaired here, right after the backslash it lost,
+    # and only between two Japanese characters -- see _STRAY_ESCAPE_N_RE.
+    normalized = _STRAY_ESCAPE_N_RE.sub("", normalized)
 
     # Strip pairs that wrap the entire line, innermost-last, repeatedly.
     changed = True
@@ -314,6 +529,32 @@ def normalize_text(text: str) -> str:
     if not _CONTENT_RE.search(normalized):
         return ""
     return normalized
+
+
+def has_kanji(text: str) -> bool:
+    """True when ``text`` contains at least one kanji."""
+    return bool(_KANJI_RE.search(text))
+
+
+def kana_only_fraction(
+    texts: Iterable[str], *, min_chars: int = KANA_ONLY_MIN_CHARS
+) -> float | None:
+    """Fraction of *substantial* transcripts in ``texts`` that hold no kanji.
+
+    "Substantial" is longer than ``min_chars`` characters.  Short lines are
+    excluded because a kana-only "うん" says nothing about a title's
+    transcription convention -- an ordinary title is full of them -- while a
+    30-character line without a single kanji is a convention, not a sentence.
+
+    Returns ``None`` when the title has no substantial transcript at all: the
+    fraction is undefined there, and a title too small to measure must not be
+    dropped on a measurement that was never taken.
+    """
+    substantial = [text for text in texts if len(text) > min_chars]
+    if not substantial:
+        return None
+    kana_only = sum(1 for text in substantial if not has_kanji(text))
+    return kana_only / len(substantial)
 
 
 def compute_source_len(duration_sec: float, *, lfr_n: int = 1) -> int:
@@ -531,6 +772,11 @@ def split_by_speaker(
 
     ``max_clips_per_speaker`` is keyword-only so the documented three-argument
     signature stays stable.
+
+    This function always computes a *fresh* split over whatever corpus it is
+    given, so a larger corpus yields a different val set.  When val must stay
+    identical across rebuilds -- to compare two runs' metrics -- the caller uses
+    :func:`split_by_pinned_keys` instead (``--pin-val-keys``).
     """
     if not records:
         return [], []
@@ -699,6 +945,158 @@ def split_by_speaker(
     return train, val
 
 
+@dataclass
+class PinnedValReport:
+    """What ``--pin-val-keys`` actually did, for the log and the manifest."""
+
+    requested: int = 0
+    found: int = 0
+    missing: list[str] = field(default_factory=list)
+    speakers: int = 0
+    train_clips_dropped: int = 0
+    keys_file: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "keys_file": self.keys_file,
+            "keys_requested": self.requested,
+            "keys_found": self.found,
+            "keys_missing": len(self.missing),
+            # The whole list, not a sample: this is the record that says which
+            # round-1 clips the round-2 corpus could not reproduce, and a
+            # truncated one cannot be diffed against the next rebuild.
+            "missing_keys": list(self.missing),
+            "pinned_speakers": self.speakers,
+            "train_clips_dropped_same_speaker": self.train_clips_dropped,
+            "policy": (
+                "val is EXACTLY the keys listed in keys_file that exist in this "
+                "corpus -- val_fraction and val_max_clips_per_speaker are not "
+                "applied, so this val set is identical to the one the pin file "
+                "came from and the two runs' metrics are comparable.  Every "
+                "pinned clip's speaker is excluded from train entirely, so "
+                "speaker-disjointness holds exactly as in the ordinary split; "
+                "their non-pinned clips are dropped from both sides and counted "
+                "in train_clips_dropped_same_speaker."
+            ),
+        }
+
+
+def split_by_pinned_keys(
+    records: Sequence[dict[str, Any]],
+    pin_keys: Iterable[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], PinnedValReport]:
+    """Split ``records`` with val pinned to ``pin_keys``.  See the module docstring.
+
+    Returns ``(train, val, report)``.  Val is *exactly* the pinned clips that
+    exist in ``records`` -- never a superset -- because a val set that grows with
+    the corpus is the thing this function exists to prevent.
+
+    Speaker-disjointness is preserved the same way :func:`split_by_speaker`
+    preserves it: the pinned clips' speakers (bare names, via
+    :func:`speaker_group_key`) are excluded from train wholesale, so a pinned
+    speaker's non-pinned clips are dropped from both sides rather than trained
+    on.  ``train + val`` is therefore smaller than ``records``; the report says
+    by how much.
+
+    Raises ``SystemExit`` -- not ``ValueError`` -- for the two unrecoverable
+    cases, because both are user-input mistakes surfaced at the very end of a
+    multi-hour run, where a clean message beats a traceback:
+
+    * no pinned key matches any record (a typo'd, stale or wrong-corpus pin
+      file).  Falling back to an ordinary split here would write a val set that
+      looks perfectly healthy and is not the pinned one;
+    * every speaker is pinned, so train would be empty.
+    """
+    wanted: list[str] = []
+    seen: set[str] = set()
+    for key in pin_keys:
+        text = str(key).strip()
+        if text and text not in seen:
+            seen.add(text)
+            wanted.append(text)
+    if not wanted:
+        raise SystemExit("--pin-val-keys: no keys to pin")
+
+    by_key: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        by_key.setdefault(str(record.get("key", "")), []).append(record)
+
+    val: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for key in wanted:
+        matched = by_key.get(key)
+        if matched:
+            val.extend(matched)
+        else:
+            missing.append(key)
+
+    found = len(wanted) - len(missing)
+    if not val:
+        raise SystemExit(
+            f"--pin-val-keys: none of the {len(wanted)} pinned keys exist in "
+            f"this corpus ({len(records)} clips).  The pin file is stale, "
+            "truncated or from a different corpus; refusing to fall back to an "
+            "unpinned split, which would silently produce a val set that is not "
+            "the pinned one."
+        )
+
+    pinned_speakers = {speaker_group_key(record) for record in val}
+    train = [r for r in records if speaker_group_key(r) not in pinned_speakers]
+    if not train:
+        raise SystemExit(
+            f"--pin-val-keys: the {found} pinned clips cover every speaker in "
+            f"this corpus ({len(pinned_speakers)} speakers), so holding them out "
+            "would leave train empty.  Pin a subset, or build a larger corpus."
+        )
+
+    val.sort(key=lambda record: str(record.get("key", "")))
+    return (
+        train,
+        val,
+        PinnedValReport(
+            requested=len(wanted),
+            found=found,
+            missing=missing,
+            speakers=len(pinned_speakers),
+            train_clips_dropped=len(records) - len(train) - len(val),
+        ),
+    )
+
+
+def read_pin_val_keys(path: Path) -> list[str]:
+    """Read a ``--pin-val-keys`` file: one manifest ``key`` per line.
+
+    Blank lines and ``#`` comments are ignored (no production key can start with
+    ``#`` -- keys are built from :func:`slugify` output), and duplicates are
+    collapsed with the first occurrence's position kept, so the requested count
+    in the report counts distinct clips rather than lines.
+
+    Read eagerly, before anything is downloaded: a missing or empty pin file
+    must cost nothing, not surface after the corpus has been rebuilt.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise SystemExit(f"--pin-val-keys: cannot read {path}: {error}") from None
+
+    keys: list[str] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        key = line.strip()
+        if not key or key.startswith("#"):
+            continue
+        if key not in seen:
+            seen.add(key)
+            keys.append(key)
+
+    if not keys:
+        raise SystemExit(
+            f"--pin-val-keys: {path} holds no keys (only blank lines or "
+            "comments).  One manifest 'key' value per line is expected"
+        )
+    return keys
+
+
 def slugify(name: str, fallback: str = "unknown") -> str:
     """Filesystem-safe token that keeps Japanese characters readable."""
     slug = _SLUG_RE.sub("_", unicodedata.normalize("NFKC", name)).strip("_")
@@ -722,6 +1120,15 @@ class ConvertTask:
 
 @dataclass
 class FilterStats:
+    """Per-reason tallies for the filter summary.
+
+    The four ``resolved_audio_*`` counters (with ``missing_audio`` as the
+    unresolved case) say *how* each index entry was matched to a file on disk.
+    They exist because their absence hid a 54,420-clip loss: every entry whose
+    audio was not at ``<Speaker>/<Voice>.ogg`` collapsed into ``missing_audio``,
+    which reads as an upstream dataset gap.  See the module docstring.
+    """
+
     index_entries: int = 0
     empty_text: int = 0
     missing_audio: int = 0
@@ -732,12 +1139,28 @@ class FilterStats:
     ambiguous_duplicate: int = 0
     duplicate_entry: int = 0
     kept: int = 0
+    # Audio resolution outcomes (see TitleAudioIndex.resolve).
+    resolved_exact: int = 0
+    resolved_extension_stripped: int = 0
+    resolved_stem_elsewhere: int = 0
+    stem_collisions: int = 0
+    # Kana-only titles (--drop-kana-only-titles).  ``kana_only_filter_applied``
+    # is what puts the two counters in the summary at all: without the flag the
+    # filter never ran, and reporting a zero would claim a measurement that was
+    # not taken -- besides changing an existing corpus's manifest.
+    kana_only_filter_applied: bool = False
+    kana_only_titles: list[str] = field(default_factory=list)
+    kana_only_title_clips: int = 0
 
-    def as_dict(self) -> dict[str, int]:
-        return {
+    def as_dict(self) -> dict[str, Any]:
+        summary: dict[str, Any] = {
             "index_entries": self.index_entries,
             "dropped_empty_or_punctuation_only_text": self.empty_text,
             "dropped_missing_audio": self.missing_audio,
+            "resolved_audio_exact_path": self.resolved_exact,
+            "resolved_audio_extension_stripped": self.resolved_extension_stripped,
+            "resolved_audio_stem_match_elsewhere": self.resolved_stem_elsewhere,
+            "audio_stem_collisions": self.stem_collisions,
             "dropped_too_short": self.too_short,
             "dropped_too_long": self.too_long,
             "dropped_decode_error": self.decode_error,
@@ -746,6 +1169,13 @@ class FilterStats:
             "skipped_over_limit_hours": self.over_limit_hours,
             "kept": self.kept,
         }
+        if self.kana_only_filter_applied:
+            # Named titles, not just a count: a title excluded here is otherwise
+            # indistinguishable in the manifest from one that was never passed
+            # to --archives at all.
+            summary["dropped_kana_only_title_clips"] = self.kana_only_title_clips
+            summary["excluded_kana_only_titles"] = list(self.kana_only_titles)
+        return summary
 
 
 @dataclass
@@ -801,6 +1231,36 @@ def fmt_bytes(num_bytes: float) -> str:
             return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
         size /= 1024.0
     return f"{size:.1f}TiB"
+
+
+def log_pinned_val_report(report: PinnedValReport) -> None:
+    """Print what ``--pin-val-keys`` did, in the style of the train/val lines.
+
+    Missing keys are *always* surfaced (individually up to
+    ``PIN_MISSING_KEYS_LOGGED``, then as a count), because a pin file that
+    silently matches less than it should produces a val set that looks healthy
+    and is not the one round 1 was measured on.
+    """
+    log(
+        f"pin     : {report.keys_file}: {report.requested} keys requested, "
+        f"{report.found} found in corpus, {len(report.missing)} missing"
+    )
+    for key in report.missing[:PIN_MISSING_KEYS_LOGGED]:
+        log(f"pin     :   missing from corpus: {key}")
+    if len(report.missing) > PIN_MISSING_KEYS_LOGGED:
+        log(
+            f"pin     :   ... and {len(report.missing) - PIN_MISSING_KEYS_LOGGED} "
+            "more missing key(s); the full list is in manifest.json (val_pin)"
+        )
+    log(
+        "pin     : val is EXACTLY the pinned set; --val-frac and "
+        "--val-max-clips-per-speaker are not applied"
+    )
+    log(
+        f"pin     : {report.speakers} pinned speaker(s) held out of train, "
+        f"dropping {report.train_clips_dropped} further clip(s) that share a "
+        "speaker with a pinned clip"
+    )
 
 
 def eta(done: int, total: int, started: float) -> str:
@@ -1384,19 +1844,193 @@ def find_index_json(root: Path) -> Path | None:
     return None
 
 
+def locate_pruned_indexes(
+    archives: Sequence[str], raw_dir: Path
+) -> list[tuple[str, Path]]:
+    """``--manifest-only`` counterpart of download + extract.
+
+    Reads the same ``raw/<archive stem>/`` layout :func:`extract_archive` writes,
+    but looks for nothing except ``index.json`` -- deliberately skipping
+    :func:`classify_extraction`, which counts files on disk against the archive's
+    entry count and would call a pruned directory truncated, using an archive
+    that pruning has already deleted.
+
+    A missing ``index.json`` is fatal rather than skipped.  Silently omitting an
+    archive would emit a quietly smaller corpus that looks entirely healthy --
+    the same failure the extraction markers exist to prevent -- and at this point
+    the audio it names may already be the only surviving copy.
+    """
+    found: list[tuple[str, Path]] = []
+    missing: list[str] = []
+    for remote in archives:
+        stem = Path(remote).stem
+        index = find_index_json(raw_dir / stem)
+        if index is None:
+            missing.append(stem)
+        else:
+            found.append((stem, index))
+
+    if missing:
+        listed = ", ".join(missing[:MANIFEST_ONLY_MISSING_LOGGED])
+        if len(missing) > MANIFEST_ONLY_MISSING_LOGGED:
+            listed += f", ... (+{len(missing) - MANIFEST_ONLY_MISSING_LOGGED} more)"
+        raise SystemExit(
+            f"--manifest-only: no index.json under {raw_dir} for "
+            f"{len(missing)} of {len(archives)} archive(s): {listed}.  This mode "
+            "rebuilds from an already-extracted tree, so raw/<archive>/index.json "
+            "must survive pruning; restore it, or name only the archives you "
+            "actually built with --archives."
+        )
+    return found
+
+
+def require_converted_audio(audio_dir: Path) -> None:
+    """Fail before planning when ``--manifest-only`` has no audio to rebuild from.
+
+    Checked up front, and by first wav rather than by count, so pointing the mode
+    at the wrong ``--out-dir`` costs one directory walk instead of an empty
+    manifest that overwrites a good one.
+    """
+    if not audio_dir.is_dir() or next(audio_dir.rglob("*.wav"), None) is None:
+        raise SystemExit(
+            f"--manifest-only: no converted wav found under {audio_dir}.  This "
+            "mode rebuilds the manifest from audio an earlier run converted; "
+            "nothing has been converted here yet, so run without "
+            "--manifest-only first (or point --out-dir at the corpus that was)."
+        )
+
+
 # --------------------------------------------------------------------------
 # Planning
 # --------------------------------------------------------------------------
+def strip_audio_suffix(name: str) -> str:
+    """Drop one trailing audio extension from ``name``, if it carries one.
+
+    Only the extensions in :data:`AUDIO_SUFFIXES` are removed, and only one, so
+    a ``Voice`` such as ``Mr.N`` or ``2.5`` -- neither of which is an extension
+    -- survives intact.  ``Path.stem`` cannot be used for this: it strips
+    whatever follows the last dot, which would rename those two.
+    """
+    head, dot, tail = name.rpartition(".")
+    if dot and f".{tail}".casefold() in AUDIO_SUFFIXES:
+        return head
+    return name
+
+
+@dataclass(frozen=True)
+class AudioMatch:
+    """One index entry resolved (or not) to a file on disk.
+
+    ``how`` is the resolution route, and is what the ``resolved_audio_*``
+    counters tally: ``exact`` (the literal ``<Speaker>/<Voice>.ogg``),
+    ``extension`` (a file in the entry's own speaker directory whose name
+    differs only in extension or case), ``stem`` (a stem match elsewhere in the
+    title), or ``missing``.
+    """
+
+    path: Path | None
+    how: str
+    collided: bool = False
+
+
+class TitleAudioIndex:
+    """Stem index of the audio actually present under one extracted title.
+
+    Built lazily and exactly once (``os.walk``, linear in the file count), so a
+    title whose entries all resolve at their literal path never walks its ~25,000
+    files, and one that needs the fallback walks them once rather than per entry.
+
+    Lookups are by **case-folded stem** across the whole subtree, which is what
+    recovers the clips ``<Speaker>/<Voice>.ogg`` cannot address; see the module
+    docstring for the three real causes this exists to handle.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._by_stem: dict[str, list[Path]] | None = None
+
+    @property
+    def by_stem(self) -> dict[str, list[Path]]:
+        if self._by_stem is None:
+            self._by_stem = self._build()
+        return self._by_stem
+
+    def _build(self) -> dict[str, list[Path]]:
+        by_stem: dict[str, list[Path]] = {}
+        for dir_path, _dir_names, file_names in os.walk(self.root):
+            directory = Path(dir_path)
+            for name in file_names:
+                stem = strip_audio_suffix(name)
+                if stem == name:  # not an audio file
+                    continue
+                by_stem.setdefault(stem.casefold(), []).append(directory / name)
+        # os.walk's order is filesystem order, so a stem naming several files is
+        # sorted to make the pick deterministic across machines and runs.
+        for paths in by_stem.values():
+            if len(paths) > 1:
+                paths.sort(key=str)
+        return by_stem
+
+    def _in_speaker_dir(self, path: Path, speaker: str) -> bool:
+        if not speaker:
+            return False
+        try:
+            parent = path.parent.relative_to(self.root)
+        except ValueError:  # pragma: no cover - candidates come from the walk
+            return False
+        return parent.as_posix().casefold() == speaker.casefold()
+
+    def resolve(self, speaker: str, voice: str, relative: str) -> AudioMatch:
+        """Find the audio for one index entry.  See the module docstring.
+
+        ``relative`` is the literal legacy path (``<Speaker>/<Voice>.ogg``) and
+        is tried first: whenever it exists the entry resolves to exactly the file
+        it always resolved to, which is what keeps an already-working title
+        byte-identical.  ``voice`` is the entry's stem, extension already
+        stripped.
+
+        Note that on a case-insensitive filesystem (macOS) the first check also
+        absorbs case differences, so a clip that the cluster's ext4 would count
+        as ``extension``/``stem`` counts as ``exact`` here.  Only the counter
+        differs -- the file chosen is the same one either way.
+        """
+        exact = self.root / relative
+        if exact.is_file():
+            return AudioMatch(exact, "exact")
+        if not voice:
+            return AudioMatch(None, "missing")
+
+        candidates = self.by_stem.get(voice.casefold(), [])
+        if not candidates:
+            return AudioMatch(None, "missing")
+
+        collided = len(candidates) > 1
+        # The entry's own speaker directory wins, so a stem that occurs in
+        # several directories still resolves to the one the index pointed at.
+        for candidate in candidates:
+            if self._in_speaker_dir(candidate, speaker):
+                return AudioMatch(candidate, "extension", collided)
+        return AudioMatch(candidates[0], "stem", collided)
+
+
 def resolve_entry_paths(entry: dict[str, Any]) -> tuple[str, str, str]:
     """Return ``(speaker, voice, relative_ogg_path)`` for one index.json entry.
 
     The archives do not share one schema, so both observed shapes are handled:
 
-    * ``{"Speaker", "Voice", "Text"}`` -- ``Voice`` carries no extension and the
-      audio is at ``<Speaker>/<Voice>.ogg`` (GIGA, Studio e.go!);
+    * ``{"Speaker", "Voice", "Text"}`` -- the audio is *usually* at
+      ``<Speaker>/<Voice>.ogg`` (GIGA, Studio e.go!);
     * ``{"Speaker", "FilePath", "Text"}`` -- ``FilePath`` is a Windows-style
       relative path including the extension, e.g. ``琴子\\ep2_kot0002.ogg``
       (Purple software / Criminal Border).
+
+    The returned ``voice`` is the entry's *stem*: any audio extension already
+    present in ``Voice`` is stripped, both because it must not be doubled when
+    matching (CIRCUS D.C. III P.P. stores ``Voice`` with ``.ogg`` on it) and
+    because ``voice`` names the converted wav, which must not be called
+    ``x.ogg.wav``.  The returned relative path is deliberately left as the
+    *literal* legacy construction, so :meth:`TitleAudioIndex.resolve` can tell a
+    clip that already resolved from one this fix recovered.
 
     The relative path is empty when the entry names no audio at all, which the
     caller counts as a missing-audio drop.
@@ -1406,7 +2040,7 @@ def resolve_entry_paths(entry: dict[str, Any]) -> tuple[str, str, str]:
     voice = str(entry.get("Voice", "") or "").strip()
     if voice:
         relative = f"{speaker}/{voice}.ogg" if speaker else f"{voice}.ogg"
-        return speaker, voice, relative
+        return speaker, strip_audio_suffix(voice), relative
 
     file_path = str(entry.get("FilePath", "") or "").strip().replace("\\", "/")
     if file_path:
@@ -1424,8 +2058,33 @@ def plan_archive(
     audio_root: Path,
     stats: FilterStats,
     archive_stats: ArchiveStats,
+    *,
+    manifest_only: bool = False,
+    drop_kana_only_titles: bool = False,
+    kana_only_threshold: float = KANA_ONLY_TITLE_THRESHOLD,
 ) -> list[ConvertTask]:
-    """Turn one ``index.json`` into conversion tasks, applying text filters."""
+    """Turn one ``index.json`` into conversion tasks, applying text filters.
+
+    Each entry is matched against the audio actually on disk by
+    :class:`TitleAudioIndex` -- ``<Speaker>/<Voice>.ogg`` first, then a
+    case-insensitive stem match across the title -- and how it matched is
+    tallied in ``stats``.  See the module docstring for why.
+
+    ``manifest_only`` drops the source-file existence check entirely.  On a
+    pruned corpus the ``.ogg`` files are gone by construction, so testing for
+    them would discard the entire index (and indexing them would find nothing);
+    the audio a clip actually needs -- its converted wav -- is checked later, by
+    :func:`probe_converted`, and its absence lands in the same
+    ``dropped_missing_audio`` counter.  Every other filter, and the key and
+    destination assignment, are untouched, so the tasks this returns for a
+    surviving clip are identical to the ones the full run built.
+
+    ``drop_kana_only_titles`` adds the one filter in this script that judges a
+    *title* rather than a clip: when more than ``kana_only_threshold`` of the
+    title's substantial transcripts contain no kanji, every task is discarded.
+    It is off by default, so a corpus built without it is bit-for-bit what it
+    was.  See ``KANA_ONLY_TITLE_THRESHOLD``.
+    """
     entries = json.loads(index_path.read_text(encoding="utf-8"))
     if not isinstance(entries, list):
         raise SystemExit(f"{index_path} is not a JSON list")
@@ -1434,9 +2093,13 @@ def plan_archive(
     archive_stats.index_entries = len(entries)
 
     source_root = index_path.parent
+    audio = TitleAudioIndex(source_root)
 
     # Pass 1 -- resolve entries and apply the per-entry filters.
     resolved: dict[Path, list[tuple[str, str, str]]] = {}
+    recovered = 0
+    collisions = 0
+    collision_example = ""
     for entry in entries:
         speaker, voice, relative = resolve_entry_paths(entry)
         text = normalize_text(str(entry.get("Text", "")))
@@ -1447,11 +2110,44 @@ def plan_archive(
             stats.missing_audio += 1
             continue
 
-        src = source_root / relative
-        if not src.is_file():
-            stats.missing_audio += 1
-            continue
+        if manifest_only:
+            src = source_root / relative
+        else:
+            match = audio.resolve(speaker, voice, relative)
+            if match.path is None:
+                stats.missing_audio += 1
+                continue
+            src = match.path
+            if match.how == "exact":
+                stats.resolved_exact += 1
+            elif match.how == "extension":
+                stats.resolved_extension_stripped += 1
+                recovered += 1
+            else:
+                stats.resolved_stem_elsewhere += 1
+                recovered += 1
+            if match.collided:
+                stats.stem_collisions += 1
+                collisions += 1
+                if not collision_example:
+                    collision_example = f"{voice} -> {src.name}"
         resolved.setdefault(src, []).append((speaker, voice, text))
+
+    # Recoveries and collisions are logged per title, not just summed into
+    # filter_stats: a title that needs the fallback for *every* entry is either
+    # a layout this script does not understand or a mis-extracted archive, and
+    # that is worth seeing while the run is still going.
+    if recovered:
+        log(
+            f"plan    : {title}: {recovered} clip(s) resolved to audio outside "
+            "<Speaker>/<Voice>.ogg (see filter_stats.resolved_audio_*)"
+        )
+    if collisions:
+        log(
+            f"plan    : {title}: {collisions} clip(s) matched a stem naming "
+            "several files; preferred the one under <Speaker>/, else the first "
+            f"by sorted path (e.g. {collision_example})"
+        )
 
     # Pass 2 -- one record per audio file.  Some indexes list the same
     # ``(Speaker, Voice)`` twice: harmless when the transcripts agree, but two
@@ -1495,6 +2191,23 @@ def plan_archive(
                 text=text,
             )
         )
+
+    # Pass 3 -- the title-level verdict, taken over the clips that survived
+    # every per-clip filter, i.e. exactly the lines that would be trained on.
+    if drop_kana_only_titles:
+        stats.kana_only_filter_applied = True
+        fraction = kana_only_fraction(task.text for task in tasks)
+        if fraction is not None and fraction > kana_only_threshold:
+            stats.kana_only_titles.append(title)
+            stats.kana_only_title_clips += len(tasks)
+            log(
+                f"plan    : {title}: dropping the whole title -- "
+                f"{fraction:.1%} of its transcripts over {KANA_ONLY_MIN_CHARS} "
+                f"characters contain no kanji (> {kana_only_threshold:.0%}), so "
+                "it is transcribed in kana where the audio has kanji "
+                f"({len(tasks)} clips)"
+            )
+            return []
     return tasks
 
 
@@ -1519,6 +2232,38 @@ def iter_pad(items: Sequence[ConvertTask], length: int) -> Iterator[ConvertTask 
 # --------------------------------------------------------------------------
 # Conversion (multiprocessing worker)
 # --------------------------------------------------------------------------
+def probe_converted(
+    dst: str, min_seconds: float, max_seconds: float
+) -> tuple[str, float, str, str]:
+    """Classify an already-converted wav from its header alone.
+
+    Returns the same ``(dst, duration, status, detail)`` shape as
+    :func:`convert_one`, of which this is the "already converted" branch --
+    shared so that the resume path and ``--manifest-only`` cannot drift apart on
+    what counts as too short, too long or unreadable.
+
+    Imports only :mod:`soundfile`: no decoding happens here, which is why
+    ``--manifest-only`` never needs librosa.  A wav that cannot be read at all
+    (a conversion interrupted mid-write, say) is an ``error``, not a silent
+    drop.
+    """
+    import soundfile as sf  # noqa: PLC0415 - worker-local, keeps parent import cheap
+
+    dst_path = Path(dst)
+    try:
+        if not dst_path.is_file():
+            return dst, 0.0, "missing", ""
+        info = sf.info(dst)
+        duration = info.frames / float(info.samplerate)
+        if duration < min_seconds:
+            return dst, duration, "too_short", ""
+        if duration > max_seconds:
+            return dst, duration, "too_long", ""
+        return dst, duration, "ok", ""
+    except Exception as error:  # noqa: BLE001 - one bad wav must not kill the run
+        return dst, 0.0, "error", f"{type(error).__name__}: {error}"
+
+
 def convert_one(task: tuple[str, str, float, float]) -> tuple[str, float, str, str]:
     """Decode one ogg to 16 kHz mono PCM16 wav.
 
@@ -1534,13 +2279,7 @@ def convert_one(task: tuple[str, str, float, float]) -> tuple[str, float, str, s
     dst_path = Path(dst)
     try:
         if dst_path.is_file():
-            info = sf.info(dst)
-            duration = info.frames / float(info.samplerate)
-            if duration < min_seconds:
-                return dst, duration, "too_short", ""
-            if duration > max_seconds:
-                return dst, duration, "too_long", ""
-            return dst, duration, "ok", ""
+            return probe_converted(dst, min_seconds, max_seconds)
 
         if not Path(src).is_file():
             return dst, 0.0, "missing", ""
@@ -1575,6 +2314,33 @@ def convert_one(task: tuple[str, str, float, float]) -> tuple[str, float, str, s
         return dst, 0.0, "error", f"{type(error).__name__}: {error}"
 
 
+def _clip_results(
+    payload: Sequence[tuple[str, str, float, float]],
+    workers: int,
+    manifest_only: bool,
+) -> Iterator[tuple[str, float, str, str]]:
+    """Yield one ``convert_one``-shaped result per task, in order.
+
+    Two sources, one shape, so :func:`convert_all` keeps a single accounting
+    loop.  ``manifest_only`` reads wav headers in this process and never starts
+    a pool: there is nothing to decode, and structurally *not* calling
+    :func:`convert_one` is what guarantees the mode cannot write a wav even if
+    some sources happen to still be on disk.
+
+    The generator is closed by the caller when ``--limit-hours`` cuts the run
+    short; that unwinds through the ``with`` and terminates the pool exactly as
+    the explicit ``pool.terminate()`` it replaces did.
+    """
+    if manifest_only:
+        for _src, dst, min_seconds, max_seconds in payload:
+            yield probe_converted(dst, min_seconds, max_seconds)
+        return
+
+    context = mp.get_context("spawn")
+    with context.Pool(processes=max(1, workers)) as pool:
+        yield from pool.imap(convert_one, payload, chunksize=8)
+
+
 def convert_all(
     tasks: Sequence[ConvertTask],
     stats: FilterStats,
@@ -1583,8 +2349,17 @@ def convert_all(
     max_seconds: float,
     limit_hours: float | None,
     workers: int,
+    *,
+    manifest_only: bool = False,
 ) -> list[dict[str, Any]]:
-    """Convert every task in order, stopping once ``limit_hours`` is reached."""
+    """Convert every task in order, stopping once ``limit_hours`` is reached.
+
+    With ``manifest_only`` nothing is converted: each task's wav is probed where
+    an earlier run left it, and a task with no wav is counted exactly as a task
+    with no source ogg would be.  The filtering, the ``--limit-hours`` cut and
+    the records produced are otherwise identical, which is what lets the two
+    modes emit the same manifest.
+    """
     if not tasks:
         return []
 
@@ -1600,16 +2375,19 @@ def convert_all(
 
     reported_errors: set[str] = set()
 
-    context = mp.get_context("spawn")
-    with context.Pool(processes=max(1, workers)) as pool:
-        results = pool.imap(convert_one, payload, chunksize=8)
+    # "convert" / "scan   ": same width, so the two modes' progress lines stay
+    # column-aligned with the rest of the log -- and can never be confused.
+    stage = "scan   " if manifest_only else "convert"
+    results = _clip_results(payload, workers, manifest_only)
+    try:
         for task, (dst, duration, status, detail) in zip(tasks, results):
             processed += 1
             if status == "error" and detail and detail not in reported_errors:
                 # Surface each distinct failure once: a systematic decode bug
                 # otherwise hides as a slowly rising "dropped" counter.
                 reported_errors.add(detail)
-                log(f"convert: error on {Path(task.src).name}: {detail}")
+                subject = Path(task.dst if manifest_only else task.src).name
+                log(f"{stage}: error on {subject}: {detail}")
             if status == "ok":
                 records.append(build_record(task.key, task.text, dst, duration))
                 stats.kept += 1
@@ -1629,7 +2407,7 @@ def convert_all(
 
             if processed % 500 == 0 or processed == len(tasks):
                 log(
-                    f"convert: {processed}/{len(tasks)} clips "
+                    f"{stage}: {processed}/{len(tasks)} clips "
                     f"({stats.kept} kept, {total_seconds / 3600:.2f} h, "
                     f"eta {eta(processed, len(tasks), started)})"
                 )
@@ -1637,12 +2415,16 @@ def convert_all(
             if limit_seconds is not None and total_seconds >= limit_seconds:
                 stats.over_limit_hours = len(tasks) - processed
                 log(
-                    f"convert: reached --limit-hours {limit_hours} "
+                    f"{stage}: reached --limit-hours {limit_hours} "
                     f"({total_seconds / 3600:.3f} h); skipping "
                     f"{stats.over_limit_hours} remaining clips"
                 )
-                pool.terminate()
                 break
+    finally:
+        # zip() stops pulling as soon as ``tasks`` runs out, so the generator is
+        # still suspended inside its ``with`` on the normal path too; closing it
+        # is what shuts the pool down, in both cases.
+        results.close()
     return records
 
 
@@ -1672,6 +2454,8 @@ def build_manifest(
     train: Sequence[dict[str, Any]],
     val: Sequence[dict[str, Any]],
     val_surplus_dropped: int = 0,
+    *,
+    pin_report: PinnedValReport | None = None,
 ) -> dict[str, Any]:
     all_records = list(train) + list(val)
     speaker_counts: dict[str, int] = {}
@@ -1695,7 +2479,7 @@ def build_manifest(
         title = record_title(record)
         train_by_title[title] = train_by_title.get(title, 0) + 1
 
-    return {
+    manifest: dict[str, Any] = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "dataset": HF_REPO,
         "config": {
@@ -1771,6 +2555,39 @@ def build_manifest(
         "cross_title_speaker_names": shared_names,
         "speaker_counts": dict(sorted(speaker_counts.items())),
     }
+    # Same conditional treatment as the two blocks below: a run without
+    # --drop-kana-only-titles produces the manifest it always did, and a run
+    # with it records the threshold its exclusions were taken at, since that
+    # number is the only thing that makes filter_stats' title list reproducible.
+    if getattr(args, "drop_kana_only_titles", False):
+        manifest["config"]["drop_kana_only_titles"] = True
+        manifest["config"]["kana_only_title_threshold"] = (
+            KANA_ONLY_TITLE_THRESHOLD
+            if getattr(args, "kana_only_title_threshold", None) is None
+            else args.kana_only_title_threshold
+        )
+        manifest["config"]["kana_only_min_chars"] = KANA_ONLY_MIN_CHARS
+    # Added only on the pinned path, so an unpinned run's manifest is byte-for-
+    # byte what it was before --pin-val-keys existed.
+    if pin_report is not None:
+        manifest["val_pin"] = pin_report.as_dict()
+    # Likewise conditional: a full build's manifest is unchanged.  Present, it
+    # says the clip list was rebuilt from wavs on disk rather than from audio
+    # this run decoded -- which is the one thing a reader cannot otherwise tell
+    # from the output files, and which explains the filter_stats shift below.
+    if getattr(args, "manifest_only", False):
+        manifest["manifest_only"] = {
+            "rebuilt_from": "raw/*/index.json + already-converted audio/**/*.wav",
+            "note": (
+                "--manifest-only: no download, extraction or conversion ran.  "
+                "Clips are exactly those whose wav was on disk; index entries "
+                "without one are counted as dropped_missing_audio, which "
+                "therefore also absorbs the clips a full build dropped for "
+                "duration (they never produced a wav).  The kept set, and so "
+                "train.jsonl/val.jsonl, are unaffected by that reclassification."
+            ),
+        }
+    return manifest
 
 
 # --------------------------------------------------------------------------
@@ -1864,6 +2681,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--pin-val-keys",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Pin the validation set to the manifest 'key' values listed in this "
+            "file, one per line (# comments ignored).  Val becomes EXACTLY the "
+            "listed clips that exist in the corpus, their speakers are kept out "
+            "of train, and --val-frac / --val-max-clips-per-speaker are not "
+            "applied -- so a rebuilt, larger corpus is still scored on the same "
+            "clips and the two runs' numbers are comparable.  Keys missing from "
+            "the corpus are reported; a file matching nothing is an error"
+        ),
+    )
+    parser.add_argument(
+        "--drop-kana-only-titles",
+        action="store_true",
+        help=(
+            "Drop every clip of a title whose transcripts are written in kana "
+            "where the audio has kanji.  A title is judged by the fraction of "
+            f"its transcripts longer than {KANA_ONLY_MIN_CHARS} characters that "
+            "contain no kanji at all; above "
+            f"--kana-only-title-threshold ({KANA_ONLY_TITLE_THRESHOLD}) the "
+            "whole title goes, and the excluded titles are reported in "
+            "filter_stats.  Opt-in, because it removes titles a previously "
+            "built corpus contains.  Individual kana-only clips are NEVER "
+            "dropped: short kana lines are ordinary Japanese"
+        ),
+    )
+    parser.add_argument(
+        "--kana-only-title-threshold",
+        type=float,
+        default=None,
+        metavar="FRACTION",
+        help=(
+            "Kanji-free fraction above which --drop-kana-only-titles drops a "
+            f"title, in (0, 1] (default: {KANA_ONLY_TITLE_THRESHOLD}).  "
+            "Requires --drop-kana-only-titles"
+        ),
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=max(1, (os.cpu_count() or 4) - 2),
@@ -1879,6 +2737,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--skip-download",
         action="store_true",
         help="Use archives already present in <out-dir>/archives",
+    )
+    parser.add_argument(
+        "--manifest-only",
+        action="store_true",
+        help=(
+            "Skip download, extraction and conversion entirely and rebuild "
+            "train.jsonl / val.jsonl / manifest.json from what is already on "
+            "disk: the index.json files under <out-dir>/raw and the converted "
+            "wavs under <out-dir>/audio.  Needs no archive, no archive password "
+            "and no HF token, so it works after the .7z files and the extracted "
+            ".ogg files have been deleted to free disk -- which is how a corpus "
+            "too big to hold in one piece is built in batches and then split in "
+            "one final pass.  An index entry whose wav is gone counts as "
+            "dropped_missing_audio; all selection and split options still apply"
+        ),
     )
     return parser.parse_args(argv)
 
@@ -1903,10 +2776,25 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--max-seconds must be greater than --min-seconds")
     if args.limit_hours is not None and args.limit_hours <= 0:
         raise SystemExit("--limit-hours must be > 0")
+    # Rejected rather than ignored, like --list-format: a threshold that silently
+    # did nothing would look like a filtered corpus and be an unfiltered one.
+    if args.kana_only_title_threshold is not None and not args.drop_kana_only_titles:
+        raise SystemExit(
+            "--kana-only-title-threshold only applies to --drop-kana-only-titles"
+        )
+    kana_only_threshold = (
+        KANA_ONLY_TITLE_THRESHOLD
+        if args.kana_only_title_threshold is None
+        else args.kana_only_title_threshold
+    )
+    if args.drop_kana_only_titles and not 0.0 < kana_only_threshold <= 1.0:
+        raise SystemExit("--kana-only-title-threshold must be in (0, 1]")
 
     # Before anything touches the network or the disk: two archives sharing a
-    # basename would collapse onto one local file and build the wrong corpus.
+    # basename would collapse onto one local file and build the wrong corpus,
+    # and an unreadable pin file must not surface hours later at the split.
     check_archive_basenames(args.archives)
+    pin_keys = read_pin_val_keys(args.pin_val_keys) if args.pin_val_keys else None
 
     out_dir: Path = args.out_dir
     archive_dir = out_dir / "archives"
@@ -1917,41 +2805,56 @@ def main(argv: list[str] | None = None) -> int:
     run_started = time.monotonic()
     log(f"out dir : {out_dir.resolve()}")
     log(f"archives: {len(args.archives)}")
+    if pin_keys is not None:
+        log(f"pin     : {len(pin_keys)} val keys from {args.pin_val_keys}")
 
-    # 1. download -------------------------------------------------------
-    downloaded: dict[str, Path] = {}
-    if args.skip_download:
-        for remote in args.archives:
-            local = archive_dir / Path(remote).name
-            if not local.is_file():
-                raise SystemExit(f"--skip-download but missing: {local}")
-            downloaded[remote] = local
-    else:
-        token = read_hf_token()
-        downloaded = download_all(
-            args.archives, archive_dir, token, args.download_workers
-        )
-        del token
-
-    # 2. extract --------------------------------------------------------
-    # The password is only read if something actually needs extracting or
-    # verifying, so a re-run on a marker-verified corpus needs no secret at all.
-    # An extraction that still has to be *checked* (no marker: the corpora built
-    # before markers existed) asks for the password too, but tolerates its
-    # absence -- that check is a safety net, not a hard requirement.
-    password: str | None = None
+    # 1-2. download + extract -------------------------------------------
+    # --manifest-only performs neither: its inputs are the index.json files and
+    # the wavs already on disk, so it touches no archive, no password and no
+    # token.  Announced loudly, and before anything is written, because the
+    # outputs it produces are indistinguishable from a full build's.
     index_paths: list[tuple[str, Path]] = []
-    for remote in args.archives:
-        archive = downloaded[remote]
-        if password is None:
-            need = extraction_password_need(archive, raw_dir)
-            if need == "extract":
-                password = read_archive_password()
-            elif need == "verify":
-                password = find_archive_password()
-        root = extract_archive(archive, raw_dir, password or "")
-        index_paths.append((archive.stem, root / "index.json"))
-    del password
+    if args.manifest_only:
+        log(
+            "mode    : MANIFEST-ONLY -- rebuilding manifest and split from "
+            f"index.json under {raw_dir} plus converted wavs under {audio_dir}; "
+            "no download, no extraction, no conversion"
+        )
+        require_converted_audio(audio_dir)
+        index_paths = locate_pruned_indexes(args.archives, raw_dir)
+    else:
+        downloaded: dict[str, Path] = {}
+        if args.skip_download:
+            for remote in args.archives:
+                local = archive_dir / Path(remote).name
+                if not local.is_file():
+                    raise SystemExit(f"--skip-download but missing: {local}")
+                downloaded[remote] = local
+        else:
+            token = read_hf_token()
+            downloaded = download_all(
+                args.archives, archive_dir, token, args.download_workers
+            )
+            del token
+
+        # The password is only read if something actually needs extracting or
+        # verifying, so a re-run on a marker-verified corpus needs no secret at
+        # all.  An extraction that still has to be *checked* (no marker: the
+        # corpora built before markers existed) asks for the password too, but
+        # tolerates its absence -- that check is a safety net, not a hard
+        # requirement.
+        password: str | None = None
+        for remote in args.archives:
+            archive = downloaded[remote]
+            if password is None:
+                need = extraction_password_need(archive, raw_dir)
+                if need == "extract":
+                    password = read_archive_password()
+                elif need == "verify":
+                    password = find_archive_password()
+            root = extract_archive(archive, raw_dir, password or "")
+            index_paths.append((archive.stem, root / "index.json"))
+        del password
 
     # 3. plan -----------------------------------------------------------
     stats = FilterStats()
@@ -1961,7 +2864,16 @@ def main(argv: list[str] | None = None) -> int:
         title = slugify(archive_stem, "unknown_title")
         archive_stats = ArchiveStats(archive=archive_stem, title=title)
         archives[title] = archive_stats
-        tasks = plan_archive(index_path, title, audio_dir, stats, archive_stats)
+        tasks = plan_archive(
+            index_path,
+            title,
+            audio_dir,
+            stats,
+            archive_stats,
+            manifest_only=args.manifest_only,
+            drop_kana_only_titles=args.drop_kana_only_titles,
+            kana_only_threshold=kana_only_threshold,
+        )
         groups.append(tasks)
         log(f"plan    : {title}: {len(tasks)} clips with usable text")
 
@@ -1977,8 +2889,17 @@ def main(argv: list[str] | None = None) -> int:
         args.max_seconds,
         args.limit_hours,
         args.workers,
+        manifest_only=args.manifest_only,
     )
     if not records:
+        if args.manifest_only:
+            raise SystemExit(
+                f"--manifest-only: none of the {stats.index_entries} index.json "
+                f"entries has a converted wav under {audio_dir}, so the manifest "
+                "would be empty.  The wavs are probably under a different "
+                "--out-dir, or this corpus was pruned before it was converted; "
+                "refusing to overwrite the existing manifest with nothing."
+            )
         raise SystemExit("no clips survived filtering; nothing to write")
 
     # 5. split and write ------------------------------------------------
@@ -1990,20 +2911,28 @@ def main(argv: list[str] | None = None) -> int:
         )
         for name, titles in shared.items():
             log(f"split   :   {name}: {', '.join(titles)}")
-    train, val = split_by_speaker(
-        records,
-        args.val_frac,
-        args.seed,
-        max_clips_per_speaker=args.val_max_clips_per_speaker,
-        cover_all_titles=args.val_cover_all_titles,
-    )
+    pin_report: PinnedValReport | None = None
+    if pin_keys is None:
+        train, val = split_by_speaker(
+            records,
+            args.val_frac,
+            args.seed,
+            max_clips_per_speaker=args.val_max_clips_per_speaker,
+            cover_all_titles=args.val_cover_all_titles,
+        )
+    else:
+        train, val, pin_report = split_by_pinned_keys(records, pin_keys)
+        pin_report.keys_file = str(args.pin_val_keys)
+        log_pinned_val_report(pin_report)
     train_path = out_dir / "train.jsonl"
     val_path = out_dir / "val.jsonl"
     write_jsonl(train, train_path)
     write_jsonl(val, val_path)
 
     val_surplus_dropped = len(records) - len(train) - len(val)
-    manifest = build_manifest(args, archives, stats, train, val, val_surplus_dropped)
+    manifest = build_manifest(
+        args, archives, stats, train, val, val_surplus_dropped, pin_report=pin_report
+    )
     manifest_path = out_dir / "manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -2021,13 +2950,26 @@ def main(argv: list[str] | None = None) -> int:
         "clips/speaker)")
     log(f"val/ttl : {json.dumps(manifest['val_clips_by_title'], ensure_ascii=False)}")
     if manifest["val_uncovered_titles"]:
-        log(
-            "val     : no val representation for "
-            f"{', '.join(manifest['val_uncovered_titles'])} -- its speakers are "
-            "all main characters elsewhere; use --val-cover-all-titles to force "
-            "coverage at the cost of dropping their clips from train"
-        )
-    if val_surplus_dropped:
+        if pin_report is not None:
+            # Expected, not a warning: the pinned val comes from an earlier
+            # corpus, so titles added since it was written have no clips in it
+            # by construction.  --val-cover-all-titles cannot change that and
+            # must not be suggested here.
+            log(
+                "val     : pinned val has no clips from "
+                f"{', '.join(manifest['val_uncovered_titles'])} -- these titles "
+                "postdate the pin file and are train-only by design"
+            )
+        else:
+            log(
+                "val     : no val representation for "
+                f"{', '.join(manifest['val_uncovered_titles'])} -- its speakers are "
+                "all main characters elsewhere; use --val-cover-all-titles to force "
+                "coverage at the cost of dropping their clips from train"
+            )
+    # On the pinned path the same clips are already reported, with the reason
+    # that actually applies, by log_pinned_val_report.
+    if val_surplus_dropped and pin_report is None:
         log(
             f"val     : dropped {val_surplus_dropped} surplus clips from val "
             "speakers (kept off both sides to protect voice disjointness)"
