@@ -189,6 +189,64 @@ there would have been scoring on training data.
   intended.  A pin file that matches *nothing* is a hard error, and so is one
   whose speakers would empty train.
 
+Per-clip emotion targets (``--emo-labels``)
+-------------------------------------------
+Without this flag every record's ``emo_target`` is the fixed ``<|NEUTRAL|>``
+above, which is what rounds 1 and 2 trained on -- and training an emotion head
+against a constant collapses it: the head learns the constant and nothing else.
+The transcripts carry no emotion annotation, so the labels have to come from
+somewhere else, and they arrive as a separate file rather than as a second
+transcript pass.
+
+``--emo-labels FILE`` takes JSONL, one object per line, as written by
+``scripts/merge_emo_labels.py``.  Only two fields are read -- ``key`` (a
+manifest key) and ``emo_target`` (the token to stamp on that clip).  Any other
+field the producer emits (``decision``, ``audio_label``, ``audio_score``,
+``text_label``) is ignored rather than rejected, so the labeller can record its
+own provenance without this script having to track its schema.
+
+A clip listed in the file takes the file's target.  A clip **not** listed takes
+``EMO_MASK_TARGET`` (``<|SER|>``) -- deliberately *not* ``<|NEUTRAL|>``.  An
+unlabelled clip is one nothing is known about, and asserting it is neutral is
+the same mistake as before, only quieter.  ``model.py`` maps the sentinel to
+``ignore_id`` immediately before the rich CE loss, so a masked clip still
+trains CTC on its transcript in full and contributes nothing at all to the
+emotion head.
+
+Everything here fails loudly, because a silent data-prep bug in this script has
+already cost one full training round: an unreadable or missing file, a
+malformed line (reported with its line number), a duplicate ``key``, an
+``emo_target`` outside the seven SenseVoice emotion tokens plus the mask
+sentinel.  ``<|EMO_UNKNOWN|>`` is rejected by name: it is the "no prediction"
+token inference bans, never a training target.
+
+Two of those checks are about *coverage*, and they are the ones that matter:
+
+* a label file matching **nothing** is a different corpus, and would mask every
+  clip while reading as a legitimate run;
+* a file matching almost nothing is worse, because it is likelier.  A labelling
+  job that died a few thousand clips in, or a merge of audio and text labels
+  taken over different ``--sample``/``--seed`` slices, produces a file that
+  covers a fraction of a percent of the corpus.  Every other clip is masked, the
+  run completes, the manifest reports it accurately -- and the emotion head
+  trains on essentially nothing, which is discoverable only by finishing a
+  two-day run and scoring it.  So fewer than ``EMO_MIN_LABELLED_FRACTION`` of
+  clips carrying a real emotion is a hard error too.  ``--allow-sparse-emo-labels``
+  overrides it for the one legitimate case, a pilot over a slice of a large
+  corpus, and the override is recorded in the manifest rather than defaulted
+  into.
+
+What was applied is recorded in ``manifest.json`` under ``emo_label_stats`` --
+the file, its sha256, how many keys it held, how many matched, how many clips
+ended up labelled, and the count and fraction of each of the eight possible
+targets in train and in val separately -- and printed at the end of the run.
+Read ``labelled_clips``, not ``keys_matched``: the labeller writes ``<|SER|>``
+explicitly for a clip it could not call, so a matched key can still be masked.
+
+A distribution where one non-mask token covers more than
+``EMO_DEGENERATE_FRACTION`` of the labelled clips is called out as a warning,
+since that near-constant target is the exact failure this flag exists to fix.
+
 Rebuilding the split without the audio sources (``--manifest-only``)
 --------------------------------------------------------------------
 A corpus larger than the free disk cannot be built in one pass: at ~1,000 h the
@@ -237,6 +295,10 @@ Usage
     # drop the titles transcribed in kana where the audio has kanji:
     python scripts/prepare_vn_data.py --drop-kana-only-titles
 
+    # round 3: real per-clip emotion targets instead of a constant <|NEUTRAL|>;
+    # clips the file does not mention are masked, not called neutral:
+    python scripts/prepare_vn_data.py --emo-labels data/vn/emo_labels.jsonl
+
     # round 2 on a bigger corpus, scored on exactly round 1's val:
     cut -d'"' -f4 data/vn/val.jsonl > round1_val_keys.txt   # the "key" field
     python scripts/prepare_vn_data.py --pin-val-keys round1_val_keys.txt
@@ -252,6 +314,7 @@ exactly that, shell-quoted, one per line).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import multiprocessing as mp
 import os
@@ -367,11 +430,57 @@ KANA_ONLY_TITLE_THRESHOLD = 0.8
 # second -- see ``compute_source_len`` for why no LFR division is applied.
 FRAME_MS = 10
 
-# Fixed tags: this corpus is Japanese speech without ITN or emotion labels.
+# Fixed tags: this corpus is Japanese speech without ITN.  ``EMO_TARGET`` is the
+# default emotion too -- the corpus ships no annotation -- and stays the default
+# so that a run without --emo-labels reproduces the round-1/2 manifests exactly.
 TEXT_LANGUAGE = "<|ja|>"
 EMO_TARGET = "<|NEUTRAL|>"
 EVENT_TARGET = "<|Speech|>"
 WITH_OR_WO_ITN = "<|woitn|>"
+
+# The emotion target for a clip ``--emo-labels`` says nothing about.  NOT
+# ``<|NEUTRAL|>``: stamping neutral on an unlabelled clip asserts an emotion
+# nothing measured, which is precisely how rounds 1 and 2 trained the head on a
+# constant and collapsed it.  ``model.py`` rewrites this sentinel to
+# ``ignore_id`` right before the rich CE loss (see ``emo_mask_token_id`` there),
+# so a masked clip trains CTC on its transcript as usual and drops out of the
+# emotion head's numerator and denominator entirely.
+EMO_MASK_TARGET = "<|SER|>"
+
+# The seven emotion tokens SenseVoice can be trained on.  ``<|EMO_UNKNOWN|>`` is
+# deliberately absent: it is the "no prediction" token, banned at inference, and
+# a clip that carries it as a *target* teaches the model to predict "unknown".
+# An unlabelled clip belongs behind EMO_MASK_TARGET instead.
+EMO_LABEL_TARGETS: tuple[str, ...] = (
+    "<|HAPPY|>",
+    "<|SAD|>",
+    "<|ANGRY|>",
+    "<|NEUTRAL|>",
+    "<|FEARFUL|>",
+    "<|DISGUSTED|>",
+    "<|SURPRISED|>",
+)
+EMO_UNKNOWN_TARGET = "<|EMO_UNKNOWN|>"
+EMO_ALL_TARGETS: tuple[str, ...] = EMO_LABEL_TARGETS + (EMO_MASK_TARGET,)
+
+# Floor on the share of the corpus that must come out of --emo-labels carrying a
+# real emotion.  Zero overlap is a typo and is caught on its own; *near* zero is
+# a partial failure -- a labelling job that died a few thousand clips in, or a
+# merge of two labellers whose key sets barely intersected -- and it is both the
+# more likely accident and the harder one to see, because the run completes, the
+# manifest is written, and the only symptom is an emotion head that saw almost
+# no supervision.  The training plan's own gate is "usable labels >= 15% of
+# train", so 5% is a floor well beneath any legitimate outcome rather than a
+# second opinion on that gate.  --allow-sparse-emo-labels overrides it, for the
+# one legitimate case: a pilot labelling run over a slice of a large corpus.
+EMO_MIN_LABELLED_FRACTION = 0.05
+
+# Share of the *labelled* (non-masked) clips above which one emotion token is
+# reported as a degenerate distribution.  Not an error -- a genuinely lopsided
+# corpus is possible, and this script does not get to overrule the labeller --
+# but loud, because a near-constant target is indistinguishable from the bug
+# this flag exists to fix and is invisible in the manifest's totals.
+EMO_DEGENERATE_FRACTION = 0.9
 
 # Characters that make a line "real" text.  A line consisting solely of
 # punctuation, symbols or dashes carries no transcribable content.
@@ -1097,6 +1206,336 @@ def read_pin_val_keys(path: Path) -> list[str]:
     return keys
 
 
+@dataclass
+class EmoLabelFile:
+    """A parsed ``--emo-labels`` file: the join table plus its provenance.
+
+    The sha256 is carried alongside the mapping because ``emo_labels.jsonl`` is
+    regenerated whenever the labeller is re-run, and a manifest that names only
+    a path cannot say *which* version of that path it was built from.
+    """
+
+    path: str
+    sha256: str
+    targets: dict[str, str] = field(default_factory=dict)
+
+
+def _reject_emo_target(path: Path, lineno: int, key: str, target: str) -> str:
+    """The error text for an ``emo_target`` this script refuses to write."""
+    detail = ""
+    if target == EMO_UNKNOWN_TARGET:
+        detail = (
+            f"  {EMO_UNKNOWN_TARGET} is the 'no prediction' token, which "
+            "inference bans and which must never be a training target -- a clip "
+            f"with no usable label carries the mask sentinel {EMO_MASK_TARGET}, "
+            "or is simply left out of this file."
+        )
+    return (
+        f"--emo-labels: {path}:{lineno}: key {key!r} has emo_target {target!r}, "
+        f"which is not one of {' '.join(EMO_ALL_TARGETS)}.{detail}"
+    )
+
+
+def read_emo_labels(path: Path) -> EmoLabelFile:
+    """Read a ``--emo-labels`` JSONL file into ``key -> emo_target``.
+
+    Only ``key`` and ``emo_target`` are read.  Every other field the labeller
+    writes (``decision``, ``audio_label``, ``audio_score``, ``text_label``) is
+    ignored rather than rejected, so its provenance bookkeeping can evolve
+    without this script having to follow.
+
+    Everything else is a hard error naming the line it happened on: a malformed
+    line, a duplicate key, a missing field, an ``emo_target`` outside
+    ``EMO_ALL_TARGETS``.  A label file is a training target for every clip it
+    touches, and the failure mode of accepting a bad one quietly is a full
+    training round spent on wrong labels.
+
+    Read eagerly, before anything is downloaded, for the same reason
+    :func:`read_pin_val_keys` is.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise SystemExit(f"--emo-labels: cannot read {path}: {error}") from None
+
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SystemExit(f"--emo-labels: {path} is not valid UTF-8: {error}") from None
+
+    targets: dict[str, str] = {}
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise SystemExit(
+                f"--emo-labels: {path}:{lineno}: malformed JSON line ({error})"
+            ) from None
+        if not isinstance(entry, dict):
+            raise SystemExit(
+                f"--emo-labels: {path}:{lineno}: expected a JSON object per line, "
+                f"got {type(entry).__name__}"
+            )
+        for name in ("key", "emo_target"):
+            if name not in entry:
+                raise SystemExit(
+                    f"--emo-labels: {path}:{lineno}: missing required field "
+                    f"{name!r}; every line needs 'key' and 'emo_target'"
+                )
+            if not isinstance(entry[name], str):
+                raise SystemExit(
+                    f"--emo-labels: {path}:{lineno}: field {name!r} must be a "
+                    f"string, got {type(entry[name]).__name__}"
+                )
+        key = entry["key"]
+        target = entry["emo_target"]
+        if key in targets:
+            raise SystemExit(
+                f"--emo-labels: {path}:{lineno}: duplicate key {key!r} (already "
+                f"labelled {targets[key]!r}).  One clip cannot have two emotion "
+                "targets, and silently keeping either one would make the corpus "
+                "depend on the file's line order"
+            )
+        if target not in EMO_ALL_TARGETS:
+            raise SystemExit(_reject_emo_target(path, lineno, key, target))
+        targets[key] = target
+
+    if not targets:
+        raise SystemExit(
+            f"--emo-labels: {path} holds no labels (only blank lines).  One JSON "
+            "object per line with 'key' and 'emo_target' is expected"
+        )
+    return EmoLabelFile(path=str(path), sha256=digest, targets=targets)
+
+
+def apply_emo_labels(
+    records: Sequence[dict[str, Any]],
+    labels: EmoLabelFile,
+    *,
+    allow_sparse: bool = False,
+) -> set[str]:
+    """Stamp each record with its label, masking the ones the file omits.
+
+    Call this over the whole kept corpus and *before* the split, so the two
+    coverage checks below measure the corpus rather than one side of it.
+    Returns the label-file keys that matched a clip, so the caller can report
+    the ones that matched nothing.  Mutates in place: ``emo_target`` already
+    exists on every record, so assigning to it keeps the field in its schema
+    position and the output stays byte-comparable with the shipped examples.
+
+    Two ways this refuses to proceed, because both end in a training run with
+    no usable emotion supervision and neither is visible in the totals:
+
+    * the file matches *nothing*, which means it was built against a different
+      corpus.  A typo, and the loudest case;
+    * it matches, but fewer than ``EMO_MIN_LABELLED_FRACTION`` of the clips come
+      out carrying a real emotion.  This is the likelier accident -- a labelling
+      job that died early, a merge over mismatched samples -- and the more
+      dangerous one, since the run completes and reports itself accurately in a
+      manifest block nobody reads before submitting a two-day training job.
+      ``allow_sparse`` (``--allow-sparse-emo-labels``) is the deliberate
+      override for a genuine pilot over a slice of a large corpus.
+    """
+    matched: set[str] = set()
+    labelled = 0
+    for record in records:
+        key = str(record["key"])
+        target = labels.targets.get(key)
+        if target is None:
+            record["emo_target"] = EMO_MASK_TARGET
+        else:
+            record["emo_target"] = target
+            matched.add(key)
+            if target != EMO_MASK_TARGET:
+                labelled += 1
+
+    if not matched:
+        raise SystemExit(
+            f"--emo-labels: none of this corpus's {len(records)} clips appears in "
+            f"{labels.path} ({len(labels.targets)} keys), so every clip would be "
+            f"masked with {EMO_MASK_TARGET} and the emotion head would see no "
+            "label at all.  The label file was almost certainly built against a "
+            "different corpus"
+        )
+
+    fraction = labelled / len(records) if records else 0.0
+    if not allow_sparse and fraction < EMO_MIN_LABELLED_FRACTION:
+        raise SystemExit(
+            f"--emo-labels: only {labelled} of this corpus's {len(records)} clips "
+            f"({fraction:.2%}) carry a real emotion token, below the "
+            f"{EMO_MIN_LABELLED_FRACTION:.0%} floor -- the emotion head would "
+            "train on almost nothing while the run itself completed normally.  "
+            "The usual causes are a labelling job that was interrupted partway "
+            "through, or a merge of audio and text labels taken over different "
+            "--sample/--seed slices, so the two key sets barely intersect.  "
+            f"Check {labels.path} covers the corpus you are building; if it is "
+            "deliberately a pilot over a slice, pass --allow-sparse-emo-labels"
+        )
+    return matched
+
+
+@dataclass
+class EmoLabelStats:
+    """What ``--emo-labels`` actually did, for the log and the manifest."""
+
+    labels_file: str = ""
+    sha256: str = ""
+    keys_in_file: int = 0
+    keys_matched: int = 0
+    train_counts: dict[str, int] = field(default_factory=dict)
+    val_counts: dict[str, int] = field(default_factory=dict)
+    sparse_override: bool = False
+
+    @property
+    def keys_matched_nothing(self) -> int:
+        return self.keys_in_file - self.keys_matched
+
+    @property
+    def total_clips(self) -> int:
+        counts = self.total_counts
+        return sum(counts[target] for target in EMO_ALL_TARGETS)
+
+    @property
+    def total_counts(self) -> dict[str, int]:
+        return {
+            target: self.train_counts.get(target, 0) + self.val_counts.get(target, 0)
+            for target in EMO_ALL_TARGETS
+        }
+
+    @property
+    def labelled_clips(self) -> int:
+        """Clips carrying a real emotion, i.e. everything but the mask."""
+        counts = self.total_counts
+        return sum(counts[t] for t in EMO_LABEL_TARGETS)
+
+    def dominant_label(self) -> tuple[str, float] | None:
+        """The one emotion covering more than ``EMO_DEGENERATE_FRACTION``, if any.
+
+        Measured over the labelled clips only: the mask is not an emotion, and
+        counting it would hide a constant target behind a large masked share.
+        """
+        labelled = self.labelled_clips
+        if labelled <= 0:
+            return None
+        counts = self.total_counts
+        target = max(EMO_LABEL_TARGETS, key=lambda t: (counts[t], t))
+        fraction = counts[target] / labelled
+        return (target, fraction) if fraction > EMO_DEGENERATE_FRACTION else None
+
+    @staticmethod
+    def _split_block(counts: dict[str, int]) -> dict[str, Any]:
+        clips = sum(counts.get(target, 0) for target in EMO_ALL_TARGETS)
+        return {
+            "clips": clips,
+            "labelled_clips": clips - counts.get(EMO_MASK_TARGET, 0),
+            # Every one of the eight targets, zeros included: a block whose keys
+            # depend on what happened to occur cannot be diffed run to run.
+            "counts": {target: counts.get(target, 0) for target in EMO_ALL_TARGETS},
+            "fractions": {
+                target: (round(counts.get(target, 0) / clips, 5) if clips else 0.0)
+                for target in EMO_ALL_TARGETS
+            },
+        }
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "labels_file": self.labels_file,
+            # Which revision of that path, not just which path: the labeller is
+            # re-run, and two manifests naming the same file are otherwise
+            # indistinguishable.
+            "labels_sha256": self.sha256,
+            "keys_in_file": self.keys_in_file,
+            "keys_matched": self.keys_matched,
+            "keys_matched_nothing": self.keys_matched_nothing,
+            "mask_target": EMO_MASK_TARGET,
+            # The coverage gate this corpus was admitted under.  A corpus built
+            # with the override must say so: it is otherwise indistinguishable
+            # from one that cleared the floor honestly, and "why did round 3
+            # learn no emotion" is answered here or not at all.
+            "min_labelled_fraction": EMO_MIN_LABELLED_FRACTION,
+            "sparse_override": self.sparse_override,
+            "labelled_clips": self.labelled_clips,
+            "labelled_fraction": (
+                round(self.labelled_clips / self.total_clips, 5)
+                if self.total_clips
+                else 0.0
+            ),
+            "train": self._split_block(self.train_counts),
+            "val": self._split_block(self.val_counts),
+            "policy": (
+                "emo_target comes from labels_file for every clip listed there; "
+                f"every clip that is not listed carries {EMO_MASK_TARGET}, which "
+                "model.py maps to ignore_id, so it trains CTC on its transcript "
+                "and contributes nothing to the emotion head.  Unlabelled clips "
+                "are deliberately NOT stamped <|NEUTRAL|>: that constant is what "
+                "collapsed the head in rounds 1 and 2."
+            ),
+        }
+
+
+def build_emo_label_stats(
+    labels: EmoLabelFile,
+    train: Sequence[dict[str, Any]],
+    val: Sequence[dict[str, Any]],
+    *,
+    sparse_override: bool = False,
+) -> EmoLabelStats:
+    """Tally the emotion targets that reached train.jsonl and val.jsonl.
+
+    Counted over the written clips rather than over everything the run kept, so
+    the block reconciles against train.jsonl and val.jsonl exactly:
+    ``keys_matched`` is the number of the file's keys that reached one of the
+    two, and ``keys_matched_nothing`` is the rest of the file.  A key whose clip
+    the split discarded as val surplus therefore counts as matching nothing --
+    which is what it did, as far as the corpus on disk goes.
+
+    ``keys_matched`` is not the labelled-clip count: the labeller writes
+    ``<|SER|>`` explicitly for a clip it could not call, so a matched key can
+    land in the mask bucket.  ``labelled_clips`` is the number to read for "how
+    much does the emotion head actually see".
+    """
+
+    def tally(records: Sequence[dict[str, Any]]) -> dict[str, int]:
+        counts = {target: 0 for target in EMO_ALL_TARGETS}
+        for record in records:
+            target = str(record["emo_target"])
+            if target not in counts:
+                # Unreachable while apply_emo_labels is the only writer and
+                # read_emo_labels has already validated every value.  Raised
+                # anyway: _split_block sums the eight known targets, so an
+                # unknown one would silently vanish from "clips" and hand the
+                # operator an under-count that still adds up on its face --
+                # which is the shape of failure this whole block exists to
+                # prevent.  "Unreachable" has a poor record in this script.
+                raise SystemExit(
+                    f"--emo-labels: clip {record.get('key')!r} carries "
+                    f"emo_target {target!r}, which is not one of "
+                    f"{' '.join(EMO_ALL_TARGETS)}.  The emotion targets were "
+                    "written by something other than apply_emo_labels"
+                )
+            counts[target] += 1
+        return counts
+
+    written = list(train) + list(val)
+    matched = {
+        str(record["key"])
+        for record in written
+        if str(record["key"]) in labels.targets
+    }
+    return EmoLabelStats(
+        labels_file=labels.path,
+        sha256=labels.sha256,
+        keys_in_file=len(labels.targets),
+        keys_matched=len(matched),
+        train_counts=tally(train),
+        val_counts=tally(val),
+        sparse_override=sparse_override,
+    )
+
+
 def slugify(name: str, fallback: str = "unknown") -> str:
     """Filesystem-safe token that keeps Japanese characters readable."""
     slug = _SLUG_RE.sub("_", unicodedata.normalize("NFKC", name)).strip("_")
@@ -1261,6 +1700,53 @@ def log_pinned_val_report(report: PinnedValReport) -> None:
         f"dropping {report.train_clips_dropped} further clip(s) that share a "
         "speaker with a pinned clip"
     )
+
+
+def log_emo_label_report(stats: EmoLabelStats) -> None:
+    """Print what ``--emo-labels`` did, in the style of the train/val lines.
+
+    The per-target breakdown is printed rather than left to the manifest because
+    the number that matters -- is the emotion head being trained on more than
+    one class? -- is exactly the number a summary of totals hides.
+    """
+    log(
+        f"emo     : {stats.labels_file}: {stats.keys_in_file} keys "
+        f"(sha256 {stats.sha256[:12]}), {stats.keys_matched} matched this "
+        f"corpus, {stats.keys_matched_nothing} matched nothing"
+    )
+    # On its own line, and separate from keys_matched, which counts the rows the
+    # labeller explicitly masked as well.  This is the number that says how much
+    # supervision the emotion head is about to get, so it goes where it will be
+    # read rather than only into the manifest.
+    fraction = stats.labelled_clips / stats.total_clips if stats.total_clips else 0.0
+    log(
+        f"emo     : labelled {stats.labelled_clips} of {stats.total_clips} clips "
+        f"({fraction:.1%}); the rest carry {EMO_MASK_TARGET} and train CTC only"
+    )
+    if stats.sparse_override:
+        log(
+            "emo     : --allow-sparse-emo-labels was passed, so the "
+            f"{EMO_MIN_LABELLED_FRACTION:.0%} coverage floor was not enforced"
+        )
+    for split, counts in (("train", stats.train_counts), ("val", stats.val_counts)):
+        clips = sum(counts.get(target, 0) for target in EMO_ALL_TARGETS)
+        breakdown = ", ".join(
+            f"{target} {counts.get(target, 0)} "
+            f"({counts.get(target, 0) / clips:.1%})"
+            for target in EMO_ALL_TARGETS
+            if counts.get(target, 0)
+        )
+        log(f"emo     :   {split}: {clips} clips -- {breakdown or 'none'}")
+    dominant = stats.dominant_label()
+    if dominant is not None:
+        target, fraction = dominant
+        log(
+            f"emo     : WARNING: degenerate emotion distribution -- {target} "
+            f"covers {fraction:.1%} of the {stats.labelled_clips} labelled clips "
+            f"(> {EMO_DEGENERATE_FRACTION:.0%}).  A near-constant target is what "
+            "collapsed the emotion head in rounds 1 and 2; check the label file "
+            "before training on this corpus"
+        )
 
 
 def eta(done: int, total: int, started: float) -> str:
@@ -2456,6 +2942,7 @@ def build_manifest(
     val_surplus_dropped: int = 0,
     *,
     pin_report: PinnedValReport | None = None,
+    emo_stats: EmoLabelStats | None = None,
 ) -> dict[str, Any]:
     all_records = list(train) + list(val)
     speaker_counts: dict[str, int] = {}
@@ -2571,6 +3058,12 @@ def build_manifest(
     # byte what it was before --pin-val-keys existed.
     if pin_report is not None:
         manifest["val_pin"] = pin_report.as_dict()
+    # Conditional for the same reason, and it matters more here: without
+    # --emo-labels every record carries the fixed <|NEUTRAL|>, exactly as in
+    # rounds 1 and 2, so their manifests stay reproducible.  Present, this block
+    # is the evidence for what the emotion head was actually trained against.
+    if emo_stats is not None:
+        manifest["emo_label_stats"] = emo_stats.as_dict()
     # Likewise conditional: a full build's manifest is unchanged.  Present, it
     # says the clip list was rebuilt from wavs on disk rather than from audio
     # this run decoded -- which is the one thing a reader cannot otherwise tell
@@ -2696,6 +3189,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--emo-labels",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Stamp per-clip emotion targets from this JSONL file (as written by "
+            "scripts/merge_emo_labels.py): one object per line, of which only "
+            "'key' (a manifest key) and 'emo_target' are read, any other field "
+            "being ignored.  A clip the file does not list gets the mask "
+            f"sentinel {EMO_MASK_TARGET}, NOT <|NEUTRAL|> -- model.py maps it to "
+            "ignore_id, so the clip still trains CTC and contributes nothing to "
+            "the emotion head.  Without this flag every clip gets the fixed "
+            f"{EMO_TARGET}, which is what rounds 1 and 2 trained on and what "
+            "collapsed the emotion head.  A bad token, a duplicate key, a "
+            "malformed line, a file matching no clip at all, and a file that "
+            "leaves all but a sliver of the corpus unlabelled (see "
+            "--allow-sparse-emo-labels) are each a hard error; what was applied "
+            "is recorded in manifest.json (emo_label_stats)"
+        ),
+    )
+    parser.add_argument(
+        "--allow-sparse-emo-labels",
+        action="store_true",
+        # Every literal per-cent sign in an argparse help string has to be
+        # doubled: argparse %-formats the string to expand %(default)s, so a
+        # bare "5%" is read as a format spec and raises at --help time.
+        help=(
+            "Permit an --emo-labels file that leaves more than "
+            f"{(1 - EMO_MIN_LABELLED_FRACTION) * 100:.0f}%% of the corpus "
+            "unlabelled.  Without it, a corpus where fewer than "
+            f"{EMO_MIN_LABELLED_FRACTION * 100:.0f}%% of clips carry a real "
+            "emotion is "
+            "a hard error, because an interrupted labelling job or a merge over "
+            "mismatched slices otherwise yields a run that completes normally "
+            "and trains the emotion head on almost nothing.  Pass this only for "
+            "a deliberate pilot over a slice of a large corpus; the override is "
+            "recorded in manifest.json (emo_label_stats.sparse_override).  "
+            "Requires --emo-labels"
+        ),
+    )
+    parser.add_argument(
         "--drop-kana-only-titles",
         action="store_true",
         help=(
@@ -2782,6 +3316,10 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             "--kana-only-title-threshold only applies to --drop-kana-only-titles"
         )
+    # Same rule: an override that silently did nothing would read as a corpus
+    # admitted under a relaxed floor when no floor was ever consulted.
+    if args.allow_sparse_emo_labels and not args.emo_labels:
+        raise SystemExit("--allow-sparse-emo-labels only applies to --emo-labels")
     kana_only_threshold = (
         KANA_ONLY_TITLE_THRESHOLD
         if args.kana_only_title_threshold is None
@@ -2795,6 +3333,7 @@ def main(argv: list[str] | None = None) -> int:
     # and an unreadable pin file must not surface hours later at the split.
     check_archive_basenames(args.archives)
     pin_keys = read_pin_val_keys(args.pin_val_keys) if args.pin_val_keys else None
+    emo_labels = read_emo_labels(args.emo_labels) if args.emo_labels else None
 
     out_dir: Path = args.out_dir
     archive_dir = out_dir / "archives"
@@ -2807,6 +3346,8 @@ def main(argv: list[str] | None = None) -> int:
     log(f"archives: {len(args.archives)}")
     if pin_keys is not None:
         log(f"pin     : {len(pin_keys)} val keys from {args.pin_val_keys}")
+    if emo_labels is not None:
+        log(f"emo     : {len(emo_labels.targets)} labels from {args.emo_labels}")
 
     # 1-2. download + extract -------------------------------------------
     # --manifest-only performs neither: its inputs are the index.json files and
@@ -2902,6 +3443,12 @@ def main(argv: list[str] | None = None) -> int:
             )
         raise SystemExit("no clips survived filtering; nothing to write")
 
+    # 4b. emotion targets -----------------------------------------------
+    if emo_labels is not None:
+        apply_emo_labels(
+            records, emo_labels, allow_sparse=args.allow_sparse_emo_labels
+        )
+
     # 5. split and write ------------------------------------------------
     shared = cross_title_speakers(records)
     if shared:
@@ -2930,8 +3477,25 @@ def main(argv: list[str] | None = None) -> int:
     write_jsonl(val, val_path)
 
     val_surplus_dropped = len(records) - len(train) - len(val)
+    emo_stats = (
+        None
+        if emo_labels is None
+        else build_emo_label_stats(
+            emo_labels,
+            train,
+            val,
+            sparse_override=args.allow_sparse_emo_labels,
+        )
+    )
     manifest = build_manifest(
-        args, archives, stats, train, val, val_surplus_dropped, pin_report=pin_report
+        args,
+        archives,
+        stats,
+        train,
+        val,
+        val_surplus_dropped,
+        pin_report=pin_report,
+        emo_stats=emo_stats,
     )
     manifest_path = out_dir / "manifest.json"
     manifest_path.write_text(
@@ -2975,6 +3539,8 @@ def main(argv: list[str] | None = None) -> int:
             "speakers (kept off both sides to protect voice disjointness)"
         )
     log(f"manifest: {manifest_path}")
+    if emo_stats is not None:
+        log_emo_label_report(emo_stats)
     log(f"filters : {json.dumps(stats.as_dict(), ensure_ascii=False)}")
     log(f"elapsed : {fmt_duration(time.monotonic() - run_started)}")
     return 0

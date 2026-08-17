@@ -1865,14 +1865,17 @@ def test_the_cli_surface_is_exactly_these_options():
     Listed exhaustively so that adding an option is a conscious edit here: this
     script's flags are recorded in manifest.json's ``config`` and quoted in the
     training docs, and a silently grown CLI makes an old command line's meaning
-    ambiguous.  Four options have been added under this rule so far --
-    ``--pin-val-keys``, ``--manifest-only``, ``--drop-kana-only-titles`` and its
-    ``--kana-only-title-threshold``.
+    ambiguous.  Six options have been added under this rule so far --
+    ``--pin-val-keys``, ``--manifest-only``, ``--drop-kana-only-titles``, its
+    ``--kana-only-title-threshold``, ``--emo-labels`` and its
+    ``--allow-sparse-emo-labels``.
     """
     assert sorted(vars(vn.parse_args([]))) == [
+        "allow_sparse_emo_labels",
         "archives",
         "download_workers",
         "drop_kana_only_titles",
+        "emo_labels",
         "kana_only_title_threshold",
         "limit_hours",
         "list_archives",
@@ -4197,3 +4200,1206 @@ def test_the_default_threshold_reaches_the_manifest_when_unset():
     manifest = vn.build_manifest(args, {}, stats, train, val, 0)
 
     assert manifest["config"]["kana_only_title_threshold"] == 0.8
+
+
+# ---------------------------------------------------------------------------
+# Per-clip emotion targets (--emo-labels)
+#
+# The bug this section pins: every record's ``emo_target`` was the hardcoded
+# ``<|NEUTRAL|>``, so rounds 1 and 2 trained the emotion head against a
+# constant and collapsed it -- the head learned the constant and nothing else.
+# Round 3 joins real per-clip pseudo-labels in from a file the labeller writes.
+#
+# Three properties are pinned here and must not be loosened:
+#   * a clip the label file does NOT mention gets ``<|SER|>``, never
+#     ``<|NEUTRAL|>``.  Stamping neutral on an unmeasured clip is the same
+#     mistake as before, only quieter; the sentinel is what model.py rewrites
+#     to ignore_id, so the clip trains CTC and skips the emotion head entirely;
+#   * the flag is OPT-IN and the default path is byte-identical.  The round-2
+#     manifests are reproducible only while a run without --emo-labels stamps
+#     ``<|NEUTRAL|>`` on everything, exactly as it always did;
+#   * every rejection is loud.  A label file is a training target for each clip
+#     it touches, and this repo has already lost a round to a data-prep bug
+#     that failed silently.
+# ---------------------------------------------------------------------------
+
+# Two clips of the pruned fixture corpus, spelled the way plan_archive builds a
+# key: "<title>__<speaker_slug>__<voice_slug>".
+EMO_KEY_A = "Studio_A__spk0__v0"
+EMO_KEY_B = "Studio_A__spk0__v1"
+
+
+def write_emo_labels(path, entries):
+    """Write a --emo-labels JSONL file from ``[{...}, ...]`` and return the path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries),
+        encoding="utf-8",
+    )
+    return path
+
+
+def emo_labels_for(path, mapping):
+    """The common case: a plain ``{key: emo_target}`` file."""
+    return write_emo_labels(
+        path, [{"key": key, "emo_target": target} for key, target in mapping.items()]
+    )
+
+
+def emo_records(mapping):
+    """Records whose keys are exactly ``mapping``'s, for the applier tests."""
+    return [
+        vn.build_record(key, "こんにちは", f"/vn/audio/t/s/{index}.wav", 2.0)
+        for index, key in enumerate(mapping)
+    ]
+
+
+def all_emo_targets(path):
+    return {record["emo_target"] for record in read_jsonl(path)}
+
+
+# --- the tokens themselves --------------------------------------------------
+
+
+def test_the_mask_sentinel_is_ser_and_not_neutral():
+    """The whole point of the flag: an unlabelled clip is masked, not asserted
+    neutral.  model.py maps this exact token (id 24991) to ignore_id."""
+    assert vn.EMO_MASK_TARGET == "<|SER|>"
+    assert vn.EMO_MASK_TARGET != vn.EMO_TARGET
+
+
+def test_the_seven_emotion_tokens_are_exactly_sensevoices():
+    assert set(vn.EMO_LABEL_TARGETS) == {
+        "<|HAPPY|>",
+        "<|SAD|>",
+        "<|ANGRY|>",
+        "<|NEUTRAL|>",
+        "<|FEARFUL|>",
+        "<|DISGUSTED|>",
+        "<|SURPRISED|>",
+    }
+
+
+def test_emo_unknown_is_not_an_acceptable_target():
+    # <|EMO_UNKNOWN|> is the "no prediction" token; webui.py maps it to the
+    # empty string at inference.  As a *target* it teaches the model to predict
+    # "unknown", which is worse than masking the clip.
+    assert vn.EMO_UNKNOWN_TARGET not in vn.EMO_ALL_TARGETS
+
+
+def test_the_eight_possible_targets_are_the_seven_plus_the_mask():
+    assert set(vn.EMO_ALL_TARGETS) == set(vn.EMO_LABEL_TARGETS) | {vn.EMO_MASK_TARGET}
+    assert len(vn.EMO_ALL_TARGETS) == 8
+
+
+def test_the_default_emotion_target_is_still_neutral():
+    # Pins round-2 reproducibility at the constant itself: build_record's
+    # default is what a run without --emo-labels writes on every clip.
+    assert vn.EMO_TARGET == "<|NEUTRAL|>"
+
+
+# --- reading the label file -------------------------------------------------
+
+
+def test_the_label_file_is_one_json_object_per_line(tmp_path):
+    path = emo_labels_for(
+        tmp_path / "emo.jsonl", {EMO_KEY_A: "<|HAPPY|>", EMO_KEY_B: "<|SAD|>"}
+    )
+
+    labels = vn.read_emo_labels(path)
+
+    assert labels.targets == {EMO_KEY_A: "<|HAPPY|>", EMO_KEY_B: "<|SAD|>"}
+
+
+@pytest.mark.parametrize("target", vn.EMO_ALL_TARGETS if vn else [])
+def test_every_one_of_the_eight_targets_is_accepted(tmp_path, target):
+    path = emo_labels_for(tmp_path / "emo.jsonl", {EMO_KEY_A: target})
+
+    assert vn.read_emo_labels(path).targets == {EMO_KEY_A: target}
+
+
+def test_unknown_fields_are_ignored_rather_than_rejected(tmp_path):
+    """The labeller records its own provenance and this script must not have to
+    track its schema -- only 'key' and 'emo_target' are contractual."""
+    path = write_emo_labels(
+        tmp_path / "emo.jsonl",
+        [
+            {
+                "key": EMO_KEY_A,
+                "emo_target": "<|ANGRY|>",
+                "decision": "audio_conf",
+                "audio_label": "angry",
+                "audio_score": 0.87,
+                "text_label": "neutral",
+                "something_invented_next_quarter": {"nested": [1, 2]},
+            },
+            # merge_emo_labels.MergedRow.to_json emits null for a labeller that
+            # had nothing to say about the clip, so nulls are the ordinary wire
+            # shape and must not be mistaken for a malformed row.
+            {
+                "key": EMO_KEY_B,
+                "emo_target": "<|SER|>",
+                "decision": "missing_masked",
+                "audio_label": None,
+                "audio_score": None,
+                "text_label": None,
+            },
+        ],
+    )
+
+    assert vn.read_emo_labels(path).targets == {
+        EMO_KEY_A: "<|ANGRY|>",
+        EMO_KEY_B: "<|SER|>",
+    }
+
+
+def test_blank_lines_are_skipped(tmp_path):
+    path = tmp_path / "emo.jsonl"
+    path.write_text(
+        f'\n{{"key": "{EMO_KEY_A}", "emo_target": "<|SAD|>"}}\n\n  \n',
+        encoding="utf-8",
+    )
+
+    assert vn.read_emo_labels(path).targets == {EMO_KEY_A: "<|SAD|>"}
+
+
+def test_the_file_digest_is_the_sha256_of_its_bytes(tmp_path):
+    """The labeller is re-run and overwrites the same path, so the manifest has
+    to say which revision of that path the corpus was built from."""
+    import hashlib
+
+    path = emo_labels_for(tmp_path / "emo.jsonl", {EMO_KEY_A: "<|HAPPY|>"})
+
+    labels = vn.read_emo_labels(path)
+
+    assert labels.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert labels.path == str(path)
+
+
+# --- loud failures ----------------------------------------------------------
+
+
+def test_a_missing_label_file_fails_loudly(tmp_path):
+    with pytest.raises(SystemExit) as excinfo:
+        vn.read_emo_labels(tmp_path / "absent.jsonl")
+
+    assert "--emo-labels" in str(excinfo.value)
+    assert "cannot read" in str(excinfo.value)
+
+
+def test_a_malformed_line_names_its_line_number(tmp_path):
+    path = tmp_path / "emo.jsonl"
+    path.write_text(
+        f'{{"key": "{EMO_KEY_A}", "emo_target": "<|SAD|>"}}\n'
+        f'{{"key": "{EMO_KEY_B}", "emo_target": ...\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.read_emo_labels(path)
+
+    message = str(excinfo.value)
+    assert "malformed JSON line" in message
+    # The line number, not just the file: a labeller writing 500k lines is only
+    # debuggable if the bad one is named.
+    assert f"{path}:2" in message
+
+
+def test_a_duplicate_key_is_fatal(tmp_path):
+    path = write_emo_labels(
+        tmp_path / "emo.jsonl",
+        [
+            {"key": EMO_KEY_A, "emo_target": "<|HAPPY|>"},
+            {"key": EMO_KEY_A, "emo_target": "<|SAD|>"},
+        ],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.read_emo_labels(path)
+
+    message = str(excinfo.value)
+    assert "duplicate key" in message
+    assert EMO_KEY_A in message
+
+
+def test_a_target_outside_the_eight_tokens_is_fatal(tmp_path):
+    path = emo_labels_for(tmp_path / "emo.jsonl", {EMO_KEY_A: "<|EXCITED|>"})
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.read_emo_labels(path)
+
+    message = str(excinfo.value)
+    # Both the offending key and its value, so the bad line is findable.
+    assert EMO_KEY_A in message
+    assert "<|EXCITED|>" in message
+
+
+@pytest.mark.parametrize("target", ["NEUTRAL", "<|neutral|>", "happy", ""])
+def test_a_near_miss_spelling_is_not_quietly_accepted(tmp_path, target):
+    # A token that is close but not exact would be tokenised as ordinary text
+    # and train the emotion slot on garbage, so no fuzzy matching is applied.
+    path = emo_labels_for(tmp_path / "emo.jsonl", {EMO_KEY_A: target})
+
+    with pytest.raises(SystemExit):
+        vn.read_emo_labels(path)
+
+
+def test_emo_unknown_is_rejected_by_name(tmp_path):
+    """Rejected with its own explanation, not just as "not in the list".
+
+    It is the one wrong value a well-meaning labeller will actually produce --
+    it is a real SenseVoice token and the obvious thing to emit for a clip the
+    classifier could not call -- so the error has to say what to do instead.
+    """
+    path = emo_labels_for(tmp_path / "emo.jsonl", {EMO_KEY_A: "<|EMO_UNKNOWN|>"})
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.read_emo_labels(path)
+
+    message = str(excinfo.value)
+    assert "<|EMO_UNKNOWN|>" in message
+    assert "never be a training target" in message
+    assert vn.EMO_MASK_TARGET in message
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"emo_target": "<|SAD|>"},
+        {"key": EMO_KEY_A},
+        {},
+    ],
+    ids=["no-key", "no-target", "empty"],
+)
+def test_a_line_missing_a_required_field_is_fatal(tmp_path, entry):
+    path = write_emo_labels(tmp_path / "emo.jsonl", [entry])
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.read_emo_labels(path)
+
+    assert "missing required field" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [{"key": 7, "emo_target": "<|SAD|>"}, {"key": EMO_KEY_A, "emo_target": 3}],
+    ids=["key", "emo_target"],
+)
+def test_a_non_string_field_is_fatal(tmp_path, entry):
+    path = write_emo_labels(tmp_path / "emo.jsonl", [entry])
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.read_emo_labels(path)
+
+    assert "must be a string" in str(excinfo.value)
+
+
+def test_a_json_line_that_is_not_an_object_is_fatal(tmp_path):
+    path = tmp_path / "emo.jsonl"
+    path.write_text('["Studio_A__spk0__v0", "<|SAD|>"]\n', encoding="utf-8")
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.read_emo_labels(path)
+
+    assert "expected a JSON object per line" in str(excinfo.value)
+
+
+def test_a_label_file_with_no_labels_fails_loudly(tmp_path):
+    path = tmp_path / "emo.jsonl"
+    path.write_text("\n\n   \n", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.read_emo_labels(path)
+
+    assert "holds no labels" in str(excinfo.value)
+
+
+# --- stamping the records ---------------------------------------------------
+
+
+def test_a_listed_clip_takes_the_files_target(tmp_path):
+    mapping = {EMO_KEY_A: "<|HAPPY|>", EMO_KEY_B: "<|ANGRY|>"}
+    records = emo_records(mapping)
+    labels = vn.read_emo_labels(emo_labels_for(tmp_path / "emo.jsonl", mapping))
+
+    vn.apply_emo_labels(records, labels)
+
+    assert [r["emo_target"] for r in records] == ["<|HAPPY|>", "<|ANGRY|>"]
+
+
+def test_an_unlisted_clip_is_masked_and_never_called_neutral(tmp_path):
+    """The regression this whole flag exists to prevent, at its narrowest."""
+    records = emo_records({EMO_KEY_A: "", EMO_KEY_B: ""})
+    labels = vn.read_emo_labels(
+        emo_labels_for(tmp_path / "emo.jsonl", {EMO_KEY_A: "<|SAD|>"})
+    )
+
+    vn.apply_emo_labels(records, labels)
+
+    assert records[0]["emo_target"] == "<|SAD|>"
+    assert records[1]["emo_target"] == vn.EMO_MASK_TARGET
+    assert records[1]["emo_target"] != "<|NEUTRAL|>"
+
+
+def test_an_explicitly_masked_row_matches_an_omitted_one(tmp_path):
+    """The labeller emits <|SER|> outright for a clip it could not call (its
+    'missing_masked' / 'disagree_masked' decisions), so the two spellings of
+    "no label" have to produce the same record."""
+    records = emo_records({EMO_KEY_A: "", EMO_KEY_B: ""})
+    labels = vn.read_emo_labels(
+        emo_labels_for(tmp_path / "emo.jsonl", {EMO_KEY_A: vn.EMO_MASK_TARGET})
+    )
+
+    # allow_sparse: this file labels nothing at all, which the coverage floor
+    # would otherwise refuse.  What is under test here is the stamping.
+    vn.apply_emo_labels(records, labels, allow_sparse=True)
+
+    assert records[0]["emo_target"] == records[1]["emo_target"] == vn.EMO_MASK_TARGET
+
+
+def test_an_explicit_mask_still_counts_as_a_matched_key(tmp_path):
+    # It matched a clip; it just carries no emotion.  labelled_clips, not
+    # keys_matched, is what says how much the emotion head sees.
+    mapping = {EMO_KEY_A: vn.EMO_MASK_TARGET, EMO_KEY_B: "<|SAD|>"}
+    labels = vn.read_emo_labels(emo_labels_for(tmp_path / "emo.jsonl", mapping))
+    records = emo_records(mapping)
+    vn.apply_emo_labels(records, labels)
+
+    stats = vn.build_emo_label_stats(labels, records, [])
+
+    assert stats.keys_matched == 2
+    assert stats.labelled_clips == 1
+
+
+def test_the_matched_keys_are_returned(tmp_path):
+    records = emo_records({EMO_KEY_A: "", EMO_KEY_B: ""})
+    labels = vn.read_emo_labels(
+        emo_labels_for(
+            tmp_path / "emo.jsonl",
+            {EMO_KEY_A: "<|SAD|>", "Studio_Z__ghost__v9": "<|HAPPY|>"},
+        )
+    )
+
+    assert vn.apply_emo_labels(records, labels) == {EMO_KEY_A}
+
+
+def test_stamping_keeps_the_field_in_its_schema_position(tmp_path):
+    # json.dumps preserves insertion order and the shipped examples are compared
+    # field-for-field, so the stamp must overwrite emo_target in place rather
+    # than re-adding it at the end.
+    records = emo_records({EMO_KEY_A: ""})
+    labels = vn.read_emo_labels(
+        emo_labels_for(tmp_path / "emo.jsonl", {EMO_KEY_A: "<|SURPRISED|>"})
+    )
+
+    vn.apply_emo_labels(records, labels)
+
+    assert list(records[0]) == EXPECTED_FIELDS
+
+
+def test_a_label_file_matching_nothing_is_fatal(tmp_path):
+    """Zero overlap means the labels were built against a different corpus.
+
+    Masking every clip and carrying on would produce a run that looks healthy,
+    trains no emotion head at all, and is only distinguishable from a good one
+    by reading the manifest -- exactly the silent failure mode this file's
+    other sections were written after.
+    """
+    records = emo_records({EMO_KEY_A: "", EMO_KEY_B: ""})
+    labels = vn.read_emo_labels(
+        emo_labels_for(tmp_path / "emo.jsonl", {"Other_Corpus__spk__v0": "<|SAD|>"})
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.apply_emo_labels(records, labels)
+
+    message = str(excinfo.value)
+    assert "--emo-labels" in message
+    assert "different corpus" in message
+
+
+def test_a_single_matching_clip_is_enough_to_proceed(tmp_path):
+    # The guard is against a *wholly* mismatched file; a corpus that grew since
+    # the labels were written is ordinary and must still build.
+    records = emo_records({EMO_KEY_A: "", EMO_KEY_B: ""})
+    labels = vn.read_emo_labels(
+        emo_labels_for(
+            tmp_path / "emo.jsonl", {EMO_KEY_A: "<|SAD|>", "absent__spk__v0": "<|SAD|>"}
+        )
+    )
+
+    assert vn.apply_emo_labels(records, labels) == {EMO_KEY_A}
+
+
+# --- the statistics block ---------------------------------------------------
+
+
+def emo_stats_over(tmp_path, train_targets, val_targets):
+    """An EmoLabelStats over synthetic splits carrying exactly these targets."""
+    mapping = {}
+    train, val = [], []
+    for index, target in enumerate(train_targets + val_targets):
+        key = f"T__spk{index}__v{index}"
+        record = vn.build_record(key, "あ", f"/vn/audio/T/spk{index}/v.wav", 2.0)
+        record["emo_target"] = target
+        if target != vn.EMO_MASK_TARGET:
+            mapping[key] = target
+        (train if index < len(train_targets) else val).append(record)
+    labels = vn.read_emo_labels(emo_labels_for(tmp_path / "emo.jsonl", mapping))
+    return vn.build_emo_label_stats(labels, train, val)
+
+
+def test_the_stats_count_every_target_in_each_split(tmp_path):
+    stats = emo_stats_over(
+        tmp_path,
+        ["<|HAPPY|>", "<|HAPPY|>", "<|SAD|>", vn.EMO_MASK_TARGET],
+        ["<|ANGRY|>", vn.EMO_MASK_TARGET],
+    )
+
+    block = stats.as_dict()
+    assert block["train"]["counts"]["<|HAPPY|>"] == 2
+    assert block["train"]["counts"]["<|SAD|>"] == 1
+    assert block["train"]["counts"][vn.EMO_MASK_TARGET] == 1
+    assert block["val"]["counts"]["<|ANGRY|>"] == 1
+    assert block["val"]["counts"][vn.EMO_MASK_TARGET] == 1
+    assert block["train"]["clips"] == 4
+    assert block["val"]["clips"] == 2
+
+
+def test_all_eight_targets_are_listed_even_at_zero(tmp_path):
+    # A block whose keys depend on what happened to occur cannot be diffed
+    # between two rounds, which is the one thing this block is written for.
+    stats = emo_stats_over(tmp_path, ["<|HAPPY|>"], ["<|HAPPY|>"])
+
+    block = stats.as_dict()
+    for split in ("train", "val"):
+        assert list(block[split]["counts"]) == list(vn.EMO_ALL_TARGETS)
+        assert list(block[split]["fractions"]) == list(vn.EMO_ALL_TARGETS)
+    assert block["train"]["counts"]["<|FEARFUL|>"] == 0
+
+
+def test_the_fractions_are_over_that_splits_clips(tmp_path):
+    stats = emo_stats_over(
+        tmp_path, ["<|HAPPY|>", "<|SAD|>", "<|SAD|>", "<|SAD|>"], ["<|ANGRY|>"]
+    )
+
+    block = stats.as_dict()
+    assert block["train"]["fractions"]["<|SAD|>"] == 0.75
+    assert block["train"]["fractions"]["<|HAPPY|>"] == 0.25
+    assert block["val"]["fractions"]["<|ANGRY|>"] == 1.0
+    assert sum(block["train"]["fractions"].values()) == pytest.approx(1.0)
+
+
+def test_the_masked_clips_are_excluded_from_labelled_clips(tmp_path):
+    stats = emo_stats_over(
+        tmp_path, ["<|HAPPY|>", vn.EMO_MASK_TARGET, vn.EMO_MASK_TARGET], ["<|SAD|>"]
+    )
+
+    block = stats.as_dict()
+    assert block["train"]["labelled_clips"] == 1
+    assert block["val"]["labelled_clips"] == 1
+    assert stats.labelled_clips == 2
+
+
+def test_keys_that_matched_nothing_are_counted(tmp_path):
+    mapping = {EMO_KEY_A: "<|SAD|>", "gone__spk__v0": "<|HAPPY|>"}
+    labels = vn.read_emo_labels(emo_labels_for(tmp_path / "emo.jsonl", mapping))
+    records = emo_records({EMO_KEY_A: ""})
+    vn.apply_emo_labels(records, labels)
+
+    stats = vn.build_emo_label_stats(labels, records, [])
+
+    block = stats.as_dict()
+    assert block["keys_in_file"] == 2
+    assert block["keys_matched"] == 1
+    assert block["keys_matched_nothing"] == 1
+
+
+def test_the_stats_record_the_file_and_its_digest(tmp_path):
+    path = emo_labels_for(tmp_path / "emo.jsonl", {EMO_KEY_A: "<|SAD|>"})
+    labels = vn.read_emo_labels(path)
+    records = emo_records({EMO_KEY_A: ""})
+    vn.apply_emo_labels(records, labels)
+
+    block = vn.build_emo_label_stats(labels, records, []).as_dict()
+
+    assert block["labels_file"] == str(path)
+    assert block["labels_sha256"] == labels.sha256
+    assert block["mask_target"] == vn.EMO_MASK_TARGET
+
+
+# --- the degenerate-distribution warning ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "happy,others,degenerate",
+    [
+        # The bound is EMO_DEGENERATE_FRACTION (0.9) and it is EXCLUSIVE: 90/100
+        # is the documented ceiling of an acceptable skew, 91/100 is over it.
+        (90, 10, False),
+        (91, 9, True),
+        (100, 0, True),
+        (50, 50, False),
+    ],
+)
+def test_the_warning_bound_is_exclusive(tmp_path, happy, others, degenerate):
+    stats = emo_stats_over(
+        tmp_path, ["<|HAPPY|>"] * happy + ["<|SAD|>"] * others, ["<|SAD|>"] * 0
+    )
+
+    dominant = stats.dominant_label()
+
+    assert (dominant is not None) is degenerate
+    if degenerate:
+        assert dominant[0] == "<|HAPPY|>"
+
+
+def test_the_mask_cannot_hide_a_constant_emotion(tmp_path):
+    """Measured over the labelled clips only.
+
+    100 masked clips beside 10 targets that are all <|HAPPY|> is 9% of the
+    corpus but 100% of what the emotion head sees, which is the collapse.
+    """
+    stats = emo_stats_over(
+        tmp_path, ["<|HAPPY|>"] * 10 + [vn.EMO_MASK_TARGET] * 100, []
+    )
+
+    assert stats.dominant_label() == ("<|HAPPY|>", 1.0)
+
+
+def test_a_wholly_masked_corpus_reports_no_dominant_label(tmp_path):
+    # Nothing to be degenerate about, and the fraction would divide by zero.
+    labels = vn.read_emo_labels(
+        emo_labels_for(tmp_path / "emo.jsonl", {EMO_KEY_A: "<|SAD|>"})
+    )
+    masked = emo_records({EMO_KEY_B: ""})
+    vn.apply_emo_labels(masked + emo_records({EMO_KEY_A: ""}), labels)
+
+    stats = vn.build_emo_label_stats(labels, masked, [])
+
+    assert stats.labelled_clips == 0
+    assert stats.dominant_label() is None
+
+
+def test_the_warning_names_the_collapse_it_is_guarding_against(capsys, tmp_path):
+    stats = emo_stats_over(tmp_path, ["<|HAPPY|>"] * 95 + ["<|SAD|>"] * 5, [])
+
+    vn.log_emo_label_report(stats)
+
+    out = capsys.readouterr().out
+    assert "WARNING: degenerate emotion distribution" in out
+    assert "<|HAPPY|> covers 95.0%" in out
+    assert "collapsed the emotion head" in out
+
+
+def test_no_warning_for_a_healthy_distribution(capsys, tmp_path):
+    stats = emo_stats_over(tmp_path, ["<|HAPPY|>"] * 5 + ["<|SAD|>"] * 5, [])
+
+    vn.log_emo_label_report(stats)
+
+    out = capsys.readouterr().out
+    assert "degenerate" not in out
+    assert "<|HAPPY|> 5 (50.0%)" in out
+
+
+# --- the CLI ----------------------------------------------------------------
+
+
+def test_emo_labels_defaults_to_none_so_the_flag_is_opt_in():
+    assert vn.parse_args([]).emo_labels is None
+
+
+def test_emo_labels_is_parsed_as_a_path():
+    assert vn.parse_args(["--emo-labels", "e.jsonl"]).emo_labels == Path("e.jsonl")
+
+
+def test_the_label_file_is_read_before_any_download(monkeypatch):
+    # Fail-fast, like the pin file and the basename guard: a typo'd path must
+    # cost nothing, not surface after the corpus has been fetched and converted.
+    def explode(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("download attempted despite an unreadable label file")
+
+    monkeypatch.setattr(vn, "download_all", explode)
+    monkeypatch.setattr(vn, "read_hf_token", explode)
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.main(["--emo-labels", "/nonexistent/emo.jsonl"])
+
+    assert "--emo-labels" in str(excinfo.value)
+
+
+# --- the manifest -----------------------------------------------------------
+
+
+def test_a_default_run_records_no_emotion_stats_in_the_manifest():
+    # An unlabelled run's manifest.json must be byte-for-byte what it was before
+    # the flag existed, so round 2's manifests stay reproducible.
+    records = corpus()
+    train, val = vn.split_by_speaker(records, 0.2, seed=0)
+    stats = vn.FilterStats(index_entries=len(records), kept=len(records))
+
+    manifest = vn.build_manifest(vn.parse_args([]), {}, stats, train, val, 0)
+
+    assert "emo_label_stats" not in manifest
+
+
+def test_a_labelled_run_records_the_stats_in_the_manifest(tmp_path):
+    records = corpus()
+    train, val = vn.split_by_speaker(records, 0.2, seed=0)
+    labels = vn.read_emo_labels(
+        emo_labels_for(
+            tmp_path / "emo.jsonl", {record["key"]: "<|SAD|>" for record in train[:3]}
+        )
+    )
+    vn.apply_emo_labels(records, labels)
+    emo_stats = vn.build_emo_label_stats(labels, train, val)
+    stats = vn.FilterStats(index_entries=len(records), kept=len(records))
+
+    manifest = vn.build_manifest(
+        vn.parse_args([]), {}, stats, train, val, 0, emo_stats=emo_stats
+    )
+
+    block = manifest["emo_label_stats"]
+    assert block["keys_in_file"] == 3
+    assert block["keys_matched"] == 3
+    assert block["train"]["counts"]["<|SAD|>"] == 3
+    assert block["val"]["counts"][vn.EMO_MASK_TARGET] == len(val)
+
+
+# --- end to end over a synthesised corpus -----------------------------------
+
+
+@requires_soundfile
+def test_without_the_flag_every_clip_is_still_neutral(tmp_path, monkeypatch):
+    """The round-2 reproducibility pin, taken through main().
+
+    The existing corpus was built with a hardcoded <|NEUTRAL|> on every record.
+    Nothing added for --emo-labels may perturb that path.
+    """
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+
+    assert vn.main(manifest_only_argv(tmp_path)) == 0
+
+    assert all_emo_targets(tmp_path / "train.jsonl") == {"<|NEUTRAL|>"}
+    assert all_emo_targets(tmp_path / "val.jsonl") <= {"<|NEUTRAL|>"}
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert "emo_label_stats" not in manifest
+
+
+@requires_soundfile
+def test_labelled_clips_take_their_target_and_the_rest_are_masked(
+    tmp_path, monkeypatch
+):
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+    labelled = {
+        "Studio_A__spk0__v0": "<|HAPPY|>",
+        "Studio_A__spk0__v1": "<|SAD|>",
+        "Studio_B__spk2__v3": "<|ANGRY|>",
+    }
+    path = emo_labels_for(tmp_path / "emo.jsonl", labelled)
+
+    assert vn.main(manifest_only_argv(tmp_path, "--emo-labels", str(path))) == 0
+
+    written = read_jsonl(tmp_path / "train.jsonl") + read_jsonl(tmp_path / "val.jsonl")
+    by_key = {record["key"]: record["emo_target"] for record in written}
+    for key, target in labelled.items():
+        assert by_key[key] == target
+    unlabelled = set(by_key) - set(labelled)
+    assert unlabelled  # otherwise the mask assertion below is vacuous
+    assert {by_key[key] for key in unlabelled} == {"<|SER|>"}
+
+
+@requires_soundfile
+def test_the_manifest_stats_reconcile_with_the_written_files(tmp_path, monkeypatch):
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+    path = emo_labels_for(
+        tmp_path / "emo.jsonl",
+        {"Studio_A__spk0__v0": "<|HAPPY|>", "Studio_B__spk1__v2": "<|SAD|>"},
+    )
+
+    vn.main(manifest_only_argv(tmp_path, "--emo-labels", str(path)))
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    block = manifest["emo_label_stats"]
+    assert block["labels_file"] == str(path)
+    assert block["keys_in_file"] == 2
+    assert block["train"]["clips"] == manifest["totals"]["train_clips"]
+    assert block["val"]["clips"] == manifest["totals"]["val_clips"]
+    # Every clip is accounted for by exactly one of the eight targets.
+    for split in ("train", "val"):
+        assert sum(block[split]["counts"].values()) == block[split]["clips"]
+    assert block["keys_matched"] + block["keys_matched_nothing"] == 2
+
+
+@requires_soundfile
+def test_the_run_prints_the_emotion_summary(tmp_path, monkeypatch, capsys):
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+    # 6 of the fixture's 24 clips: 25%, comfortably over the coverage floor.
+    path = emo_labels_for(
+        tmp_path / "emo.jsonl",
+        {f"Studio_A__spk0__v{index}": "<|HAPPY|>" for index in range(4)}
+        | {f"Studio_B__spk1__v{index}": "<|SAD|>" for index in range(2)},
+    )
+
+    vn.main(manifest_only_argv(tmp_path, "--emo-labels", str(path)))
+
+    out = capsys.readouterr().out
+    assert "emo     :" in out
+    assert "6 keys" in out
+    assert "<|SER|>" in out
+    # The number an operator needs before submitting a training job, on its own
+    # line: keys_matched counts explicitly-masked rows too, labelled_clips does
+    # not.
+    assert "labelled 6 of 24 clips (25.0%)" in out
+
+
+@requires_soundfile
+def test_a_degenerate_corpus_is_called_out_at_the_end_of_the_run(
+    tmp_path, monkeypatch, capsys
+):
+    """22 of 24 clips labelled <|HAPPY|> is 91.7% -- over the 90% bound."""
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+    vn.main(manifest_only_argv(tmp_path))
+    keys = [
+        record["key"]
+        for record in read_jsonl(tmp_path / "train.jsonl")
+        + read_jsonl(tmp_path / "val.jsonl")
+    ]
+    mapping = {key: "<|HAPPY|>" for key in keys[:22]}
+    mapping.update({key: "<|SAD|>" for key in keys[22:24]})
+    path = emo_labels_for(tmp_path / "emo.jsonl", mapping)
+    capsys.readouterr()
+
+    vn.main(manifest_only_argv(tmp_path, "--emo-labels", str(path)))
+
+    assert "WARNING: degenerate emotion distribution" in capsys.readouterr().out
+
+
+@requires_soundfile
+def test_a_balanced_corpus_raises_no_warning(tmp_path, monkeypatch, capsys):
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+    vn.main(manifest_only_argv(tmp_path))
+    keys = [
+        record["key"]
+        for record in read_jsonl(tmp_path / "train.jsonl")
+        + read_jsonl(tmp_path / "val.jsonl")
+    ]
+    mapping = {key: "<|HAPPY|>" for key in keys[:12]}
+    mapping.update({key: "<|SAD|>" for key in keys[12:24]})
+    path = emo_labels_for(tmp_path / "emo.jsonl", mapping)
+    capsys.readouterr()
+
+    vn.main(manifest_only_argv(tmp_path, "--emo-labels", str(path)))
+
+    assert "degenerate" not in capsys.readouterr().out
+
+
+@requires_soundfile
+def test_a_label_file_for_another_corpus_stops_the_run(tmp_path, monkeypatch):
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+    path = emo_labels_for(
+        tmp_path / "emo.jsonl", {"Some_Other_Title__spk0__v0": "<|HAPPY|>"}
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.main(manifest_only_argv(tmp_path, "--emo-labels", str(path)))
+
+    assert "different corpus" in str(excinfo.value)
+
+
+# --- interaction with --pin-val-keys ----------------------------------------
+
+
+@requires_soundfile
+def test_emotion_labels_compose_with_a_pinned_val_split(tmp_path, monkeypatch):
+    """Round 3 is exactly this: both flags, one invocation.
+
+    The two features touch different fields -- pinning decides *which* clips are
+    val, labelling decides what each clip's emo_target is -- and neither may
+    disturb the other.
+    """
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+    vn.main(manifest_only_argv(tmp_path))
+    pinned = [record["key"] for record in read_jsonl(tmp_path / "val.jsonl")]
+    pins = tmp_path / "pins.txt"
+    pins.write_text("".join(f"{key}\n" for key in pinned), encoding="utf-8")
+    keys = [record["key"] for record in read_jsonl(tmp_path / "train.jsonl")] + pinned
+    path = emo_labels_for(
+        tmp_path / "emo.jsonl",
+        {key: ("<|HAPPY|>" if index % 2 else "<|SAD|>") for index, key in
+         enumerate(keys)},
+    )
+
+    vn.main(
+        manifest_only_argv(
+            tmp_path, "--pin-val-keys", str(pins), "--emo-labels", str(path)
+        )
+    )
+
+    val = read_jsonl(tmp_path / "val.jsonl")
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    block = manifest["emo_label_stats"]
+    # The pin is untouched by the labelling: val is still exactly the pinned set.
+    assert [record["key"] for record in val] == sorted(pinned)
+    # And the per-split stats add up to the corpus the manifest describes.
+    assert block["train"]["clips"] + block["val"]["clips"] == manifest["totals"]["clips"]
+    assert block["train"]["clips"] == manifest["totals"]["train_clips"]
+    assert block["val"]["clips"] == manifest["totals"]["val_clips"]
+    assert block["val"]["labelled_clips"] == len(pinned)
+    assert manifest["val_pin"]["keys_found"] == len(pinned)
+
+
+@requires_soundfile
+def test_a_pinned_val_clip_keeps_its_own_label(tmp_path, monkeypatch):
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+    vn.main(manifest_only_argv(tmp_path))
+    pinned = [record["key"] for record in read_jsonl(tmp_path / "val.jsonl")]
+    pins = tmp_path / "pins.txt"
+    pins.write_text("".join(f"{key}\n" for key in pinned), encoding="utf-8")
+    # Only the first pinned clip is labelled; the rest of val must be masked.
+    # One clip of 24 is under the coverage floor, so this is also the end-to-end
+    # exercise of the deliberate override.
+    path = emo_labels_for(tmp_path / "emo.jsonl", {pinned[0]: "<|FEARFUL|>"})
+
+    vn.main(
+        manifest_only_argv(
+            tmp_path,
+            "--pin-val-keys",
+            str(pins),
+            "--emo-labels",
+            str(path),
+            "--allow-sparse-emo-labels",
+        )
+    )
+
+    val = {r["key"]: r["emo_target"] for r in read_jsonl(tmp_path / "val.jsonl")}
+    assert val[pinned[0]] == "<|FEARFUL|>"
+    assert set(val.values()) - {"<|FEARFUL|>"} <= {"<|SER|>"}
+
+
+# --- the coverage floor -----------------------------------------------------
+#
+# Zero overlap is a typo and is caught above.  This is the other half, and the
+# likelier accident: a label file that matches *almost* nothing -- a labelling
+# job interrupted a few thousand clips in, or a merge of audio and text labels
+# taken over different --sample/--seed slices.  Every unmatched clip is masked,
+# the run completes, the manifest reports it accurately, and the emotion head
+# trains on essentially nothing.  The cost of noticing late is a finished
+# two-day training run.
+
+
+def emo_corpus(count, labelled, tmp_path, target="<|HAPPY|>"):
+    """``count`` records of which the first ``labelled`` carry a real emotion."""
+    mapping = {f"T__spk{index}__v{index}": "" for index in range(count)}
+    records = emo_records(mapping)
+    labels = vn.read_emo_labels(
+        emo_labels_for(
+            tmp_path / "emo.jsonl",
+            {key: target for key in list(mapping)[:labelled]},
+        )
+    )
+    return records, labels
+
+
+def test_the_coverage_floor_is_five_percent():
+    # Well beneath the training plan's own gate ("usable labels >= 15% of
+    # train"), so this is a floor against a broken file, not a second opinion
+    # on that gate.  Raising it to argue about label quality would be a
+    # different decision, taken elsewhere.
+    assert vn.EMO_MIN_LABELLED_FRACTION == 0.05
+
+
+@pytest.mark.parametrize(
+    "labelled,accepted",
+    [
+        # The bound is EMO_MIN_LABELLED_FRACTION (0.05) over the kept corpus and
+        # it is INCLUSIVE: 5/100 is exactly the floor and passes, 4/100 is below
+        # it and does not.
+        (5, True),
+        (4, False),
+        (1, False),
+        (100, True),
+    ],
+)
+def test_the_floor_is_an_inclusive_bound(tmp_path, labelled, accepted):
+    records, labels = emo_corpus(100, labelled, tmp_path)
+
+    if accepted:
+        assert vn.apply_emo_labels(records, labels)
+    else:
+        with pytest.raises(SystemExit):
+            vn.apply_emo_labels(records, labels)
+
+
+def test_a_nearly_empty_label_file_is_fatal(tmp_path):
+    """The finding this section was added for: 0.04% coverage used to pass."""
+    records, labels = emo_corpus(5000, 2, tmp_path)
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.apply_emo_labels(records, labels)
+
+    message = str(excinfo.value)
+    assert "2 of this corpus's 5000 clips" in message
+    assert "0.04%" in message
+
+
+def test_the_floor_error_names_the_likely_causes(tmp_path):
+    """A fraction alone does not tell an operator what to go and look at."""
+    records, labels = emo_corpus(1000, 1, tmp_path)
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.apply_emo_labels(records, labels)
+
+    message = str(excinfo.value)
+    assert "interrupted" in message
+    assert "--sample/--seed" in message
+    assert "--allow-sparse-emo-labels" in message
+
+
+def test_a_wholly_masked_file_is_caught_by_the_floor(tmp_path):
+    """Matching every key while labelling nothing clears the zero-overlap check.
+
+    The floor is what stops it: coverage is measured in clips that came out
+    carrying an emotion, not in keys that found a home.
+    """
+    mapping = {f"T__spk{i}__v{i}": vn.EMO_MASK_TARGET for i in range(20)}
+    records = emo_records(mapping)
+    labels = vn.read_emo_labels(emo_labels_for(tmp_path / "emo.jsonl", mapping))
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.apply_emo_labels(records, labels)
+
+    assert "0 of this corpus's 20 clips (0.00%)" in str(excinfo.value)
+
+
+def test_the_override_permits_a_deliberate_pilot(tmp_path):
+    # A pilot labelling run over a slice of a large corpus is legitimate and
+    # must be expressible without editing the source.
+    records, labels = emo_corpus(5000, 2, tmp_path)
+
+    assert len(vn.apply_emo_labels(records, labels, allow_sparse=True)) == 2
+    assert records[0]["emo_target"] == "<|HAPPY|>"
+    assert records[99]["emo_target"] == vn.EMO_MASK_TARGET
+
+
+def test_the_override_does_not_excuse_a_mismatched_corpus(tmp_path):
+    """Sparse is a judgement call; zero overlap is still a broken input."""
+    records = emo_records({EMO_KEY_A: "", EMO_KEY_B: ""})
+    labels = vn.read_emo_labels(
+        emo_labels_for(tmp_path / "emo.jsonl", {"Other__spk__v0": "<|SAD|>"})
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.apply_emo_labels(records, labels, allow_sparse=True)
+
+    assert "different corpus" in str(excinfo.value)
+
+
+# --- the override on the CLI and in the manifest ----------------------------
+
+
+def test_allow_sparse_emo_labels_defaults_to_off():
+    assert vn.parse_args([]).allow_sparse_emo_labels is False
+
+
+def test_allow_sparse_emo_labels_is_a_flag():
+    args = vn.parse_args(["--emo-labels", "e.jsonl", "--allow-sparse-emo-labels"])
+    assert args.allow_sparse_emo_labels is True
+
+
+def test_the_override_without_the_labels_flag_is_an_error(monkeypatch):
+    # Rejected rather than ignored, like --list-format and
+    # --kana-only-title-threshold: an override that silently did nothing would
+    # read as a corpus admitted under a relaxed floor when no floor was ever
+    # consulted.
+    def explode(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("the run proceeded past argument validation")
+
+    monkeypatch.setattr(vn, "download_all", explode)
+    monkeypatch.setattr(vn, "read_hf_token", explode)
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.main(["--allow-sparse-emo-labels"])
+
+    assert "--allow-sparse-emo-labels only applies to --emo-labels" in str(
+        excinfo.value
+    )
+
+
+def test_the_manifest_records_the_floor_and_whether_it_was_overridden(tmp_path):
+    records, labels = emo_corpus(100, 2, tmp_path)
+    vn.apply_emo_labels(records, labels, allow_sparse=True)
+
+    block = vn.build_emo_label_stats(
+        labels, records, [], sparse_override=True
+    ).as_dict()
+
+    # A corpus built under the override is otherwise indistinguishable from one
+    # that cleared the floor honestly, and "why did round 3 learn no emotion"
+    # is answered here or not at all.
+    assert block["sparse_override"] is True
+    assert block["min_labelled_fraction"] == vn.EMO_MIN_LABELLED_FRACTION
+    assert block["labelled_clips"] == 2
+    assert block["labelled_fraction"] == 0.02
+
+
+def test_an_ordinary_run_records_no_override(tmp_path):
+    records, labels = emo_corpus(20, 10, tmp_path)
+    vn.apply_emo_labels(records, labels)
+
+    block = vn.build_emo_label_stats(labels, records, []).as_dict()
+
+    assert block["sparse_override"] is False
+    assert block["labelled_fraction"] == 0.5
+
+
+# --- the summary line an operator reads -------------------------------------
+
+
+def test_the_summary_states_labelled_of_total(capsys, tmp_path):
+    stats = emo_stats_over(
+        tmp_path, ["<|HAPPY|>", "<|SAD|>"] + [vn.EMO_MASK_TARGET] * 6, ["<|SAD|>"]
+    )
+
+    vn.log_emo_label_report(stats)
+
+    out = capsys.readouterr().out
+    assert "labelled 3 of 9 clips (33.3%)" in out
+
+
+def test_the_summary_says_when_the_floor_was_overridden(capsys, tmp_path):
+    stats = emo_stats_over(tmp_path, ["<|HAPPY|>"] + [vn.EMO_MASK_TARGET] * 99, [])
+    stats.sparse_override = True
+
+    vn.log_emo_label_report(stats)
+
+    assert "--allow-sparse-emo-labels was passed" in capsys.readouterr().out
+
+
+def test_an_ordinary_run_does_not_mention_the_override(capsys, tmp_path):
+    stats = emo_stats_over(tmp_path, ["<|HAPPY|>", "<|SAD|>"], [])
+
+    vn.log_emo_label_report(stats)
+
+    assert "allow-sparse" not in capsys.readouterr().out
+
+
+# --- defence in depth: the tally trusts nothing -----------------------------
+
+
+def test_a_target_outside_the_eight_is_refused_by_the_tally(tmp_path):
+    """Unreachable while apply_emo_labels is the only writer -- and raised anyway.
+
+    ``_split_block`` sums the eight known targets, so an unknown one would drop
+    out of ``clips`` silently and hand the operator an under-count that still
+    adds up on its face.  That is the exact shape of failure this block exists
+    to prevent, and "unreachable" has a poor record in this script: the
+    54,420-clip loss above was also an assumption that held for most inputs.
+    """
+    labels = vn.read_emo_labels(
+        emo_labels_for(tmp_path / "emo.jsonl", {EMO_KEY_A: "<|SAD|>"})
+    )
+    records = emo_records({EMO_KEY_A: ""})
+    vn.apply_emo_labels(records, labels)
+    records[0]["emo_target"] = "<|EMO_UNKNOWN|>"
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.build_emo_label_stats(labels, records, [])
+
+    message = str(excinfo.value)
+    assert EMO_KEY_A in message
+    assert "<|EMO_UNKNOWN|>" in message
+
+
+# --- end to end -------------------------------------------------------------
+
+
+@requires_soundfile
+def test_a_sparse_label_file_stops_the_run(tmp_path, monkeypatch):
+    """1 of 24 clips is 4.2%, under the floor -- the run must not complete."""
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+    path = emo_labels_for(tmp_path / "emo.jsonl", {"Studio_A__spk0__v0": "<|HAPPY|>"})
+
+    with pytest.raises(SystemExit) as excinfo:
+        vn.main(manifest_only_argv(tmp_path, "--emo-labels", str(path)))
+
+    assert "1 of this corpus's 24 clips (4.17%)" in str(excinfo.value)
+
+
+@requires_soundfile
+def test_the_sparse_run_writes_no_manifest(tmp_path, monkeypatch):
+    # It must refuse before overwriting a good manifest, exactly as the empty
+    # corpus check does.
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+    path = emo_labels_for(tmp_path / "emo.jsonl", {"Studio_A__spk0__v0": "<|HAPPY|>"})
+
+    with pytest.raises(SystemExit):
+        vn.main(manifest_only_argv(tmp_path, "--emo-labels", str(path)))
+
+    assert not (tmp_path / "manifest.json").exists()
+
+
+@requires_soundfile
+def test_the_override_lets_the_sparse_run_through_and_says_so(
+    tmp_path, monkeypatch, capsys
+):
+    build_pruned_corpus(tmp_path)
+    forbid_acquisition(monkeypatch)
+    path = emo_labels_for(tmp_path / "emo.jsonl", {"Studio_A__spk0__v0": "<|HAPPY|>"})
+
+    assert (
+        vn.main(
+            manifest_only_argv(
+                tmp_path, "--emo-labels", str(path), "--allow-sparse-emo-labels"
+            )
+        )
+        == 0
+    )
+
+    out = capsys.readouterr().out
+    assert "labelled 1 of 24 clips (4.2%)" in out
+    assert "--allow-sparse-emo-labels was passed" in out
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["emo_label_stats"]["sparse_override"] is True
+
+
+# --- --help must actually render --------------------------------------------
+
+
+def test_the_help_text_renders():
+    """argparse %-formats every help string to expand %(default)s, so a literal
+    per-cent sign in one raises TypeError at --help time and nowhere else.
+
+    Caught in review only because --help was run by hand: parse_args() never
+    formats help, so the CLI-surface test above passes over the bug entirely.
+    A percentage in a help string is natural to write here -- the thresholds
+    are all fractions -- so this renders the whole parser once.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        vn.parse_args(["--help"])
+
+    assert excinfo.value.code == 0
+
+
+def test_the_help_text_states_the_coverage_floor(capsys):
+    with pytest.raises(SystemExit):
+        vn.parse_args(["--help"])
+
+    # Rendered as literal per-cent signs, not swallowed as format specs.  Asserted
+    # on the unwrapped source rather than the output, because argparse rewraps
+    # the paragraph to the terminal width and splits "95%" from "of the corpus".
+    out = " ".join(capsys.readouterr().out.split())
+
+    assert "fewer than 5% of clips carry a real emotion" in out
+    assert "leaves more than 95% of the corpus unlabelled" in out
