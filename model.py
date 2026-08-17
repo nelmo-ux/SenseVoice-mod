@@ -1,4 +1,5 @@
 
+import logging
 import time
 import torch
 from torch import nn
@@ -1055,6 +1056,40 @@ class SenseVoiceEncoderSmall(nn.Module):
         return xs_pad, cache
 
 
+# Token id of ``<|SER|>`` in chn_jpn_yue_eng_ko_spectok.bpe.model.  ``scripts/prepare_vn_data.py``
+# writes this sentinel into the emotion slot of clips that carry no emotion label, because the
+# manifest holds *strings* and the funasr dataset layer cannot inject ``ignore_id`` (-1).  It is
+# never a legitimate training target under any configuration, which is what makes it safe to
+# hardcode as a guard below.
+SER_TOKEN_ID = 24991
+
+
+def _optional_scalar(name, value, cast, default=None):
+    """Coerce an optional scalar coming from a YAML/hydra config.
+
+    Hydra overrides such as ``++model_conf.emo_mask_token_id=24991`` arrive as
+    strings, and configs written before the option existed omit the key
+    entirely.  ``None``, the empty string and ``"none"``/``"null"`` all mean
+    "unset" and yield ``default``.
+
+    ``name`` is only used to name the offending option in error messages.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        # bool is a subclass of int, so True would silently coerce to 1 -- a
+        # perfectly valid-looking token id.  Refuse rather than guess.
+        raise ValueError(f"{name} must be a number or a string, got the boolean {value!r}")
+    if isinstance(value, str):
+        value = value.strip()
+        if value == "" or value.lower() in ("none", "null"):
+            return default
+    try:
+        return cast(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{name} could not be read as {cast.__name__}: {value!r}") from e
+
+
 @tables.register("model_classes", "SenseVoiceSmall")
 class SenseVoiceSmall(nn.Module):
     """CTC-attention hybrid Encoder-Decoder model"""
@@ -1115,7 +1150,35 @@ class SenseVoiceSmall(nn.Module):
         self.textnorm_int_dict = {25016: 14, 25017: 15}
         self.embed = torch.nn.Embedding(7 + len(self.lid_dict) + len(self.textnorm_dict), input_size)
         self.emo_dict = {"unk": 25009, "happy": 25001, "sad": 25002, "angry": 25003, "neutral": 25004}
-        
+
+        # Emotion-slot masking.  ``scripts/prepare_vn_data.py`` writes *strings* into
+        # the manifest and the funasr dataset layer tokenises them, so it cannot inject
+        # ``ignore_id`` (-1) for utterances that carry no emotion label; it writes the
+        # ``<|SER|>`` sentinel (single token, id 24991) instead.  The mapping to
+        # ``ignore_id`` therefore happens here, right before the rich CE loss.  It always
+        # removes the slot from LabelSmoothingLoss' numerator and blocks the gradient
+        # through it; it additionally removes the slot from the *denominator* only when
+        # ``length_normalized_loss`` is true (see LabelSmoothingLoss.forward:
+        # ``denom = total if self.normalize_length else batch_size``).  The shipped
+        # models/SenseVoiceSmall/config.yaml sets it to true.  ``None`` (the default)
+        # keeps the original behaviour.
+        self.emo_mask_token_id = _optional_scalar(
+            "emo_mask_token_id", kwargs.get("emo_mask_token_id", None), int
+        )
+        self.rich_loss_weight = _optional_scalar(
+            "rich_loss_weight", kwargs.get("rich_loss_weight", 1.0), float, 1.0
+        )
+        # Log the *resolved* values once at startup.  funasr builds model_conf as
+        # ``deep_update(model_conf, kwargs.get("model_conf", {}))`` followed by
+        # ``deep_update(model_conf, kwargs)`` (funasr/auto/auto_model.py:615-618), so a
+        # stray top-level key silently overrides the model_conf entry.  The model cannot
+        # defend against that, but it can record what it actually received.
+        logging.info(
+            f"SenseVoiceSmall rich-loss config: emo_mask_token_id={self.emo_mask_token_id}, "
+            f"rich_loss_weight={self.rich_loss_weight}, "
+            f"length_normalized_loss={self.length_normalized_loss}"
+        )
+
         self.criterion_att = LabelSmoothingLoss(
             size=self.vocab_size,
             padding_idx=self.ignore_id,
@@ -1165,16 +1228,50 @@ class SenseVoiceSmall(nn.Module):
             encoder_out[:, 4:, :], encoder_out_lens - 4, text[:, 4:], text_lengths - 4
         )
 
-        loss_rich, acc_rich = self._calc_rich_ce_loss(
-            encoder_out[:, :4, :], text[:, :4]
+        # text[:, :4] is [language, emotion, event, textnorm] (funasr assembles it as
+        # lid + emo + event + itn in datasets/sense_voice_datasets/datasets.py:408).
+        rich_target = text[:, :4]
+        if self.emo_mask_token_id is None:
+            # Misconfiguration guard: a manifest built with --emo-labels puts <|SER|> in
+            # the emotion slot of every unlabelled clip.  Left unmasked it becomes the
+            # majority target, acc_emo climbs towards the sentinel's share of the data and
+            # *looks* healthy while the emotion head learns only to emit <|SER|>.  Nothing
+            # else cross-checks the manifest against the training flags, so fail loudly at
+            # step 1 instead of after two days of GPU time.  An old-style manifest never
+            # contains this id, so the check is inert for pre-existing configs.
+            if bool((text[:, 1] == SER_TOKEN_ID).any()):
+                raise RuntimeError(
+                    f"The emotion slot (text[:, 1]) of this batch contains <|SER|> "
+                    f"(token id {SER_TOKEN_ID}), the 'no emotion label' sentinel written by "
+                    f"scripts/prepare_vn_data.py --emo-labels, but emo_mask_token_id is unset. "
+                    f"Training would fit {SER_TOKEN_ID} as a real emotion class and acc_emo "
+                    f"would look healthy while the emotion head learns nothing. Fix: set "
+                    f"EMO_MASK_TOKEN_ID={SER_TOKEN_ID} for the training job, or pass "
+                    f"++model_conf.emo_mask_token_id={SER_TOKEN_ID} directly. <|SER|> is never "
+                    f"a legitimate training target."
+                )
+        else:
+            # text is also consumed by the CTC branch above, so mask on a copy.
+            rich_target = rich_target.clone()
+            emo_slot = rich_target[:, 1]
+            emo_slot.masked_fill_(emo_slot == self.emo_mask_token_id, self.ignore_id)
+
+        loss_rich, acc_rich, acc_emo = self._calc_rich_ce_loss(
+            encoder_out[:, :4, :], rich_target
         )
 
-        loss = loss_ctc + loss_rich
+        # Note: under length_normalized_loss, masking shrinks the rich-loss denominator
+        # while the language/event/textnorm slots stay, so those three slots carry a
+        # slightly larger share of loss_rich -- about 1.03x at the expected mask rate.
+        # Small and accepted, but it is a real consequence of masking, not a bug.
+        loss = loss_ctc + self.rich_loss_weight * loss_rich
         # Collect total loss stats
         stats["loss_ctc"] = torch.clone(loss_ctc.detach()) if loss_ctc is not None else None
+        # loss_rich is reported *unweighted* so it stays comparable across rich_loss_weight settings.
         stats["loss_rich"] = torch.clone(loss_rich.detach()) if loss_rich is not None else None
         stats["loss"] = torch.clone(loss.detach()) if loss is not None else None
         stats["acc_rich"] = acc_rich
+        stats["acc_emo"] = acc_emo
 
         # force_gatherable: to-device and to-tensor if scalar for DataParallel
         if self.length_normalized_loss:
@@ -1252,8 +1349,24 @@ class SenseVoiceSmall(nn.Module):
             ys_pad.contiguous(),
             ignore_label=self.ignore_id,
         )
+        # Accuracy of the emotion slot (index 1) on its own.  th_accuracy divides by the
+        # number of non-ignored targets, so a fully masked batch would raise; report
+        # ``None`` for that step rather than NaN.  Both trainers drop None-valued stats
+        # (``stats = {k: v for k, v in stats.items() if v is not None}``,
+        # train_utils/trainer.py:427 and :604, train_utils/trainer_ds.py:732) before
+        # logging them, so the metric is simply absent for that step instead of
+        # emitting a NaN into the log line and the TensorBoard series.  This matches
+        # how loss_ctc / loss_rich already signal "not computed".
+        if bool((ys_pad[:, 1] != self.ignore_id).any()):
+            acc_emo = th_accuracy(
+                decoder_out[:, 1, :].contiguous(),
+                ys_pad[:, 1:2].contiguous(),
+                ignore_label=self.ignore_id,
+            )
+        else:
+            acc_emo = None
 
-        return loss_rich, acc_rich
+        return loss_rich, acc_rich, acc_emo
 
 
     def inference(
