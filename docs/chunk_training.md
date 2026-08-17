@@ -615,6 +615,150 @@ reader nothing. `finetune_chunk_slurm.sh` fails in preflight — through the sam
 `FAIL:` path and job-status sentinel as every other check — if the placeholders
 are still unedited, rather than letting you discover it after a queue wait.
 
+## Round 2 — 814 hours, and the first strictly comparable comparison
+
+> Status: **run completed.** Chunk CER 0.1623 on the same 5,194 clips round 1
+> was scored on, down from 0.1679.
+
+Every quality comparison up to this point had a caveat attached: the MPS
+baseline and the 300 h cluster run were scored on different val sets, so the
+numbers were directional at best. Round 2 removes the caveat.
+
+### Pinning the val set
+
+`--pin-val-keys FILE` takes a list of manifest `key` values and makes the val
+set **exactly** those clips, holding their speakers out of train. Round 2 was
+built with round 1's 5,194 val keys pinned, so `val.jsonl` came out with the
+identical sha256 (`a4e3167e…`) as round 1's. The two runs are scored on the same
+bytes, and round 1's numbers can be quoted beside round 2's without re-running
+anything.
+
+This exists because the alternative had already failed twice. Growing a corpus
+re-runs the speaker-disjoint split over more data, which produces a *different*
+val set; and when we checked whether the older val could simply be re-scored,
+**547 of its 772 clips (70.9 %) had landed in the newer training set**. Pinning
+is the only way a generation-over-generation number means anything.
+
+There is no pinned-plus-top-up mode, deliberately: a superset val is exactly the
+incomparability the flag exists to remove.
+
+### Corpus
+
+58 archives across 56 studios, selected the same way (studio diversity first),
+with a tie-break added: prefer archives absent from the teacher corpus used in
+the transcript audit below, which raised the audit's usable share from 12 to 37
+of 58.
+
+| | clips | hours |
+|---|---|---|
+| train | 549,404 | 813.81 |
+| val (pinned) | 5,194 | 7.48 |
+
+The build ran in batches of 6 archives because the three intermediate forms do
+not fit the quota together (archives 40 GB + extracted 43 GB + converted audio
+115 GB against ~118 GB free). Each batch converts, then deletes its `.7z` and
+its extracted `.ogg` while **keeping `raw/<stem>/index.json`** — tiny, and the
+only thing the manifest builder needs from the raw tree. `--manifest-only` then
+rebuilds the whole-corpus split from those index files plus the converted wavs,
+without download, extraction or conversion, and without needing credentials.
+
+### Results
+
+Same geometry, same fp32/TF32-off measurement discipline, same 5,194 clips.
+
+| model | chunk CER | full CER | gap |
+|---|---|---|---|
+| base (published) | 0.4024 | 0.1781 | 0.2243 |
+| round 1 — 300 h, epoch 4 | 0.1679 | 0.1584 | 0.0095 |
+| **round 2 — 814 h, epoch 3** | **0.1623** | **0.1518** | 0.0106 |
+| round 2, epoch 4 | 0.1655 | 0.1571 | 0.0084 |
+| round 2, epoch 2 | 0.1670 | 0.1753 | −0.0084 |
+
+**2.7× the data bought 3.3 % relative on chunk CER** (0.1679 → 0.1623) and
+4.2 % on full-attention CER (0.1584 → 0.1518). Both moved together, so the gain
+is not being paid for out of offline quality. Against the base model the chunk
+CER falls 59.7 %.
+
+The honest reading is that returns are diminishing sharply. Round 1 took chunk
+CER from 0.4024 to 0.1679 with 300 h; another 514 h moved it 0.0056 further.
+Whatever is left is unlikely to be data volume.
+
+Epoch 2 is an oddity worth recording: its gap is **negative** (−0.0084), chunk
+decoding scoring *better* than full attention on the same clips. Nothing here
+explains it, and it did not persist into later epochs.
+
+**The 800-clip selection sweep mis-ranked the finalists for the third time.** It
+put epoch 2 second (0.1556) and epoch 4 third (0.1567); the full set reverses
+them and moves epoch 2 to last. Three independent failures across two rounds is
+no longer bad luck — the subset separates good checkpoints from bad and cannot
+resolve differences of a few thousandths. Run finalists on the whole set before
+claiming a winner.
+
+### Transcript audit
+
+With a training run occupying two GPUs, the spare slot went to auditing the
+ground truth rather than generating more of it. `scripts/detect_label_noise.py`
+decodes clips with `litagin/anime-whisper` and ranks by CER against the stored
+transcript — restricted to the 37 archives absent from that model's own training
+corpus, since on the other 21 it has memorised the pairs and cannot detect an
+error it was trained to reproduce.
+
+Comparison happens on a **normalized projection of both strings**. The teacher
+emits ASCII `!?`, no `。`, and single `…` where our corpus uses full-width `！？`,
+`。` and `……`; measured over the real val, that convention gap alone is **8.29
+CER points** raw and **0.000000** after normalization. Without it the filter
+measures orthography, and because `……`/`！` density is highest on emotive lines,
+it would preferentially flag those.
+
+Three findings from 4,000 clips:
+
+- **Unescaped newlines surviving as a literal `n`** (`一n杯`, `調n教`) — 89
+  occurrences, concentrated in one title, ~12,000 clips extrapolated. A defect,
+  and repairable: `normalize_text` now deletes a lone `n` with kana or kanji on
+  both sides. Latin runs, `第N回` and doubled `nn` are pinned untouched by tests.
+- **Titles transcribed entirely in kana** — 285 of 2,872 substantial transcripts
+  contain no kanji at all, median CER 0.417 against 0.103 for the rest, and one
+  title is 100 % kanji-free. Not wrong, but training on it teaches kana output.
+  `--drop-kana-only-titles` excludes a title above a kanji-free fraction
+  (default 0.8). Opt-in, and it drops nothing from the corpora on disk. Deliberately
+  title-level: a short kana-only line is ordinary Japanese and dropping those
+  would bias the corpus against backchannels.
+- **One title that looked worst of all and is fine.** `hibiki_works_LOVELY_CATION`
+  scored a median CER of 1.000. Its ground truth correlates with clip duration
+  normally (r = 0.819 against controls' 0.844–0.914) at a normal 4.65
+  characters/second; the *teacher* correlates at 0.327 and emits 1.34 chars/second,
+  returning empty output on non-verbal and NSFW vocalisation. The transcripts are
+  correct and the measuring instrument failed. Excluding it would have discarded
+  good data on the strength of a broken measurement.
+
+That last case generalises: **an empty teacher output is not evidence against a
+transcript**, yet it currently scores as CER 1.0 and sorts to the top of the
+report. Treating it as unscoreable is the obvious next fix.
+
+### Two guards added after they were needed
+
+Both come from failures that every existing check passed.
+
+`EXPECT_TRAIN_HOURS` / `EXPECT_VAL_CLIPS` — a run trained to completion on
+**16.5 hours** when 813.8 were intended, reported `SENSEVOICE_JOB_OK
+preflight=passed`, and finished in 4 minutes instead of 90. A data-prep
+invocation over a 4-archive subset had rebuilt the manifest and replaced the
+full one; `prepare_vn_data.py` always rebuilds the split over the archives it is
+given, which is by design and is exactly what makes it dangerous to run casually.
+The job-status sentinel cannot see this — the run genuinely succeeded, at the
+wrong thing. Declaring the expected size is the only check that can.
+
+The val expectation is an exact match rather than a tolerance: the val is pinned
+precisely so numbers stay comparable, and a silently replaced one would look
+perfectly healthy while invalidating the comparison.
+
+The second guard is a habit rather than code. A "full val" evaluation was
+submitted with `LIMIT=` against a script reading `${LIMIT:-800}` — which treats
+empty as unset — so it re-ran the 800-clip subset and wrote it under
+`eval_full_*.json`. It was caught only because the numbers matched the selection
+sweep to four decimals. **Assert `num_clips` before reading a CER**, and prefer
+`${VAR-default}` when an empty value is meaningful.
+
 ## What is verified, and what is not
 
 Pinned by `tests/test_chunk_streaming_equivalence.py` (small randomly-initialised
