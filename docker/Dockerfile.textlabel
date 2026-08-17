@@ -14,9 +14,9 @@
 #
 #   docker build --no-cache --platform linux/amd64 \
 #       --build-context scripts=../scripts \
-#       -t <cluster-registry>/<project>/sensevoice-textlabel:vllm0.27.1-v1 \
+#       -t <cluster-registry>/<project>/sensevoice-textlabel:vllm0.27.1-v2 \
 #       -f Dockerfile.textlabel .
-#   docker push <cluster-registry>/<project>/sensevoice-textlabel:vllm0.27.1-v1
+#   docker push <cluster-registry>/<project>/sensevoice-textlabel:vllm0.27.1-v2
 #
 # Two things about that command differ from Dockerfile.cluster's and are not
 # cosmetic:
@@ -43,6 +43,31 @@
 # The tag must stay in sync with whatever sbatch script requests this image, for
 # the same reason Dockerfile.cluster documents: a stale tag that still exists in
 # the registry fails quietly with old contents instead of loudly at pull time.
+#
+# ---------------------------------------------------------------------------
+# Why the tag is -v2, and why there is a fifth verification layer
+# ---------------------------------------------------------------------------
+#
+# v1 built clean, pushed clean, and passed all four verification layers below.
+# It then died on the node, inside engine start: vLLM and Triton compile their
+# CUDA utilities with a *runtime* JIT that shells out to a C compiler, and
+# nvidia/cuda:13.0.3-runtime-ubuntu24.04 ships no toolchain at all. The first
+# thing that wanted cc was the first thing that ran on a GPU.
+#
+# The four layers did not miss this by bad luck. Every one of them tests an
+# import, and the imports were genuinely fine — the image proved it could be
+# *loaded*, which is not the property that failed. Nothing in a build that never
+# touches a GPU has any reason to invoke a compiler, so the toolchain's absence
+# had no way to show up before the node found it.
+#
+# Hence layer five, at the bottom, and hence the apt line below installing a
+# toolchain into what is nominally a runtime image. Layer five does not ask
+# whether a compiler exists — `which cc` proves a file is on PATH and nothing
+# about whether it works — it compiles a translation unit, links it, runs it,
+# and then compiles a real CPython extension through Triton's own build entry
+# point with Triton's own include resolution. What still cannot be proved here
+# is named in that layer's comment: everything past the point where the driver
+# or a GPU is required.
 #
 # ---------------------------------------------------------------------------
 # Why this is a second image and not a few more lines in Dockerfile.cluster
@@ -125,10 +150,37 @@ FROM nvidia/cuda:13.0.3-runtime-ubuntu24.04
 # externally managed (PEP 668), so a system-wide pip install would be refused.
 # A venv is the supported answer and also keeps every package this image adds in
 # one directory that apt has no opinion about.
+#
+# build-essential and python3-dev are the v1 fix, and neither is a build-time
+# convenience: they are what vLLM needs at *runtime*. Triton compiles its
+# cuda_utils extension on first engine start with roughly
+# `cc src.c -O3 -shared -fPIC -o mod.so`, and torch.compile's inductor backend —
+# which vLLM's V1 engine turns on by default — shells out to a C++ compiler for
+# its CPU-side codegen. The set actually required is therefore a C compiler, a
+# C++ compiler, a linker, libc headers, and Python.h.
+#
+# build-essential rather than a hand-picked `gcc`, deliberately. It is gcc, g++,
+# cpp, libc6-dev, binutils and make: roughly 250 MB installed, against an image
+# already in the multi-GB range from the vLLM wheel and the nvidia-*-cu13
+# runtime wheels, so about 2% for the whole toolchain. `gcc` alone would save
+# most of that and would leave the inductor path broken — which is the same
+# mistake as v1 one notch smaller, guessing which JIT path gets exercised first
+# and spending a build-push-schedule-fail cycle to find out. The storage quota
+# has the room (see the weights note at the bottom); another cycle does not.
+#
+# python3-dev is separate from build-essential and is not optional. Triton's
+# generated source opens with #include <Python.h> and it resolves the include
+# directory through sysconfig, whose venv scheme derives `include` from
+# installed_base — that is /usr/include/python3.12, the *system* interpreter's
+# headers, not anything inside /opt/venv. Ubuntu's python3 package does not ship
+# them. Layer five checks that exact path rather than assuming this paragraph
+# stays true across a base image bump.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         python3 \
         python3-venv \
+        python3-dev \
+        build-essential \
         libgomp1 \
         ca-certificates \
  && rm -rf /var/lib/apt/lists/*
@@ -308,6 +360,90 @@ assert "vllm" not in sys.modules, "importing label_emotions_text pulled in vllm 
 msgs=t.build_prompt("test"); \
 assert [m["role"] for m in msgs] == ["system", "user"], msgs; \
 print("label_emotions_text imported OK | classes:", len(t.TEXT_CLASSES), "| default model:", t.DEFAULT_MODEL)'
+
+# ---------------------------------------------------------------------------
+# Layer five: the toolchain, proved by using it
+# ---------------------------------------------------------------------------
+#
+# The four layers above prove imports; this one proves a compile. It exists
+# because v1 passed all four and then died on the node for want of a C compiler
+# (the incident is written up in the header). Two steps, deliberately separate.
+#
+# 5a is the floor and depends on nothing this image installs with pip: one
+# translation unit through `cc`, linked to an executable, and then *run* — a
+# compiler that produces a binary that will not execute is not a working
+# compiler, and only running it says so. The same for `c++`, which torch.compile
+# needs and which a hand-picked `gcc` would not have provided. Keeping this
+# independent of vLLM matters: if a future edit breaks the toolchain in a way
+# that also breaks importing triton, 5b would fall back to its own compiler
+# invocation and could report the wrong cause. 5a cannot.
+#
+# The failure text is long on purpose. What the next person reads at 3am should
+# name the missing thing and the reason it is needed, not leave them to infer it
+# from a Triton stack trace.
+RUN { echo 'int main(void){return 0;}' | cc -x c - -o /tmp/ccprobe && /tmp/ccprobe \
+   && echo 'int main(void){return 0;}' | c++ -x c++ - -o /tmp/cxxprobe && /tmp/cxxprobe; } \
+ || { echo "FATAL: no working C/C++ compiler in this image. vLLM does not need one to import, which is why every layer above passes without it, but Triton compiles its CUDA utilities with a runtime JIT that shells out to cc at first engine start, and torch.compile shells out to c++ — so the failure lands on the node, hours into the queue, and the scheduler reports the dead job as a successful one. The base is a CUDA *runtime* image and ships no toolchain; install build-essential in the apt layer near the top." >&2; exit 1; } \
+ && rm -f /tmp/ccprobe /tmp/cxxprobe \
+ && echo "cc and c++ compile, link and run"
+
+# 5b goes after the same path Triton will take on the node, as far as that path
+# can be walked without a GPU:
+#
+#   - the compiler *Triton* resolves, in Triton's order ($CC, then gcc, then
+#     clang), rather than whatever `cc` happens to point at;
+#   - the Python.h that Triton's own sysconfig lookup finds. That lookup is the
+#     part most likely to rot: inside this venv the include path resolves to the
+#     system interpreter's /usr/include/python3.12 (the venv scheme derives
+#     include from installed_base), so it depends on python3-dev being present,
+#     and Debian's posix_local scheme is remapped exactly as Triton remaps it;
+#   - triton.runtime.build._build itself when it is present with the expected
+#     signature, so the real compiler invocation is exercised and not a
+#     reimplementation of it. If it has moved or been renamed the layer says so
+#     in the log and compiles directly instead — it degrades to a weaker check,
+#     never to no check;
+#   - a genuine CPython extension module, including <cuda.h> from Triton's
+#     bundled backend headers when they are there, which is then loaded through
+#     the import machinery. Compiling proves the headers parse and the compiler
+#     driver works; importing proves the result matches this interpreter's ABI.
+#
+# What is NOT proved here, and cannot be at build time:
+#
+#   - the link against libcuda. Triton's real cuda_utils build passes
+#     libraries=["cuda"] with library_dirs from `ldconfig -p | grep libcuda.so`,
+#     and libcuda.so.1 arrives from the driver mount on the node. This probe
+#     builds a shared object without -lcuda, which is why it links at all here.
+#   - anything downstream of that: ptxas on a real kernel, cubin load, the
+#     forward-compatibility path against the node's driver version. All of it
+#     needs a GPU, so the first real evidence comes from the first job.
+#
+# The boundary is therefore: everything up to and including "this image can
+# compile and load a CUDA-aware CPython extension" is settled here; everything
+# that needs the driver is settled by the job.
+RUN python -c 'import importlib.util as iu, inspect, os, pathlib, shutil, subprocess, sysconfig, tempfile; \
+cc=os.environ.get("CC") or shutil.which("gcc") or shutil.which("clang") or shutil.which("cc"); \
+assert cc, "no C compiler on PATH. Triton resolves one at runtime as $CC, then gcc, then clang, and compiles its CUDA utilities with it at first engine start; with none present this image fails on the node rather than here. Install build-essential."; \
+scheme=sysconfig.get_default_scheme(); \
+scheme="posix_prefix" if scheme == "posix_local" else scheme; \
+pyinc=sysconfig.get_paths(scheme=scheme)["include"]; \
+print("compiler:", cc, "| sysconfig scheme:", scheme, "| Python.h from:", pyinc); \
+assert os.path.exists(os.path.join(pyinc, "Python.h")), "Python.h is not under %s, which is where Triton JIT-compiled extensions look for it (sysconfig scheme %r). Ubuntu ships those headers in python3-dev, not in python3." % (pyinc, scheme); \
+tri=iu.find_spec("triton") and __import__("triton"); \
+cudainc=[d for d in ([os.path.join(os.path.dirname(tri.__file__), "backends", "nvidia", "include")] if tri else []) if os.path.exists(os.path.join(d, "cuda.h"))]; \
+print("triton:", os.path.dirname(tri.__file__) if tri else "NOT INSTALLED", "| bundled cuda.h:", cudainc or "not found, probe compiles without it"); \
+src="\n".join(["#include <Python.h>"] + ["#include <cuda.h>"] * bool(cudainc) + ["static struct PyModuleDef m={PyModuleDef_HEAD_INIT,\"ccprobe\",NULL,-1,NULL};", "PyMODINIT_FUNC PyInit_ccprobe(void){return PyModule_Create(&m);}"]); \
+d=tempfile.mkdtemp(); \
+p=os.path.join(d, "ccprobe.c"); \
+pathlib.Path(p).write_text(src); \
+mod=tri and iu.find_spec("triton.runtime.build") and __import__("triton.runtime.build", fromlist=["_build"]); \
+build=getattr(mod, "_build", None); \
+build=build if build is not None and {"name", "src", "srcdir", "library_dirs", "include_dirs", "libraries"} <= set(inspect.signature(build).parameters) else None; \
+print("build route:", "triton.runtime.build._build" if build else "direct invocation of %s (triton build helper absent or moved)" % cc); \
+so=build(name="ccprobe", src=p, srcdir=d, library_dirs=[], include_dirs=cudainc, libraries=[]) if build else (subprocess.check_call([cc, p, "-O3", "-shared", "-fPIC", "-o", os.path.join(d, "ccprobe.so"), "-I" + pyinc] + ["-I" + i for i in cudainc]) or os.path.join(d, "ccprobe.so")); \
+s=iu.spec_from_file_location("ccprobe", so); \
+m=iu.module_from_spec(s); \
+s.loader.exec_module(m); \
+print("compiled a CPython extension with the JIT toolchain and imported it:", so)'
 
 # Qwen2.5-14B-Instruct is roughly 28 GB in bf16 and is deliberately NOT baked
 # in. The storage quota is not the binding reason — with the weights staged

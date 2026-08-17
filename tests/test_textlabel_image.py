@@ -11,6 +11,30 @@ So the conflict is asserted here instead, as arithmetic over the declared
 version specifiers.  The numbers below were read from PyPI metadata and are
 quoted in the Dockerfile's header for the same reason.
 
+The second half of this file is about the toolchain, and it is here because of
+what the first nine tests did *not* pin.  The v1 image passed every one of them,
+built clean, pushed clean, and then died on the node: vLLM's Triton JIT compiles
+CUDA utilities at first engine start by shelling out to a C compiler, and a CUDA
+*runtime* base image ships none.
+
+Worth being blunt about it, because the lesson is in the selection and not in
+any individual test: not one of the nine would have caught it, and none of them
+was wrong.  Four assert that the image installs the right versions, two that it
+does not install the wrong ones, one that pip stays in build layers, one that
+the weights are not baked in, and one that four verification layers are still
+present -- and that last one checks their *markers*, which were all imports.
+Nine properties, all of them about what the image contains.  The property that
+failed was about what it can do.
+
+The pattern is worth naming, because it is not specific to compilers: a test
+written from an assumption tends to check the assumption rather than the
+artefact.  "vLLM is installed" was the assumption; "vLLM can start an engine"
+was the artefact, and nothing here or in the build touched it.  The cheap
+correction, applied below, is to make at least one check *use* the thing instead
+of describing it -- so the tests that follow ask that a compiler is installed,
+and that the Dockerfile proves it by compiling, linking and running something
+rather than by finding a binary on PATH.
+
 None of this needs vLLM, numpy 2.x or a GPU to run -- it compares specifiers,
 never installs anything.
 """
@@ -264,3 +288,105 @@ def test_textlabel_image_verifies_itself_before_the_scheduler_does():
             "time; without it an ImportError surfaces only after the scheduler "
             "has started the job."
         )
+
+
+# ----------------------------------------------------------------- the toolchain
+
+
+def test_textlabel_image_installs_a_c_compiler():
+    """The v1 failure, asserted so it cannot come back quietly.
+
+    vLLM and Triton compile CUDA utilities with a runtime JIT that shells out to
+    a C compiler, and torch.compile's inductor backend shells out to a C++ one.
+    The base is nvidia/cuda:*-runtime and has neither, so this has to be added
+    explicitly -- and it looks like dead weight to anyone reading the apt line
+    without the header, which is exactly why it is pinned here.
+    """
+    apt = " ".join(i for i in _instructions() if "apt-get install" in i)
+    assert apt, "docker/Dockerfile.textlabel no longer installs any apt packages"
+    assert re.search(r"\b(build-essential|gcc|clang)\b", apt), (
+        "docker/Dockerfile.textlabel installs no C compiler. vLLM imports fine "
+        "without one -- it needs it at first engine start, on the node, hours "
+        "into the queue. This is the v1 failure; see the Dockerfile header."
+    )
+    assert re.search(r"\bpython3-dev\b", apt), (
+        "docker/Dockerfile.textlabel no longer installs python3-dev. Triton's "
+        "JIT-compiled module opens with #include <Python.h>, and Ubuntu ships "
+        "that header in python3-dev rather than python3, so a compiler on its "
+        "own is not enough."
+    )
+
+
+def test_the_toolchain_check_compiles_something_rather_than_locating_a_binary():
+    """`which cc` proves a file is on PATH, which is not the failing property.
+
+    A compiler that is present but cannot produce a runnable binary -- missing
+    libc headers, no linker, a broken install -- passes an existence check and
+    fails the job.  So the probe has to compile, link and then *run* its output,
+    and this test pins all three parts rather than the string ``cc``.
+    """
+    probes = [i for i in _instructions() if "ccprobe" in i]
+    assert probes, (
+        "docker/Dockerfile.textlabel has no compile probe. Without it a missing "
+        "or broken toolchain is discovered by the scheduler, and the scheduler "
+        "discards the batch script's exit code."
+    )
+    compiled = [i for i in probes if "-x c" in i]
+    assert compiled, (
+        "the compile probe in docker/Dockerfile.textlabel no longer compiles a "
+        f"translation unit: {probes!r}"
+    )
+    for instruction in compiled:
+        assert re.search(r"&&\s*/tmp/ccprobe\b", instruction), (
+            "the compile probe builds /tmp/ccprobe but never runs it; a binary "
+            "that will not execute still counts as a successful compile."
+        )
+    for instruction in _instructions():
+        if re.search(r"\b(which|command\s+-v)\s+(cc|gcc|c\+\+|g\+\+)\b", instruction):
+            assert "-x c" in instruction or "ccprobe" in instruction, (
+                f"the toolchain is verified by an existence check: {instruction!r}. "
+                "That is the check that would have passed on v1 too."
+            )
+
+
+def test_the_toolchain_check_follows_the_path_triton_takes():
+    """The plain compile is the floor; this is the part that matches reality.
+
+    Triton does not run ``cc hello.c``.  It resolves a compiler in its own order,
+    finds Python.h through sysconfig (which inside this venv resolves to the
+    system interpreter's headers, so it depends on python3-dev), and builds a
+    CPython extension.  Each of those is a separate way to be broken while the
+    plain probe still passes, so the second layer walks the real path and this
+    test pins the pieces of it that can run without a GPU.
+    """
+    text = DOCKERFILE.read_text()
+    for marker, why in [
+        ("sysconfig.get_paths", "Triton locates Python.h through sysconfig"),
+        ("posix_local", "Debian's sysconfig scheme has to be remapped as Triton remaps it"),
+        ("Python.h", "the JIT-compiled module includes it and python3-dev supplies it"),
+        ("triton.runtime.build", "the real build entry point is preferred over a reimplementation"),
+        ("PyInit_ccprobe", "the probe builds an actual CPython extension"),
+        ("spec_from_file_location", "and loads it, which is what proves the ABI matches"),
+    ]:
+        assert marker in text, (
+            f"docker/Dockerfile.textlabel no longer checks {marker!r} at build "
+            f"time ({why}); that part of the JIT path goes back to being first "
+            "exercised on the node."
+        )
+
+
+def test_the_image_tag_names_the_rebuilt_image():
+    """v1 is the image that fails on the node, so nothing may still request it.
+
+    Only tags are checked, not the string ``-v1``: the header discusses the v1
+    incident in prose deliberately, and that prose is the reason the toolchain
+    below it is not mistaken for bloat.
+    """
+    tags = re.findall(r"sensevoice-textlabel:vllm[0-9][^\s\\]*", DOCKERFILE.read_text())
+    assert tags, "docker/Dockerfile.textlabel names no image tag at all"
+    stale = [t for t in tags if not t.endswith("-v2")]
+    assert not stale, (
+        f"docker/Dockerfile.textlabel still names {stale}; v1 is the build with "
+        "no C compiler in it, and a tag that still resolves in the registry "
+        "fails quietly with those contents rather than loudly at pull time."
+    )
