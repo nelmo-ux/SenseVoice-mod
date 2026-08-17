@@ -193,11 +193,12 @@ RUN pip install --no-cache-dir \
 # which reads metadata and never parses wheel tags. Names are compared PEP 503
 # normalised; requirements guarded by an extra we did not request are skipped.
 #
-# This layer and the transformers one below import `packaging`, which is not
-# installed here on purpose but is not incidental either: transformers declares
-# packaging>=20.0 and huggingface_hub declares packaging>=20.9, so it is present
-# whenever the install above succeeded. Worth knowing because the base is a bare
-# CUDA image and ships no Python packages of its own.
+# This layer and the transformers one below import `packaging`, which is never
+# installed by name here. Its presence is not luck: transformers declares
+# packaging>=20.0 and huggingface_hub declares packaging>=20.9, so it arrives
+# with the install above or that install did not succeed. Worth stating because
+# the base is a bare CUDA image and ships no Python packages of its own, so
+# nothing in this file can be assumed present the way it could under NGC.
 RUN python -c 'import importlib.metadata as md, re; \
 from packaging.requirements import Requirement; \
 ours=("vllm","transformers","torch","numpy"); \
@@ -309,9 +310,12 @@ assert [m["role"] for m in msgs] == ["system", "user"], msgs; \
 print("label_emotions_text imported OK | classes:", len(t.TEXT_CLASSES), "| default model:", t.DEFAULT_MODEL)'
 
 # Qwen2.5-14B-Instruct is roughly 28 GB in bf16 and is deliberately NOT baked
-# in. Two reasons, both practical: a layer that size makes every node pull slow
-# and the cluster's storage quota is already tight, and weights that live in the
-# image can only be changed by rebuilding and repushing it.
+# in. The storage quota is not the binding reason — with the weights staged
+# separately it has about 30 GB of margin, which is precisely the margin that
+# baking them in would spend. What settles it is that a layer that size is
+# re-pulled by every node that runs this image, and that weights living in a
+# layer can only be changed by rebuilding and repushing the whole thing, which
+# couples the model version to the image version for no benefit.
 #
 # They are staged on the shared filesystem instead and passed by path, following
 # the same convention as the acoustic labeller's emotion2vec directory:

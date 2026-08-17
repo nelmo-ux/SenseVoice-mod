@@ -759,6 +759,88 @@ empty as unset — so it re-ran the 800-clip subset and wrote it under
 sweep to four decimals. **Assert `num_clips` before reading a CER**, and prefer
 `${VAR-default}` when an empty value is meaningful.
 
+## Round 3 — repairing the emotion head
+
+> Status: **in progress.** Code landed and tested; corpus rebuild, labelling
+> and training not yet run.
+
+Rounds 1 and 2 trained the emotion head on a constant. `prepare_vn_data.py`
+stamped `<|NEUTRAL|>` on every clip, and because the emotion slot shares the
+CTC output projection, the head was optimised towards that constant.
+`acc_rich` saturating at 1.0 by step 880 was the label being constant, not
+the model being right.
+
+Nothing caught it. CER is measured after `strip_rich_tags`, so every
+evaluation this project has run was blind to the emotion output. The defect
+survived two full training rounds and a published checkpoint.
+
+### Saying "no label" without lying
+
+The repair needs per-clip emotion labels, and pseudo-labels are not reliable
+for every clip. The question is what to write for the rest.
+
+`<|EMO_UNKNOWN|>` looks like the obvious answer and is the wrong one.
+Inference bans it (`ban_emo_unk`), so training it is capacity spent on a
+token that can never be emitted; and if most clips carried it, the run would
+reproduce the original collapse with a different constant.
+
+Instead the manifest carries `<|SER|>` — a single token, id 24991 — and
+`model.py` maps it to `ignore_id` before the rich cross-entropy. That drops
+the slot from `LabelSmoothingLoss`' numerator *and* denominator and blocks
+the gradient through it, while the clip still trains CTC in full. The
+mapping lives in the model because `prepare_vn_data.py` writes strings and
+the funasr dataset layer tokenises them; neither can inject `-1`.
+
+Two consequences worth knowing. The denominator only shrinks when
+`length_normalized_loss` is true, which it is in the base config but is a
+property of the configuration rather than of the mechanism. And masking
+raises the effective weight of the other three rich slots by roughly 1.03 at
+the expected mask rate, since they keep their share of a smaller denominator.
+
+`acc_emo` reports the emotion slot's accuracy on its own. It exists because
+its absence is what let round 2 fail silently.
+
+### Two labellers, and only what they agree on
+
+emotion2vec+ large reads the waveform; Qwen2.5-14B-Instruct reads the
+ground-truth transcript. Where they agree the label is adopted, where they
+disagree it is masked. Both are Apache-2.0 — the obvious Japanese
+visual-novel SER resources are GPL-derived and would have tainted the result.
+
+Agreement is worth the cost because this is acted dialogue: the audio side
+hears exaggerated delivery, and the text side reads lines whose emotion is
+carried entirely by the performance. Neither is trustworthy alone.
+
+Text classification carries `embarrassed` and `sexual` as first-class
+buckets. Both are frequent here and neither maps onto the seven SenseVoice
+emotions, so giving them their own labels keeps them out of the seven. They
+mask rather than drop: no clip leaves the corpus.
+
+### A second image, because vLLM and numpy cannot share one
+
+`docker/Dockerfile.textlabel` is separate from `Dockerfile.cluster` and will
+stay separate. Every current vLLM requires `numpy>=2`; this project pins
+`numpy<=1.26.4`, and the `scipy` / `numba` / `llvmlite` / `scikit-learn` /
+`umap-learn` caps in `requirements.txt` exist to hold that ceiling. vLLM
+would also move torch to whatever it was compiled against. The conflict is
+not reconcilable, and it does not need to be: the text labeller reads a
+manifest and writes a JSONL, sharing nothing with the training stack at
+runtime.
+
+The base is `nvidia/cuda:13.0.3-runtime-ubuntu24.04` rather than the NGC
+mirror, matching vLLM 0.27.1's torch 2.13/cu13 wheels.
+
+Qwen2.5-14B's weights are **staged, not baked in** — 28 GB of layer would be
+pulled on every job, and the quota has about 30 GB of margin. Stage them and
+pass the path via `--model`.
+
+Two operational notes. Build on an **x86_64 host** with
+`--platform linux/amd64`; under qemu on Apple Silicon the build-time
+verification layers can fail as false positives, which is worse than not
+having them. And if `--tensor-parallel-size` exceeds 1, the job needs
+`#CONTAINER --shm-size 32G` — NCCL's shared-memory transport otherwise fails
+in a way that reads as a hang rather than an error.
+
 ## What is verified, and what is not
 
 Pinned by `tests/test_chunk_streaming_equivalence.py` (small randomly-initialised

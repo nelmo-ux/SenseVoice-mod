@@ -203,10 +203,11 @@ def test_textlabel_image_pins_vllm_and_transformers_and_tags_the_vllm_version():
 
 
 def test_textlabel_image_does_not_bake_the_qwen_weights():
-    """~28 GB of weights in a layer, against a tight cluster quota.
+    """~28 GB of weights re-pulled by every node that runs the image.
 
-    The weights are staged on the shared filesystem and passed with --model, so
-    nothing in this image should be fetching or copying them.
+    The quota has room for them; what it does not have is a reason to spend that
+    room.  The weights are staged on the shared filesystem and passed with
+    --model, so nothing in this image should be fetching or copying them.
     """
     downloaders = [
         "huggingface-cli download",
