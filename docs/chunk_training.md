@@ -816,6 +816,61 @@ buckets. Both are frequent here and neither maps onto the seven SenseVoice
 emotions, so giving them their own labels keeps them out of the seven. They
 mask rather than drop: no clip leaves the corpus.
 
+### The corpus, and the pin that moved
+
+801.10 h of train against round 2's 813.81. The arithmetic is worth writing
+out, because neither term is what was expected:
+
+```
+  813.8127 h   round 2
+-  12.7095 h   --drop-kana-only-titles (JADE_Love_Destination, 6,009 clips)
++   0.0000 h   stem-resolution recovery
+= 801.1032 h   round 3, measured
+```
+
+**The ~90 hours the stem-resolution fix was meant to recover are not on
+disk.** Round 2's `manifest.json` was itself built with `--manifest-only`, so
+its `dropped_missing_audio: 57,180` already meant "index entry that matched no
+wav **on disk**", not "no `.ogg` at extraction time". 54,420 of those belong to
+four titles, two of which have no `audio/` directory at all. The wav count on
+disk (563,268) equals the manifest's `kept` exactly, across all 58 titles with
+zero per-title mismatches — every wav present was already found by the old
+exact-path resolver, so the stem fallback has nothing left to match. The
+rebuild confirmed it prospectively: `resolved_audio_stem_match_elsewhere: 0`.
+
+The four `.7z` still on disk are exactly those four titles, and that is
+causal rather than coincidental — the batch pipeline deletes an archive once
+its conversion succeeds, so these survive *because* conversion never
+completed. Recovering the hours means re-extracting and re-converting them.
+**Deferred to a later round**: round 2 measured 2.7× the data buying 3.3 %
+relative on chunk CER, so +11 % would buy under 0.2 % — below the evaluation's
+resolution — and changing corpus size while repairing the emotion head would
+make round 3 a two-variable experiment.
+
+**`EXPECT_TRAIN_HOURS=801.10`.** Note that the guard could not have caught the
+stale value: at round 2's 813.81 the ±5 % band is 773.12–854.50 h, and 801.10
+sits inside it. A 1.56 % drift passes, so this update has to be made
+deliberately.
+
+**The pinned val changed by one record.** `val.jsonl` moved from
+`a4e3167e…` to `c57be1c8…`. Exactly 1 of 5,194 records differs, in `target`
+and `target_len` only — same keys, same order, same `source`, same
+`source_len`. The lone-`n` repair landed on a val transcript:
+
+```
+Libido_Soft_Hinekuremono_..._Reversible__太陽__taiyo0007
+ old: …パーッと遊びにn行こうって話に…今日部活n休みなんだよ！  (57)
+ new: …パーッと遊びに行こうって話に…今日部活休みなんだよ！    (55)
+```
+
+The repair was accepted. Keeping a knowingly-corrupt reference so a hash
+matches would fix the defect into every future round's scoring, and the pin
+exists to make numbers comparable, not to preserve errors. But the swap is
+only legitimate if it is *shown* not to move the numbers, so round 2 epoch 3
+is re-scored on the new val and both figures are recorded — two characters in
+roughly 1.5 M should agree to four decimals, and if they do not, that is a
+finding rather than a rounding note. **`c57be1c8…` is the pin from here on.**
+
 ### A second image, because vLLM and numpy cannot share one
 
 `docker/Dockerfile.textlabel` is separate from `Dockerfile.cluster` and will
