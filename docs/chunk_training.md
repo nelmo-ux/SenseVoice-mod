@@ -853,7 +853,9 @@ sits inside it. A 1.56 % drift passes, so this update has to be made
 deliberately.
 
 **The pinned val changed by one record.** `val.jsonl` moved from
-`a4e3167e…` to `c57be1c8…`. Exactly 1 of 5,194 records differs, in `target`
+`a4e3167e56d09f954b46addb58a793d4dc9502f45e297a9ba29ef246038c190e` to
+`c57be1c82d4df78af1a5116e220ac4f7b402aaa5dfb7ebbc0065a04a33194b68`.
+Exactly 1 of 5,194 records differs, in `target`
 and `target_len` only — same keys, same order, same `source`, same
 `source_len`. The lone-`n` repair landed on a val transcript:
 
