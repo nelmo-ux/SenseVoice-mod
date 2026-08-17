@@ -320,63 +320,68 @@ def test_decide_records_the_raw_labels_for_review(merge):
     assert payload["key"] == "k"
 
 
-# ------------------------------------------------------- audio-conf fallback
+# ------------------------------------- no confidence override (retired 2026-08-14)
 
 
-def test_audio_conf_fallback_is_off_by_default(merge):
-    """Off until the pilot's confusion matrix says it is worth the bias.
+@pytest.mark.parametrize(
+    ("audio_label", "text_label", "score"),
+    [
+        pytest.param("happy", "neutral", 1.0, id="text-neutral-audio-certain"),
+        pytest.param("surprised", "neutral", 1.0, id="the-domain-shifted-class"),
+        pytest.param("happy", "sad", 0.99, id="two-different-emotions"),
+        pytest.param("neutral", "happy", 0.99, id="audio-neutral-text-emotional"),
+    ],
+)
+def test_no_audio_confidence_overrides_a_disagreement(merge, audio_label, text_label, score):
+    """Confidence buys nothing. Every disagreement masks, at any score.
 
-    A confident acoustic label over a textually-neutral line is plausible, but
-    "plausible" is how the neutral collapse got in. The default has to be the
-    conservative one.
-    """
-    row = merge.decide("k", audio_record("happy", score=0.9), text_record("neutral"))
-    assert row.emo_target == merge.MASK_TOKEN
-    assert row.decision == "disagree_masked"
+    ``--audio-conf-fallback`` used to adopt the audio label on the
+    text-neutral/audio-confident pattern. The 5,000-clip pilot of 2026-08-14
+    retired it: emotion2vec+ large is domain-shifted on this corpus (surprised
+    32.1%, happy 24.0%, neutral 1.64%) and returns 1.000 on ordinary
+    conversational lines, with ~85% of clips above 0.7. A threshold selects
+    nearly everything and the selection is full of confident mislabels, so the
+    override imported the shift into precisely the clips the text labeller had
+    called neutral.
 
-
-def test_audio_conf_fallback_adopts_audio_above_tau(merge):
-    row = merge.decide(
-        "k", audio_record("happy", score=0.9), text_record("neutral"), audio_conf_tau=0.7
-    )
-    assert row.emo_target == "<|HAPPY|>"
-    assert row.decision == "audio_conf"
-
-
-def test_audio_conf_fallback_respects_the_threshold(merge):
-    """0.6 under a 0.7 threshold still masks; the boundary itself adopts."""
-    below = merge.decide(
-        "k", audio_record("happy", score=0.6), text_record("neutral"), audio_conf_tau=0.7
-    )
-    assert below.emo_target == merge.MASK_TOKEN
-    assert below.decision == "disagree_masked"
-
-    boundary = merge.decide(
-        "k", audio_record("happy", score=0.7), text_record("neutral"), audio_conf_tau=0.7
-    )
-    assert boundary.decision == "audio_conf"
-
-
-def test_audio_conf_fallback_only_covers_the_text_neutral_pattern(merge):
-    """It must not become a general "audio wins when confident" rule.
-
-    The pattern it covers is asymmetric for a reason: a flat line delivered with
-    obvious affect is invisible to a transcript labeller. Between two *different*
-    emotions neither side has a claim, however confident the audio is.
+    Parametrized over the exact cases the flag used to change, including
+    ``surprised`` -- the class the shift concentrates in -- so that reinstating
+    any confidence rule fails here rather than passing quietly.
     """
     row = merge.decide(
-        "k", audio_record("happy", score=0.99), text_record("sad"), audio_conf_tau=0.7
+        "k", audio_record(audio_label, score=score), text_record(text_label)
     )
     assert row.emo_target == merge.MASK_TOKEN
     assert row.decision == "disagree_masked"
 
 
-def test_audio_conf_fallback_does_not_fire_for_neutral_audio(merge):
-    """Reverse pattern (audio neutral, text emotional) stays masked."""
-    row = merge.decide(
-        "k", audio_record("neutral", score=0.99), text_record("happy"), audio_conf_tau=0.7
-    )
-    assert row.decision == "disagree_masked"
+def test_decide_takes_no_confidence_threshold(merge):
+    """The parameter is gone, not defaulted to None.
+
+    A retired knob left in the signature is a knob someone re-enables without
+    re-reading why it was retired.
+    """
+    with pytest.raises(TypeError):
+        merge.decide("k", audio_record("happy"), text_record("neutral"), 0.7)
+    assert "audio_conf" not in merge.DECISIONS
+
+
+def test_masked_disagreements_keep_the_audio_evidence(merge):
+    """``audio_label`` and ``audio_score`` survive on masked rows.
+
+    Deliberately preserved through the fallback's removal. A second hypothesis
+    is still open -- audio ``neutral`` is rare but may be *correct* on short flat
+    utterances, so the labeller could be trustworthy in that one direction while
+    useless in the other. It is unmeasured, so no rule is built on it, but the
+    evidence needed to settle it has to survive in the merge output or the
+    question can only be answered by relabelling the corpus.
+    """
+    row = merge.decide("k", audio_record("surprised", score=1.0), text_record("neutral"))
+    payload = row.to_json()
+    assert payload["emo_target"] == merge.MASK_TOKEN
+    assert payload["audio_label"] == "surprised"
+    assert payload["audio_score"] == 1.0
+    assert payload["text_label"] == "neutral"
 
 
 # ---------------------------------------------------------------- neutral cap
@@ -689,7 +694,6 @@ def test_stats_report_the_cap_and_the_fallback_state(merge, tmp_path):
         "neutral_after": 10,
         "demoted": 80,
     }
-    assert stats["audio_conf_fallback"]["enabled"] is False
     assert stats["label_distribution"]["counts"]["<|NEUTRAL|>"] == 10
     assert stats["num_usable"] == 20
 
@@ -856,27 +860,45 @@ def test_missing_breakdown_separates_absent_from_unusable(merge, tmp_path):
     }
 
 
-# --------------------------------------------------- fallback / cap validation
+# ------------------------------------------------------------- cap validation
 
 
-@pytest.mark.parametrize("tau", ["0", "-0.5", "1.5"])
-def test_audio_conf_fallback_rejects_a_threshold_outside_the_unit_range(merge, tmp_path, tau):
-    """``0`` would adopt audio for *every* text-neutral pair, not none of them.
+def test_the_retired_fallback_flag_is_rejected(merge, tmp_path, capsys):
+    """``--audio-conf-fallback`` must not silently no-op if someone still passes it.
 
-    That is the exact inverse of what someone typing a low number wants, and the
-    output of the two cases is indistinguishable without reading the stats.
-    Omitting the flag is how the fallback is disabled.
+    Retired flags in old scripts and job files are the realistic way a removed
+    behaviour comes back: argparse rejecting the flag tells the operator to go
+    read why it is gone, whereas accepting and ignoring it would let a job that
+    *thinks* it enabled the override run as if it had.
     """
     audio_path, text_path = _overlap_files(tmp_path, ["a"], ["a"])
     out = tmp_path / "emo.jsonl"
-    code = merge.main(
-        [
-            "--audio", str(audio_path), "--text", str(text_path),
-            "--out", str(out), "--audio-conf-fallback", tau,
-        ]
-    )
-    assert code == 1
+    with pytest.raises(SystemExit) as excinfo:
+        merge.main(
+            [
+                "--audio", str(audio_path), "--text", str(text_path),
+                "--out", str(out), "--audio-conf-fallback", "0.7",
+            ]
+        )
+    assert excinfo.value.code == 2  # argparse: unrecognised argument
     assert not out.exists()
+
+
+def test_stats_no_longer_report_a_fallback(merge, tmp_path):
+    """The stats block for the retired flag is gone, not left reading disabled.
+
+    A permanently-``false`` field reads as a switch waiting to be flipped.
+    """
+    audio_path, text_path = _overlap_files(tmp_path, ["a"], ["a"])
+    out = tmp_path / "emo.jsonl"
+    assert (
+        merge.main(["--audio", str(audio_path), "--text", str(text_path), "--out", str(out)])
+        == 0
+    )
+    stats = json.loads((tmp_path / "emo.jsonl.stats.json").read_text(encoding="utf-8"))["stats"]
+    assert "audio_conf_fallback" not in stats
+    # ...but the matrix that will inform the replacement rule stays.
+    assert "disagreement_confusion" in stats
 
 
 def test_neutral_cap_warns_when_it_would_delete_all_supervision(merge, capsys):
@@ -1527,8 +1549,7 @@ def test_importing_the_module_pulls_in_no_model_stack(script, tmp_path):
                                     "--limit", "--sample", "--seed",
                                     "--max-consecutive-failures", "--max-unparsed-frac"]),
         ("merge_emo_labels.py", ["--audio", "--text", "--out", "--stats-out",
-                                 "--audio-conf-fallback", "--neutral-cap", "--sample",
-                                 "--min-overlap"]),
+                                 "--neutral-cap", "--sample", "--min-overlap"]),
     ],
 )
 def test_help_runs_without_the_model_stack(script, expected, tmp_path):

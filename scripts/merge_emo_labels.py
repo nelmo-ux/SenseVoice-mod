@@ -52,19 +52,38 @@ byte-identical output.
 The optional confidence fallback
 --------------------------------
 
-``--audio-conf-fallback TAU`` is **off by default and should stay off until the
-pilot justifies it.**  It relaxes exactly one disagreement pattern: the text
-says ``neutral`` while the audio says something else with confidence at or
-above TAU.  That pattern is the one case where the two labellers are not
-symmetric -- a line can be textually flat and delivered with obvious affect
-("そう", shouted), and the transcript labeller has no way to see it.  Every
-other disagreement stays masked, because in those cases neither side has a
-principled claim to be right.
+There was one, ``--audio-conf-fallback TAU``: when the text said ``neutral`` and
+the audio disagreed with confidence at or above TAU, adopt the audio label.  The
+reasoning was that a line can be textually flat and delivered with obvious
+affect ("そう", shouted), which a transcript labeller cannot see.
 
-The stats report includes the full disagreement confusion matrix precisely so
-this switch can be decided from measurement rather than intuition: if
-text-neutral/audio-X is a small slice of disagreements, the fallback buys
-little coverage and adds a labeller-specific bias for nothing.
+**Measured on 2026-08-14 over a 5,000-clip pilot, and removed.**  emotion2vec+
+large has a corpus-wide domain shift on visual-novel dialogue: it returns
+``surprised`` for 32.1% of clips and ``happy`` for 24.0%, against ``neutral``
+for 1.64% -- ordinary conversational lines come back as ``surprised`` at a score
+of 1.000.  Roughly 85% of all clips score above 0.7.
+
+That makes the rule actively harmful rather than merely useless.  **Confidence
+is not a proxy for correctness on this data**: any threshold worth the name
+selects nearly the whole corpus, and confident mislabels are abundant inside the
+selection, so the fallback would have imported the domain shift wholesale into
+exactly the clips the text labeller had judged neutral.  The branch is gone
+rather than defaulted-off, because a flag whose only honest documentation is
+"measured, does not work, do not enable" reads as an invitation.
+
+The disagreement confusion matrix stays in the stats, and is now *more* useful
+than when it was the fallback's evidence: it is how the domain shift gets read
+off the full corpus, and it is the input to whichever merge rule replaces this
+one.
+
+A second hypothesis is still open and points the other way.  Audio ``neutral``
+is rare (1.64%) but appeared in the pilot to land correctly on short flat
+utterances, so the acoustic labeller may be trustworthy in that one direction
+while being useless in the other.  That is **unmeasured** -- the merge analysis
+after the text pilot decides it -- so no rule is built on it here.  What this
+file does guarantee is that the raw material survives: ``audio_label`` and
+``audio_score`` stay on every output row and the per-decision counts stay in the
+stats, so the question can be answered from a merge output without relabelling.
 """
 
 from __future__ import annotations
@@ -163,7 +182,6 @@ AUX_TEXT_LABELS = frozenset({"embarrassed", "sexual"})
 #: The decisions :func:`decide` and :func:`apply_neutral_cap` may record.
 DECISIONS: tuple[str, ...] = (
     "agree",
-    "audio_conf",
     "disagree_masked",
     "aux_masked",
     "other_masked",
@@ -330,7 +348,6 @@ def decide(
     key: str,
     audio: Optional[Dict[str, Any]],
     text: Optional[Dict[str, Any]],
-    audio_conf_tau: Optional[float] = None,
 ) -> MergedRow:
     """Decide one clip's emotion target from the two labellers.
 
@@ -341,17 +358,14 @@ def decide(
        labeller chose an auxiliary bucket, otherwise ``other_masked``).  The two
        are distinguished only for the report; the target is the same.
     3. Both map to the same token -> adopt it (``agree``).
-    4. Otherwise mask (``disagree_masked``), unless the confidence fallback is
-       enabled *and* this is the text-neutral / audio-confident-X pattern, in
-       which case adopt X (``audio_conf``).  See the module docstring for why
-       that one pattern and no other.
+    4. Otherwise mask (``disagree_masked``).  There is no override, by
+       measurement rather than by caution -- see the module docstring on the
+       removed confidence fallback.
 
     Args:
         key: The clip key.
         audio: The audio labeller's record, or ``None``.
         text: The text labeller's record, or ``None``.
-        audio_conf_tau: Confidence threshold for the fallback; ``None`` disables
-            it, which is the default.
 
     Returns:
         The decided row.
@@ -397,15 +411,17 @@ def decide(
     if audio_token == text_token:
         return MergedRow(emo_target=audio_token, decision="agree", **base)
 
-    if (
-        audio_conf_tau is not None
-        and text_token == NEUTRAL_TOKEN
-        and audio_token != NEUTRAL_TOKEN
-        and audio_score is not None
-        and float(audio_score) >= audio_conf_tau
-    ):
-        return MergedRow(emo_target=audio_token, decision="audio_conf", **base)
-
+    # Every disagreement masks. A confidence-based override used to live here --
+    # "text says neutral, audio is sure it is X, take X" -- and the 5,000-clip
+    # pilot of 2026-08-14 killed it: emotion2vec+ large returns surprised for
+    # 32.1% of this corpus and happy for 24.0% against neutral for 1.64%,
+    # scoring 1.000 on ordinary conversational lines, with ~85% of all clips
+    # above 0.7. A threshold therefore selects nearly everything and the
+    # selection is full of confident mislabels, so the override imported that
+    # domain shift into precisely the clips the text labeller had called
+    # neutral. audio_score survives on the row (the neutral cap orders by it,
+    # and the open "is audio trustworthy when it says neutral" question needs
+    # it) but nothing here reads it as evidence of correctness.
     return MergedRow(emo_target=MASK_TOKEN, decision="disagree_masked", **base)
 
 
@@ -482,7 +498,6 @@ def apply_neutral_cap(
 def merge(
     audio: LabelFile,
     text: LabelFile,
-    audio_conf_tau: Optional[float] = None,
     neutral_cap: float = DEFAULT_NEUTRAL_CAP,
     sample: Optional[int] = None,
     seed: int = 0,
@@ -493,7 +508,6 @@ def merge(
     Args:
         audio: The audio labeller's file.
         text: The text labeller's file.
-        audio_conf_tau: See :func:`decide`.
         neutral_cap: See :func:`apply_neutral_cap`.
         sample: Restrict to N keys drawn uniformly at random, for the pilot.
             Drawn from the sorted union so the draw does not depend on file
@@ -512,10 +526,7 @@ def merge(
     if sample is not None and sample < len(keys):
         keys = sorted(random.Random(seed).sample(keys, sample))
 
-    rows = [
-        decide(key, audio.labels.get(key), text.labels.get(key), audio_conf_tau)
-        for key in keys
-    ]
+    rows = [decide(key, audio.labels.get(key), text.labels.get(key)) for key in keys]
     apply_neutral_cap(rows, neutral_cap, warn=warn)
     return rows
 
@@ -566,7 +577,6 @@ def _missing_breakdown(
 
 def summarise(
     rows: Sequence[MergedRow],
-    audio_conf_tau: Optional[float] = None,
     neutral_cap: float = DEFAULT_NEUTRAL_CAP,
     audio: Optional[LabelFile] = None,
     text: Optional[LabelFile] = None,
@@ -575,7 +585,6 @@ def summarise(
 
     Args:
         rows: The merged rows, after the cap.
-        audio_conf_tau: The threshold that was in force, or ``None``.
         neutral_cap: The cap that was in force.
         audio: The audio labeller's file, for the join diagnostics.
         text: The text labeller's file, for the join diagnostics.
@@ -597,7 +606,7 @@ def summarise(
     comparable = [
         row
         for row in rows
-        if row.original_decision in ("agree", "audio_conf", "disagree_masked")
+        if row.original_decision in ("agree", "disagree_masked")
     ]
     agreed = sum(1 for row in comparable if row.original_decision == "agree")
 
@@ -643,11 +652,6 @@ def summarise(
             "neutral_before": distribution.get(NEUTRAL_TOKEN, 0) + neutral_capped,
             "neutral_after": distribution.get(NEUTRAL_TOKEN, 0),
             "demoted": neutral_capped,
-        },
-        "audio_conf_fallback": {
-            "enabled": audio_conf_tau is not None,
-            "tau": audio_conf_tau,
-            "adopted": decisions.get("audio_conf", 0),
         },
         "num_usable": usable,
         "usable_fraction": (usable / total) if total else 0.0,
@@ -719,18 +723,11 @@ def format_summary(stats: Dict[str, Any]) -> str:
             else "  disabled"
         )
     )
-    fallback = stats["audio_conf_fallback"]
-    lines.append(
-        "  audio-conf       : "
-        + (
-            f"tau={fallback['tau']}, adopted {fallback['adopted']}"
-            if fallback["enabled"]
-            else "disabled (default)"
-        )
-    )
-
     confusion = stats["disagreement_confusion"]
     if confusion:
+        # Printed, not just written to the stats JSON: this matrix is how the
+        # acoustic labeller's domain shift is read off a run, and it is the
+        # input to whatever merge rule replaces the removed fallback.
         lines.append("  disagreements (audio -> text):")
         for audio_token, by_text in confusion.items():
             rendered = "  ".join(f"{text}:{n}" for text, n in by_text.items())
@@ -792,17 +789,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="stats JSON destination (default: <out>.stats.json)",
     )
     parser.add_argument(
-        "--audio-conf-fallback",
-        type=float,
-        default=None,
-        metavar="TAU",
-        help=(
-            "adopt the audio label when the text says neutral and the audio is "
-            "at least TAU confident (suggested 0.7). OFF by default -- enable "
-            "only once the pilot's confusion matrix shows the pattern is common"
-        ),
-    )
-    parser.add_argument(
         "--neutral-cap",
         type=float,
         default=DEFAULT_NEUTRAL_CAP,
@@ -858,17 +844,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not 0.0 <= args.min_overlap <= 1.0:
         print("--min-overlap must be between 0 and 1", file=sys.stderr)
         return 1
-    if args.audio_conf_fallback is not None and not 0.0 < args.audio_conf_fallback <= 1.0:
-        # A threshold of 0 or below would adopt the audio label for *every*
-        # text-neutral disagreement regardless of confidence -- the exact
-        # opposite of what someone typing a low number is reaching for, and
-        # indistinguishable in the output from the feature working.
-        print(
-            "--audio-conf-fallback must be in (0, 1]; omit the flag to disable "
-            "the fallback rather than passing 0",
-            file=sys.stderr,
-        )
-        return 1
 
     try:
         audio = load_label_file(args.audio)
@@ -902,7 +877,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         rows = merge(
             audio,
             text,
-            audio_conf_tau=args.audio_conf_fallback,
             neutral_cap=args.neutral_cap,
             sample=args.sample,
             seed=args.seed,
@@ -913,7 +887,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     write_rows(rows, args.out)
-    stats = summarise(rows, args.audio_conf_fallback, args.neutral_cap, audio, text)
+    stats = summarise(rows, args.neutral_cap, audio, text)
     stats_path = args.stats_out or args.out.with_suffix(args.out.suffix + ".stats.json")
     stats_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path.write_text(
