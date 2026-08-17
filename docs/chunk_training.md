@@ -930,6 +930,55 @@ is re-scored on the new val and both figures are recorded — two characters in
 roughly 1.5 M should agree to four decimals, and if they do not, that is a
 finding rather than a rounding note. **`c57be1c8…` is the pin from here on.**
 
+### The audio labeller does not transfer to this domain
+
+A 5,000-clip pilot settled a rule that had been left open on purpose. The
+result is that **`--audio-conf-fallback` is retired permanently.**
+
+emotion2vec+ large over visual-novel dialogue:
+
+| class | share |
+|---|---|
+| surprised | 32.1 % |
+| happy | 24.0 % |
+| neutral | **1.64 %** |
+| other + unknown (masked) | 3.90 % |
+
+Japanese conversational speech is not 32 % surprised and 1.6 % neutral. The
+labeller is reading acted delivery as constant emotional peak — the exact
+domain shift the two-labeller design was built to survive, now measured
+rather than anticipated.
+
+**Confidence is not a proxy for correctness here.** About 85 % of clips score
+above 0.7, and ordinary conversational lines come back as `surprised` at
+score **1.000**. The retired rule was "if audio is confident, override a
+text-neutral disagreement"; at this distribution that threshold selects
+almost the whole corpus and would import the domain shift wholesale.
+
+The disagreement confusion matrix stays in the stats. It is now more useful,
+not less — it is how the shift is read off the full corpus, and it is the
+input to whichever merge rule replaces the retired one.
+
+One direction is still open and deliberately unbuilt: audio saying `neutral`
+is rare, and in the pilot those calls landed on short flat utterances that
+really were flat. A labeller can be worthless in one direction and
+informative in the other. That is a hypothesis, it is unmeasured, and the
+merge analysis is what will decide it.
+
+**A test can only check the assumption it was written from.** The pilot's
+first two submissions died in seconds on a smoke gate, because
+`emotion2vec_plus_large`'s `tokens.txt` ends in a bare `<unk>` rather than the
+`中文/english` pair its other eight classes use — and both the docstring and
+the unit-test fixture asserted the pair. The fixture was written from an
+assumption, so the suite checked the assumption against itself and passed. It
+is now reconstructed from the real file and cross-checked against two
+independent quantities of it, its length and its sha256, with an opt-in check
+that reads the staged artefact directly.
+
+Raising on an unknown class rather than defaulting to the mask is what made
+this cost three seconds of GPU. A fallback would have exited cleanly over
+550,000 clips having masked everything it did not recognise.
+
 ### A second image, because vLLM and numpy cannot share one
 
 `docker/Dockerfile.textlabel` is separate from `Dockerfile.cluster` and will
