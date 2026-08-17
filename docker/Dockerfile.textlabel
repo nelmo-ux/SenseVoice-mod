@@ -397,11 +397,19 @@ RUN { echo 'int main(void){return 0;}' | cc -x c - -o /tmp/ccprobe && /tmp/ccpro
 #     system interpreter's /usr/include/python3.12 (the venv scheme derives
 #     include from installed_base), so it depends on python3-dev being present,
 #     and Debian's posix_local scheme is remapped exactly as Triton remaps it;
-#   - triton.runtime.build._build itself when it is present with the expected
-#     signature, so the real compiler invocation is exercised and not a
-#     reimplementation of it. If it has moved or been renamed the layer says so
-#     in the log and compiles directly instead — it degrades to a weaker check,
-#     never to no check;
+#   - triton.runtime.build._build itself, so the real compiler invocation is
+#     exercised rather than a reimplementation of it. The guard on that call is
+#     the second thing this layer has had to learn. Its first version asserted
+#     that _build's parameter names were a superset of the six it knew about and
+#     then called it without ccflags, which this Triton requires: the guard
+#     passed, the call raised TypeError, and the fallback was never reached. A
+#     superset test answers "does this signature look familiar"; the question is
+#     "can the call I am about to make be made". So the exact keyword set is
+#     assembled first and put through inspect.signature().bind() — if it does not
+#     bind, the layer says so loudly and compiles directly instead, degrading to
+#     a weaker check but never to no check. ccflags and extra_compile_args are
+#     passed as empty lists when the installed signature has them, which is what
+#     Triton's own callers pass when they have no extra flags;
 #   - a genuine CPython extension module, including <cuda.h> from Triton's
 #     bundled backend headers when they are there, which is then loaded through
 #     the import machinery. Compiling proves the headers parse and the compiler
@@ -437,9 +445,13 @@ p=os.path.join(d, "ccprobe.c"); \
 pathlib.Path(p).write_text(src); \
 mod=tri and iu.find_spec("triton.runtime.build") and __import__("triton.runtime.build", fromlist=["_build"]); \
 build=getattr(mod, "_build", None); \
-build=build if build is not None and {"name", "src", "srcdir", "library_dirs", "include_dirs", "libraries"} <= set(inspect.signature(build).parameters) else None; \
-print("build route:", "triton.runtime.build._build" if build else "direct invocation of %s (triton build helper absent or moved)" % cc); \
-so=build(name="ccprobe", src=p, srcdir=d, library_dirs=[], include_dirs=cudainc, libraries=[]) if build else (subprocess.check_call([cc, p, "-O3", "-shared", "-fPIC", "-o", os.path.join(d, "ccprobe.so"), "-I" + pyinc] + ["-I" + i for i in cudainc]) or os.path.join(d, "ccprobe.so")); \
+sig=inspect.signature(build) if build is not None else None; \
+kw=dict(name="ccprobe", src=p, srcdir=d, library_dirs=[], include_dirs=cudainc, libraries=[]); \
+kw.update({k: [] for k in ("ccflags", "extra_compile_args") if sig is not None and k in sig.parameters}); \
+exec("def fits(s, kw):\n try:\n  s.bind(**kw)\n  return True\n except TypeError as why:\n  print(\"WARNING: triton.runtime.build._build exists but will not accept the call this probe intends to make (%s). Compiling directly instead, which still proves the toolchain but does NOT walk the Triton build path, so the strongest half of this check is not running. Update the keyword set above.\" % why)\n  return False\n"); \
+usable=build is not None and fits(sig, kw); \
+print("build route:", "triton.runtime.build._build(%s)" % ", ".join(sorted(kw)) if usable else "DIRECT INVOCATION of %s, the Triton build path was NOT exercised (see the warning above)" % cc); \
+so=build(**kw) if usable else (subprocess.check_call([cc, p, "-O3", "-shared", "-fPIC", "-o", os.path.join(d, "ccprobe.so"), "-I" + pyinc] + ["-I" + i for i in cudainc]) or os.path.join(d, "ccprobe.so")); \
 s=iu.spec_from_file_location("ccprobe", so); \
 m=iu.module_from_spec(s); \
 s.loader.exec_module(m); \

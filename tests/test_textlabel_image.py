@@ -375,6 +375,60 @@ def test_the_toolchain_check_follows_the_path_triton_takes():
         )
 
 
+def test_the_triton_probe_checks_the_call_it_is_about_to_make():
+    """The probe's own version of the mistake it exists to catch.
+
+    Its first version asserted that ``_build``'s parameter names were a superset
+    of the six it knew about, then called it without ``ccflags``, which the
+    installed Triton requires: the guard passed, the call raised TypeError, and
+    the fallback was never reached.  A superset test answers "does this signature
+    look familiar"; what has to hold is "the call I am about to make binds".
+
+    So the invariant pinned here is that the keyword mapping which is *checked*
+    is the mapping which is *passed* -- one dict, bound and then unpacked.  An
+    inline keyword list at the call site is what allowed the two to drift apart.
+
+    Worth noting how that failure went, because it is the property to keep: the
+    probe crashed loudly during a build instead of quietly taking the fallback
+    and reporting success.  It cost one cheap build rather than a GPU job, and a
+    version that had silently degraded would have reported a pass while testing
+    nothing.  The assertions below therefore also require the fallback to
+    announce itself.
+    """
+    text = DOCKERFILE.read_text()
+    assert "s.bind(**kw)" in text, (
+        "the probe no longer validates the _build call with Signature.bind; "
+        "whatever replaced it is describing the signature rather than trying "
+        "the call, which is exactly how the ccflags TypeError got shipped."
+    )
+    assert "build(**kw)" in text, (
+        "the probe binds one keyword mapping and calls _build with something "
+        "else; the check and the call have to be the same dict or they drift."
+    )
+    assert not re.search(r"\bbuild\(name=", text), (
+        "the _build call passes an inline keyword list again. That is the form "
+        "that allowed the guard and the call to disagree -- assemble the kwargs "
+        "once, bind them, then unpack them."
+    )
+    assert "ccflags" in text, (
+        "the probe no longer passes ccflags. The Triton in this image requires "
+        "it, and omitting it is what failed the v2 build."
+    )
+    assert not re.search(r"<=\s*set\(inspect\.signature", text), (
+        "the superset guard is back; it answers a different question from the "
+        "one that matters (see this test's docstring)."
+    )
+    fallback = [i for i in _instructions() if "subprocess.check_call" in i]
+    assert fallback, (
+        "the direct-invocation fallback is gone, so a Triton that renames or "
+        "drops _build would fail the build rather than compile a weaker probe."
+    )
+    assert "NOT exercised" in text and "WARNING" in text, (
+        "the fallback no longer announces itself. A probe that quietly settles "
+        "for the weaker check reports a pass while testing less than it claims."
+    )
+
+
 def test_the_image_tag_names_the_rebuilt_image():
     """v1 is the image that fails on the node, so nothing may still request it.
 
