@@ -150,6 +150,18 @@ Environment overrides (defaults in the CONFIGURATION block of this file):
   MODEL_DIR TRAIN_JSONL VAL_JSONL OUTPUT_DIR DEVICE MAX_EPOCH LR BATCH_TOKENS
   NUM_WORKERS SAVE_INTERVAL KEEP_NBEST RESUME USE_BF16 SMOKE NPROC_PER_NODE
   CHUNK_SIZES STRIDES PAD_LEFTS LOOK_BACKS PYTHON_BIN LR_CEILING
+  EXPECT_TRAIN_HOURS EXPECT_TRAIN_HOURS_TOLERANCE EXPECT_VAL_CLIPS
+
+  EXPECT_TRAIN_HOURS is unset by default and opt-in: set it to the audio-hours
+  the training manifest is supposed to hold and the preflight refuses to start
+  when the manifest disagrees by more than EXPECT_TRAIN_HOURS_TOLERANCE (a
+  fraction, default 0.05 = +/-5%).  EXPECT_VAL_CLIPS is the exact clip count the
+  validation manifest must have -- exact, because val is pinned so that
+  round-to-round numbers stay comparable.  Both exist because a run on a manifest
+  that was silently rebuilt over a subset of the archives SUCCEEDS: it trains,
+  exits 0 and reports preflight=passed, so no other check and no job-status
+  sentinel can distinguish it from the intended run.  Leave them unset and the
+  preflight behaves exactly as it did before.
 
   LR_CEILING defaults to 0.0002 and the run refuses to start when LR exceeds it.
   Raising it is allowed but deliberate: pass LR_CEILING explicitly (e.g.
@@ -556,6 +568,43 @@ TRAIN_JSONL="${TRAIN_JSONL:-/corpus/vn/train.jsonl}"
 VAL_JSONL="${VAL_JSONL:-/corpus/vn/val.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-/outputs/chunk_cluster}"
 
+# --- corpus-size expectation (opt-in; unset = the behaviour this script has
+#     always had) ---
+# WHY THIS GUARD EXISTS
+# A run trained on the WRONG CORPUS SUCCEEDS, and nothing else here can see it.
+# MEASURED: a job whose training manifest had been silently rebuilt over a
+# 4-archive SUBSET trained on 16.5 audio-h where 813.8 were intended, finished in
+# 4 minutes instead of 90, and reported
+#     SENSEVOICE_JOB_OK rc=0 preflight=passed
+# Every other check passed HONESTLY: the manifest parsed, every sampled clip
+# existed and was readable, source_len was in the right units, the projected
+# schedule was self-consistent with the corpus it was handed, the disk budget
+# held, and the job-status sentinel was telling the truth -- the run genuinely
+# succeeded, just at the wrong thing.  The sentinel cannot help with this class of
+# failure by construction, and neither can sacct, the loss curve or the log.
+#
+# The one fact nobody had written down is how big the corpus was SUPPOSED to be:
+# that is knowledge the caller has and the manifest does not, so there is nowhere
+# to derive it from.  It is declared here instead, and checked in the preflight
+# against the audio-hours that preflight already projects.
+#
+# Both expectations are OPT-IN and empty by default -- unset, the preflight is
+# byte-for-byte the preflight it was, so existing invocations are unaffected.
+#   EXPECT_TRAIN_HOURS            audio-hours the train manifest is believed to
+#                                 hold (per epoch, i.e. the corpus itself)
+#   EXPECT_TRAIN_HOURS_TOLERANCE  accepted fractional drift, 0.05 = +/-5%, so a
+#                                 manifest that legitimately moves a little does
+#                                 not block a run
+#   EXPECT_VAL_CLIPS              exact clip count of the val manifest.  Exact
+#                                 rather than toleranced on purpose: val is pinned
+#                                 to a fixed set precisely so round-to-round
+#                                 numbers are comparable, and a silently replaced
+#                                 val invalidates every comparison while looking
+#                                 perfectly healthy.
+EXPECT_TRAIN_HOURS="${EXPECT_TRAIN_HOURS:-}"
+EXPECT_TRAIN_HOURS_TOLERANCE="${EXPECT_TRAIN_HOURS_TOLERANCE:-0.05}"
+EXPECT_VAL_CLIPS="${EXPECT_VAL_CLIPS:-}"
+
 # --- device ---
 DEVICE="${DEVICE:-cuda}"
 SEED="${SEED:-0}"
@@ -700,6 +749,15 @@ if [ "${SMOKE}" = "1" ]; then
     SMOKE_DATA_DIR="${OUTPUT_DIR}/smoke_data"
     TRAIN_JSONL="${SMOKE_DATA_DIR}/smoke_train.jsonl"
     VAL_JSONL="${SMOKE_DATA_DIR}/smoke_val.jsonl"
+    # The smoke manifests are generated locally and have nothing to do with the
+    # real corpus, so a corpus-size expectation inherited from the environment
+    # would fail on data that is exactly right for this mode.  Dropped rather than
+    # checked; the guard exists for TRAIN runs.
+    if [ -n "${EXPECT_TRAIN_HOURS}" ] || [ -n "${EXPECT_VAL_CLIPS}" ]; then
+        info "  ignoring EXPECT_TRAIN_HOURS/EXPECT_VAL_CLIPS: SMOKE uses generated data"
+    fi
+    EXPECT_TRAIN_HOURS=""
+    EXPECT_VAL_CLIPS=""
 
     MAX_EPOCH=1
     LOG_INTERVAL=1
@@ -1247,6 +1305,9 @@ run_preflight() {
         "${KEEP_NBEST}" \
         "${CKPT_SIZE_GIB}" \
         "${BF16_EFFECTIVE}" \
+        "${EXPECT_TRAIN_HOURS}" \
+        "${EXPECT_TRAIN_HOURS_TOLERANCE}" \
+        "${EXPECT_VAL_CLIPS}" \
         <<'PREFLIGHT_PY'
 import json
 import math
@@ -1257,8 +1318,8 @@ import sys
 (
     device, train_jsonl, val_jsonl, model_dir, max_epoch, lr, warmup_arg,
     batch_tokens, samp_cap, units_per_sec, nproc, output_dir, keep_nbest,
-    ckpt_gib, bf16,
-) = sys.argv[1:16]
+    ckpt_gib, bf16, expect_train_hours, expect_train_tol, expect_val_clips,
+) = sys.argv[1:19]
 
 max_epoch = int(max_epoch)
 lr = float(lr)
@@ -1445,9 +1506,10 @@ def inspect(path, label):
 
 
 train = inspect(train_jsonl, "train")
-inspect(val_jsonl, "val")
+val = inspect(val_jsonl, "val")
 
 # --- projected schedule ----------------------------------------------------
+epoch_hours = None
 if train:
     n_clips, total_seconds, total_units = train
     # DDP splits the corpus across ranks, so each rank sees 1/nproc of it and the
@@ -1467,9 +1529,12 @@ if train:
         f"= ~{nproc * batch_tokens / units_per_sec:.0f} effective audio-s/step, "
         f"cap {samp_cap} clips/rank)"
     )
+    # Bound once and reused by the corpus-size expectation below, so the guard
+    # can never disagree with the number printed here.
+    epoch_hours = total_seconds / 3600.0
     print(
-        f"  projected: {total_seconds / 3600.0:.2f} audio-h per epoch, "
-        f"{total_seconds / 3600.0 * max_epoch:.2f} audio-h total"
+        f"  projected: {epoch_hours:.2f} audio-h per epoch, "
+        f"{epoch_hours * max_epoch:.2f} audio-h total"
     )
     if warmup:
         peak = lr * min(1.0, total_steps / warmup)
@@ -1481,6 +1546,87 @@ if train:
             notes.append(
                 f"the run ends inside warmup, so LR only reaches {peak:.2e} of the "
                 f"{lr:.0e} ceiling and never decays. Lower WARMUP_STEPS to plateau."
+            )
+
+# --- corpus-size expectation (opt-in) --------------------------------------
+# The only check here that compares the corpus against something OUTSIDE it.
+# Everything above asks "is this manifest internally consistent and readable",
+# which a manifest rebuilt over a subset of the archives passes perfectly -- it is
+# a valid corpus, just not the intended one, and the resulting run succeeds.  See
+# the WHY block next to EXPECT_TRAIN_HOURS in this file's CONFIGURATION section.
+# Unset expectations are skipped entirely, so the default behaviour is unchanged.
+train_clips = train[0] if train else None
+val_clips = val[0] if val else None
+
+if expect_train_hours.strip():
+    expected_h = None
+    try:
+        expected_h = float(expect_train_hours)
+    except ValueError:
+        pass
+    if expected_h is None or not (expected_h > 0) or math.isinf(expected_h):
+        fail(f"EXPECT_TRAIN_HOURS must be a positive number of hours, got {expect_train_hours!r}")
+        expected_h = None
+
+    tol = None
+    try:
+        tol = float(expect_train_tol)
+    except ValueError:
+        pass
+    if tol is None or not 0.0 <= tol < 1.0:
+        fail(
+            "EXPECT_TRAIN_HOURS_TOLERANCE must be a fraction in [0, 1) "
+            f"(0.05 = +/-5%), got {expect_train_tol!r}"
+        )
+        tol = None
+
+    # epoch_hours is None only when the manifest itself already failed above; that
+    # failure is the one to report, not a comparison against nothing.
+    if expected_h is not None and tol is not None and epoch_hours is not None:
+        low = expected_h * (1.0 - tol)
+        high = expected_h * (1.0 + tol)
+        if low <= epoch_hours <= high:
+            print(
+                f"  corpus size: train {epoch_hours:.2f} audio-h matches "
+                f"EXPECT_TRAIN_HOURS={expected_h:.2f} "
+                f"(+/-{tol * 100:.1f}%, {train_clips} clips)"
+            )
+        else:
+            fail(
+                f"train manifest holds {epoch_hours:.2f} audio-h but "
+                f"EXPECT_TRAIN_HOURS={expected_h:.2f} "
+                f"(tolerance +/-{tol * 100:.1f}%, accepted {low:.2f}-{high:.2f} h); "
+                f"manifests as found: train {train_clips} clips in {train_jsonl}, "
+                f"val {val_clips} clips in {val_jsonl}. "
+                "MOST LIKELY CAUSE: a data-prep run rebuilt this manifest over a "
+                "SUBSET of the archives and replaced the full one. "
+                "Re-run data prep over the full archive set, or pass the corpus "
+                "size you actually intend as EXPECT_TRAIN_HOURS. This is the only "
+                "check that can see it: a run on the wrong corpus trains, "
+                "converges and exits 0."
+            )
+
+if expect_val_clips.strip():
+    expected_val = None
+    try:
+        expected_val = int(expect_val_clips)
+    except ValueError:
+        pass
+    if expected_val is None or expected_val <= 0:
+        fail(f"EXPECT_VAL_CLIPS must be a positive integer clip count, got {expect_val_clips!r}")
+    elif val_clips is not None:
+        if val_clips == expected_val:
+            print(f"  corpus size: val {val_clips} clips matches EXPECT_VAL_CLIPS exactly")
+        else:
+            fail(
+                f"val manifest holds {val_clips} clips but EXPECT_VAL_CLIPS="
+                f"{expected_val} (exact match required, no tolerance: val is "
+                "pinned to a fixed set so round-to-round numbers stay comparable, "
+                "and a replaced val invalidates every comparison while looking "
+                f"perfectly healthy); manifests as found: train {train_clips} "
+                f"clips in {train_jsonl}, val {val_clips} clips in {val_jsonl}. "
+                "MOST LIKELY CAUSE: a data-prep run rebuilt this manifest over a "
+                "SUBSET of the archives and replaced the pinned one."
             )
 
 # --- disk budget -----------------------------------------------------------
