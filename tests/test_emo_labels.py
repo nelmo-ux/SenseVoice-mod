@@ -359,9 +359,11 @@ def test_decide_takes_no_confidence_threshold(merge):
     """The parameter is gone, not defaulted to None.
 
     A retired knob left in the signature is a knob someone re-enables without
-    re-reading why it was retired.
+    re-reading why it was retired. The fourth positional slot now carries
+    ``rule``, so a stale caller passing the old threshold is rejected loudly
+    rather than having its number silently reinterpreted.
     """
-    with pytest.raises(TypeError):
+    with pytest.raises(ValueError, match="unknown rule"):
         merge.decide("k", audio_record("happy"), text_record("neutral"), 0.7)
     assert "audio_conf" not in merge.DECISIONS
 
@@ -858,6 +860,289 @@ def test_missing_breakdown_separates_absent_from_unusable(merge, tmp_path):
         "audio_unusable": 0,
         "text_unusable": 1,  # "b": both ran, text did not parse
     }
+
+
+# ------------------------------------------- rule B1: text-led with audio veto
+
+
+def test_agreement_is_the_default_rule(merge):
+    """The default must stay ``agreement``.
+
+    Not a style preference: the val consensus subset that SER evaluation scores
+    against is built with agreement-only. If the default became B1, the training
+    labels would be judged against a target set produced by the same rule that
+    produced them, and the evaluation would stop being independent without
+    anything failing.
+    """
+    assert merge.DEFAULT_RULE == merge.RULE_AGREEMENT
+    assert set(merge.RULES) == {"agreement", "b1"}
+    row = merge.decide("k", audio_record("happy"), text_record("sad"))
+    assert row.decision == "disagree_masked"  # agreement semantics, unasked
+
+
+def test_b1_adopts_the_text_label_over_a_disagreeing_audio(merge):
+    """The text labeller assigns. Audio disagreement alone does not mask.
+
+    This is the core of B1 and the opposite of the agreement rule: emotion2vec+
+    is domain-shifted here, so its disagreement is weak evidence and the text
+    label stands.
+    """
+    row = merge.decide("k", audio_record("surprised"), text_record("sad"), merge.RULE_B1)
+    assert row.emo_target == "<|SAD|>"
+    assert row.decision == "text_led"
+
+
+def test_b1_records_audio_corroboration_separately(merge):
+    """``agree`` and ``text_led`` adopt the same token but are not the same event.
+
+    Kept apart so the full-corpus stats show how much of B1's output the
+    acoustic labeller actually backs, which is the number that decides whether
+    B1 was the right call.
+    """
+    row = merge.decide("k", audio_record("sad"), text_record("sad"), merge.RULE_B1)
+    assert row.emo_target == "<|SAD|>"
+    assert row.decision == "agree"
+
+
+def test_b1_veto_fires_when_audio_says_neutral(merge):
+    """Audio ``neutral`` over a text emotion masks the clip.
+
+    The one direction the acoustic labeller earned trust in: ``neutral`` is rare
+    from it (1.64% of the pilot) and landed on genuinely flat utterances.
+    """
+    row = merge.decide("k", audio_record("neutral"), text_record("happy"), merge.RULE_B1)
+    assert row.emo_target == merge.MASK_TOKEN
+    assert row.decision == "audio_neutral_veto"
+
+
+def test_b1_veto_does_not_fire_when_both_say_neutral(merge):
+    """A veto against the label it would impose is not a veto."""
+    row = merge.decide("k", audio_record("neutral"), text_record("neutral"), merge.RULE_B1)
+    assert row.emo_target == "<|NEUTRAL|>"
+    assert row.decision == "agree"
+
+
+@pytest.mark.parametrize("audio_label", ["happy", "surprised", "angry", "other", "unknown"])
+def test_b1_veto_fires_only_from_a_neutral_audio_label(merge, audio_label):
+    """No other audio label can veto, however wrong the text looks.
+
+    Guards the asymmetry: the moment a non-neutral audio label can mask, B1 has
+    become "audio has an opinion" again, which is the thing the domain shift
+    ruled out.
+    """
+    row = merge.decide("k", audio_record(audio_label), text_record("sad"), merge.RULE_B1)
+    assert row.emo_target == "<|SAD|>"
+    assert row.decision in ("text_led", "agree")
+
+
+@pytest.mark.parametrize("audio_label", ["other", "unknown"])
+def test_b1_audio_abstention_does_not_mask(merge, audio_label):
+    """An audio ``other``/``unknown`` is not an abstention on the clip's behalf.
+
+    The rules diverge here as much as they do at the veto: under ``agreement``
+    this is ``other_masked``, under B1 the text label simply stands. Pinned
+    because it is the easiest part of B1 to "tidy" into symmetry by accident.
+    """
+    b1 = merge.decide("k", audio_record(audio_label), text_record("angry"), merge.RULE_B1)
+    assert b1.emo_target == "<|ANGRY|>"
+    assert b1.decision == "text_led"
+
+    agreement = merge.decide("k", audio_record(audio_label), text_record("angry"))
+    assert agreement.emo_target == merge.MASK_TOKEN
+    assert agreement.decision == "other_masked"
+
+
+@pytest.mark.parametrize("text_label", ["other", "embarrassed", "sexual"])
+def test_b1_still_masks_when_the_text_labeller_abstains(merge, text_label):
+    """The text side keeps its veto over itself under both rules."""
+    row = merge.decide("k", audio_record("happy"), text_record(text_label), merge.RULE_B1)
+    assert row.emo_target == merge.MASK_TOKEN
+    assert row.decision in ("aux_masked", "other_masked")
+
+
+@pytest.mark.parametrize("missing", ["audio", "text"])
+def test_b1_masks_when_either_side_is_missing(merge, missing):
+    """B1 still needs both sides present -- without audio there is no veto."""
+    row = merge.decide(
+        "k",
+        None if missing == "audio" else audio_record("happy"),
+        None if missing == "text" else text_record("happy"),
+        merge.RULE_B1,
+    )
+    assert row.emo_target == merge.MASK_TOKEN
+    assert row.decision == "missing_masked"
+
+
+def test_b1_rejects_an_unknown_class_like_agreement_does(merge):
+    """The strictness is a property of the join, not of one rule."""
+    with pytest.raises(KeyError, match="unknown audio class"):
+        merge.decide("k", audio_record("elated"), text_record("happy"), merge.RULE_B1)
+
+
+def test_unknown_rule_name_is_rejected(merge):
+    with pytest.raises(ValueError, match="unknown rule"):
+        merge.decide("k", audio_record("happy"), text_record("happy"), "b2")
+
+
+def _both_rules(merge, pairs):
+    """Run both rules over the same pair list; return (agreement_rows, b1_rows)."""
+    audio = merge.LabelFile.from_labels(
+        {f"k{i:03d}": audio_record(a) for i, (a, _) in enumerate(pairs)}
+    )
+    text = merge.LabelFile.from_labels(
+        {f"k{i:03d}": text_record(t) for i, (_, t) in enumerate(pairs)}
+    )
+    return (
+        merge.merge(audio, text, neutral_cap=1.0, rule=merge.RULE_AGREEMENT),
+        merge.merge(audio, text, neutral_cap=1.0, rule=merge.RULE_B1),
+    )
+
+
+def test_the_two_rules_differ_exactly_where_expected(merge):
+    """B1 recovers the disagreements agreement-only throws away, minus the vetoes."""
+    pairs = [
+        ("happy", "happy"),  # agree under both
+        ("surprised", "sad"),  # agreement masks; B1 takes text
+        ("other", "angry"),  # agreement masks; B1 takes text
+        ("neutral", "happy"),  # agreement masks; B1 vetoes -> still masked
+        ("happy", "sexual"),  # both mask: text abstained
+    ]
+    agreement, b1 = _both_rules(merge, pairs)
+    assert [r.emo_target for r in agreement] == [
+        "<|HAPPY|>", merge.MASK_TOKEN, merge.MASK_TOKEN, merge.MASK_TOKEN, merge.MASK_TOKEN
+    ]
+    assert [r.emo_target for r in b1] == [
+        "<|HAPPY|>", "<|SAD|>", "<|ANGRY|>", merge.MASK_TOKEN, merge.MASK_TOKEN
+    ]
+    assert [r.decision for r in b1] == [
+        "agree", "text_led", "text_led", "audio_neutral_veto", "aux_masked"
+    ]
+
+
+def test_agreement_rule_output_is_unchanged_by_the_b1_addition(merge):
+    """``--rule agreement`` must be byte-identical to what it produced before.
+
+    The evaluation subset is regenerated from this path; if adding B1 perturbed
+    it by even one row, every SER number computed against it would shift for a
+    reason unrelated to the model.
+    """
+    pairs = [
+        ("happy", "happy"), ("surprised", "sad"), ("other", "angry"),
+        ("neutral", "happy"), ("happy", "sexual"), ("neutral", "neutral"),
+    ]
+    audio = merge.LabelFile.from_labels(
+        {f"k{i:03d}": audio_record(a, score=0.5 + i / 100) for i, (a, _) in enumerate(pairs)}
+    )
+    text = merge.LabelFile.from_labels(
+        {f"k{i:03d}": text_record(t) for i, (_, t) in enumerate(pairs)}
+    )
+    explicit = merge.merge(audio, text, rule=merge.RULE_AGREEMENT)
+    defaulted = merge.merge(audio, text)  # no rule named at all
+    assert [r.to_json() for r in explicit] == [r.to_json() for r in defaulted]
+    # And the decisions are the pre-B1 vocabulary only.
+    assert {r.decision for r in explicit} <= {
+        "agree", "disagree_masked", "aux_masked", "other_masked",
+        "missing_masked", "neutral_capped",
+    }
+
+
+def test_agreement_rate_and_confusion_are_rule_independent(merge):
+    """Both describe the *labellers*, so neither may move with the rule.
+
+    Computed from the raw labels rather than the decision names, because B1's
+    ``text_led`` and ``audio_neutral_veto`` rows are comparable pairs too -- a
+    decision-name test would drop them from the denominator and report B1 as
+    having far better labeller agreement than agreement-only, from identical
+    inputs.
+    """
+    pairs = [
+        ("happy", "happy"), ("surprised", "sad"), ("other", "angry"),
+        ("neutral", "happy"), ("happy", "sexual"), ("sad", "sad"),
+    ]
+    agreement, b1 = _both_rules(merge, pairs)
+    stats_a = merge.summarise(agreement, neutral_cap=1.0, rule=merge.RULE_AGREEMENT)
+    stats_b = merge.summarise(b1, neutral_cap=1.0, rule=merge.RULE_B1)
+    assert stats_a["agreement_rate"] == stats_b["agreement_rate"]
+    assert stats_a["num_comparable"] == stats_b["num_comparable"]
+    assert stats_a["disagreement_confusion"] == stats_b["disagreement_confusion"]
+    assert stats_a["rule"] == "agreement" and stats_b["rule"] == "b1"
+
+
+def test_b1_yields_more_usable_labels_than_agreement(merge):
+    """The point of B1 is coverage; pin the direction of the inequality."""
+    pairs = [("surprised", "sad")] * 10 + [("happy", "happy")] * 2
+    agreement, b1 = _both_rules(merge, pairs)
+    def usable(rows):
+        return sum(1 for r in rows if r.emo_target != merge.MASK_TOKEN)
+
+    assert usable(agreement) == 2
+    assert usable(b1) == 12
+
+
+def test_b1_is_reachable_through_the_cli(merge, tmp_path):
+    audio_path = write_jsonl(
+        tmp_path / "audio.jsonl", [{"key": "a", **audio_record("surprised")}]
+    )
+    text_path = write_jsonl(tmp_path / "text.jsonl", [{"key": "a", **text_record("sad")}])
+    out = tmp_path / "emo.jsonl"
+    assert (
+        merge.main(
+            [
+                "--audio", str(audio_path), "--text", str(text_path),
+                "--out", str(out), "--rule", "b1",
+            ]
+        )
+        == 0
+    )
+    row = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
+    assert row["emo_target"] == "<|SAD|>"
+    assert row["decision"] == "text_led"
+    stats = json.loads((tmp_path / "emo.jsonl.stats.json").read_text(encoding="utf-8"))["stats"]
+    assert stats["rule"] == "b1"
+
+
+# ---------------------------------------------- B1 yield reproduction (pilot)
+
+#: Point these at the pilot's two label files to reproduce its measured yield.
+#: This is the acceptance check for B1: the rule as implemented here must
+#: reproduce the number the rule as *measured* produced, or they are not the
+#: same rule. Runs nowhere but where the pilot data lives.
+PILOT_AUDIO_ENV = "SENSEVOICE_EMO_PILOT_AUDIO"
+PILOT_TEXT_ENV = "SENSEVOICE_EMO_PILOT_TEXT"
+
+#: The yield the merge analysis reported for B1 with --neutral-cap 0.5 over
+#: 5,000 clips: about 71% of clips carrying a usable (non-mask) label.
+PILOT_B1_EXPECTED_YIELD = 0.71
+PILOT_B1_YIELD_TOLERANCE = 0.02
+
+
+def test_b1_reproduces_the_pilot_yield():
+    """B1 over the pilot's own label files must land at ~71% usable.
+
+    The acceptance check the rule was approved against. If this fails, the rule
+    implemented here is not the rule that was measured, and the number is not
+    the thing to adjust -- report the discrepancy.
+
+    Skipped unless both env vars point at the pilot files, which do not live in
+    the repo.
+    """
+    audio_path = os.environ.get(PILOT_AUDIO_ENV)
+    text_path = os.environ.get(PILOT_TEXT_ENV)
+    if not audio_path or not text_path:
+        pytest.skip(f"set {PILOT_AUDIO_ENV} and {PILOT_TEXT_ENV} to the pilot label files")
+    merge = _load("merge_emo_labels")
+    audio = merge.load_label_file(Path(audio_path))
+    text = merge.load_label_file(Path(text_path))
+    rows = merge.merge(
+        audio, text, neutral_cap=0.5, sample=5000, seed=0, rule=merge.RULE_B1
+    )
+    stats = merge.summarise(rows, neutral_cap=0.5, audio=audio, text=text, rule=merge.RULE_B1)
+    assert stats["usable_fraction"] == pytest.approx(
+        PILOT_B1_EXPECTED_YIELD, abs=PILOT_B1_YIELD_TOLERANCE
+    ), (
+        f"B1 yielded {stats['usable_fraction']:.1%} against the pilot's "
+        f"{PILOT_B1_EXPECTED_YIELD:.0%}. Decisions: {stats['decisions']}"
+    )
 
 
 # ------------------------------------------------------------- cap validation

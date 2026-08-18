@@ -7,11 +7,19 @@ them on ``key`` and decides, per clip, whether their agreement is strong enough
 to be used as supervision.  Its output is what
 ``prepare_vn_data.py --emo-labels`` reads to fill ``emo_target``.
 
+    # training labels (B1: text-led with an audio neutral veto)
     .venv/bin/python scripts/merge_emo_labels.py \\
         --audio outputs/emo_audio.jsonl \\
         --text outputs/emo_text.jsonl \\
+        --rule b1 \\
         --out data/vn/emo_labels.jsonl \\
         --stats-out outputs/emo_merge_stats.json
+
+    # val consensus subset for SER evaluation (agreement-only, the default)
+    .venv/bin/python scripts/merge_emo_labels.py \\
+        --audio outputs/emo_audio_val.jsonl \\
+        --text outputs/emo_text_val.jsonl \\
+        --out data/vn/emo_labels_val_consensus.jsonl
 
 **The two labellers must have been run over the same clips.**  If a pilot used
 ``--limit`` or ``--sample N --seed S``, the identical selection has to have been
@@ -30,6 +38,52 @@ CTC branches at full weight, it simply contributes nothing to the emotion head.
 That is why this script can afford to be strict.  The expensive error is a
 wrong emotion label, which teaches the head something false; the cheap error is
 a mask, which teaches it nothing.
+
+The two rules
+-------------
+
+``--rule`` selects how the two labellers are combined.  Both are kept because
+they serve different consumers, and swapping one for the other silently would
+corrupt the thing the other produces.
+
+``agreement`` (**the default**)
+    Adopt a label only when both labellers map to the same token; mask every
+    other case.  This is the conservative rule described above, and it is what
+    builds the **val consensus subset used for SER evaluation**.  The evaluation
+    path depends on it: if the default changed, the training labels would be
+    scored against a target set built by the very rule they came from, and the
+    measurement would stop being independent.  Do not repoint the default.
+
+``b1`` (opt-in, the rule chosen for **training** labels)
+    Text-led with an audio *veto*.  The text labeller assigns; the audio
+    labeller may only object, and only in one direction.  Measured yield on the
+    pilot: about 71% of clips carry a usable label, against agreement-only's
+    much lower coverage.
+
+Why B1 is shaped that way, so nobody re-derives it: emotion2vec+ large is
+domain-shifted on this corpus -- 32.1% ``surprised``, 24.0% ``happy``, 1.64%
+``neutral``, with confident mislabels throughout (see the removed confidence
+fallback below).  It therefore cannot be trusted to *assign* an emotion.  But
+its ``neutral`` calls are rare and, in the pilot, landed on utterances that
+genuinely were flat.  **A labeller can be worthless in one direction and
+informative in the other**, and B1 uses it only where it earned trust: it can
+say "this line is flat, do not label it as emotional", and nothing else.
+
+Note what B1 deliberately does *not* do: an audio label of ``other`` or
+``unknown`` does not mask the clip.  Under B1 the audio side has no power to
+assign and no power to abstain on the text's behalf -- only the veto.  That is
+the main place the two rules diverge beyond the veto itself.
+
+**How much the veto actually does.**  The veto can fire on at most the clips
+where the audio labeller said ``neutral``, which the pilot measured at 1.64%.
+So B1's yield is set almost entirely by the text labeller's abstention rate and
+the NEUTRAL cap, and the audio labeller moves it by under two points.  That is
+worth knowing before anyone spends a GPU-week on the acoustic pass for the sake
+of the training labels: it is a real but small effect, and the argument for
+keeping it rests on those clips being ones the text labeller gets confidently
+wrong, not on the count.  The acoustic pass is independently required for the
+``agreement`` rule, which the evaluation subset is built from, so this is a
+question about B1's marginal value and not about dropping the labeller.
 
 The NEUTRAL cap
 ---------------
@@ -100,6 +154,10 @@ from typing import Any, Dict, List, Optional, Sequence, Set, TextIO
 
 __all__ = [
     "MASK_TOKEN",
+    "RULES",
+    "RULE_AGREEMENT",
+    "RULE_B1",
+    "DEFAULT_RULE",
     "NEUTRAL_TOKEN",
     "EMOTION_TOKENS",
     "AUDIO_LABEL_TO_TOKEN",
@@ -180,8 +238,24 @@ TEXT_LABEL_TO_TOKEN: Dict[str, str] = {
 AUX_TEXT_LABELS = frozenset({"embarrassed", "sexual"})
 
 #: The decisions :func:`decide` and :func:`apply_neutral_cap` may record.
+#: Adopt a label only where the two labellers agree.  Builds the val consensus
+#: subset that SER evaluation scores against, which is why it stays the default.
+RULE_AGREEMENT = "agreement"
+
+#: Text-led with an audio neutral veto; the rule chosen for training labels.
+RULE_B1 = "b1"
+
+RULES: tuple[str, ...] = (RULE_AGREEMENT, RULE_B1)
+
+#: The default is ``agreement`` on purpose and should not be repointed -- see the
+#: module docstring.  B1 is opt-in so that a job which does not name a rule
+#: cannot silently change what the evaluation subset means.
+DEFAULT_RULE = RULE_AGREEMENT
+
 DECISIONS: tuple[str, ...] = (
     "agree",
+    "text_led",
+    "audio_neutral_veto",
     "disagree_masked",
     "aux_masked",
     "other_masked",
@@ -344,28 +418,83 @@ def overlap_fraction(audio: LabelFile, text: LabelFile) -> float:
 # -------------------------------------------------------------------- decisions
 
 
+def _decide_b1(
+    audio_token: str,
+    text_token: str,
+    text_label: str,
+    base: Dict[str, Any],
+) -> MergedRow:
+    """The B1 branch: the text labeller assigns, the audio labeller may veto.
+
+    Split out rather than inlined because the asymmetry is the whole rule and is
+    easy to "tidy" back into symmetry by accident.  The audio side appears here
+    exactly twice: once to veto, once to distinguish ``agree`` from ``text_led``
+    in the report.  It never assigns and it never masks.
+
+    Args:
+        audio_token: The audio label's token, possibly :data:`MASK_TOKEN`.
+        text_token: The text label's token, possibly :data:`MASK_TOKEN`.
+        text_label: The raw text class, for the aux/other attribution.
+        base: The row fields shared with :func:`decide`.
+
+    Returns:
+        The decided row.
+    """
+    # Only the text side can abstain. An audio ``other``/``unknown`` is not an
+    # abstention on the clip's behalf -- it is the acoustic labeller having no
+    # opinion, which under B1 it is not entitled to act on.
+    if text_token == MASK_TOKEN:
+        decision = "aux_masked" if text_label in AUX_TEXT_LABELS else "other_masked"
+        return MergedRow(emo_target=MASK_TOKEN, decision=decision, **base)
+
+    # The veto, and the only thing the audio labeller may do. Fires only in the
+    # neutral direction: "this utterance is flat, do not call it emotional".
+    # The reverse -- audio claiming an emotion over a text neutral -- is exactly
+    # what the domain shift produces in bulk, and is not honoured.
+    if audio_token == NEUTRAL_TOKEN and text_token != NEUTRAL_TOKEN:
+        return MergedRow(emo_target=MASK_TOKEN, decision="audio_neutral_veto", **base)
+
+    decision = "agree" if audio_token == text_token else "text_led"
+    return MergedRow(emo_target=text_token, decision=decision, **base)
+
+
 def decide(
     key: str,
     audio: Optional[Dict[str, Any]],
     text: Optional[Dict[str, Any]],
+    rule: str = DEFAULT_RULE,
 ) -> MergedRow:
     """Decide one clip's emotion target from the two labellers.
 
-    Rules, in order:
+    ``agreement`` (the default), in order:
 
     1. Either labeller missing -> mask (``missing_masked``).
     2. Either label maps to the mask -> mask (``aux_masked`` when the text
        labeller chose an auxiliary bucket, otherwise ``other_masked``).  The two
        are distinguished only for the report; the target is the same.
     3. Both map to the same token -> adopt it (``agree``).
-    4. Otherwise mask (``disagree_masked``).  There is no override, by
-       measurement rather than by caution -- see the module docstring on the
-       removed confidence fallback.
+    4. Otherwise mask (``disagree_masked``).  There is no confidence override,
+       by measurement rather than by caution -- see the module docstring.
+
+    ``b1``, in order:
+
+    1. Either labeller missing -> mask (``missing_masked``).
+    2. **Text** maps to the mask -> mask (``aux_masked`` / ``other_masked``).
+       Note the asymmetry: an audio ``other``/``unknown`` does *not* mask, because
+       under B1 the audio side may neither assign nor abstain on the text's
+       behalf.
+    3. Audio says ``neutral`` while text says a non-neutral emotion -> the veto
+       fires -> mask (``audio_neutral_veto``).
+    4. Otherwise adopt the **text** label: ``agree`` when audio happens to
+       corroborate it, ``text_led`` when it does not.  Both adopt the same token;
+       they are separated so the stats show how much of B1's output the acoustic
+       labeller actually backs.
 
     Args:
         key: The clip key.
         audio: The audio labeller's record, or ``None``.
         text: The text labeller's record, or ``None``.
+        rule: One of :data:`RULES`.
 
     Returns:
         The decided row.
@@ -375,7 +504,11 @@ def decide(
             table.  Not defaulted to the mask: a class this script does not know
             means the labeller changed under it, and silently masking those
             clips would quietly delete a whole emotion from the training signal.
+        ValueError: On an unknown rule name.
     """
+    if rule not in RULES:
+        raise ValueError(f"unknown rule {rule!r}; known: {', '.join(RULES)}")
+
     audio_label = audio.get("label") if audio else None
     text_label = text.get("label") if text else None
     audio_score = audio.get("score") if audio else None
@@ -397,6 +530,9 @@ def decide(
 
     audio_token = AUDIO_LABEL_TO_TOKEN[audio_label]
     text_token = TEXT_LABEL_TO_TOKEN[text_label]
+
+    if rule == RULE_B1:
+        return _decide_b1(audio_token, text_token, text_label, base)
 
     if audio_token == MASK_TOKEN or text_token == MASK_TOKEN:
         # When both sides abstain at once -- audio ``other``, text ``sexual`` --
@@ -502,12 +638,14 @@ def merge(
     sample: Optional[int] = None,
     seed: int = 0,
     warn: Optional[TextIO] = None,
+    rule: str = DEFAULT_RULE,
 ) -> List[MergedRow]:
     """Join, decide and cap.
 
     Args:
         audio: The audio labeller's file.
         text: The text labeller's file.
+        rule: See :func:`decide`.
         neutral_cap: See :func:`apply_neutral_cap`.
         sample: Restrict to N keys drawn uniformly at random, for the pilot.
             Drawn from the sorted union so the draw does not depend on file
@@ -526,7 +664,9 @@ def merge(
     if sample is not None and sample < len(keys):
         keys = sorted(random.Random(seed).sample(keys, sample))
 
-    rows = [decide(key, audio.labels.get(key), text.labels.get(key)) for key in keys]
+    rows = [
+        decide(key, audio.labels.get(key), text.labels.get(key), rule) for key in keys
+    ]
     apply_neutral_cap(rows, neutral_cap, warn=warn)
     return rows
 
@@ -575,11 +715,34 @@ def _missing_breakdown(
     return breakdown
 
 
+def _both_sides_mapped(row: MergedRow) -> bool:
+    """True when both labellers produced a real emotion token for this clip.
+
+    Defined structurally, from the raw labels, rather than by reading the
+    decision name.  That keeps the agreement rate and the confusion matrix
+    meaning the *same thing* under both rules, which is the only way the two can
+    be compared on one run -- B1's ``text_led`` and ``audio_neutral_veto`` rows
+    are comparable pairs too, and a decision-name test would silently drop them
+    from the denominator and inflate B1's apparent agreement.
+    """
+    if row.audio_label is None or row.text_label is None:
+        return False
+    audio_token = AUDIO_LABEL_TO_TOKEN.get(row.audio_label)
+    text_token = TEXT_LABEL_TO_TOKEN.get(row.text_label)
+    return (
+        audio_token is not None
+        and text_token is not None
+        and audio_token != MASK_TOKEN
+        and text_token != MASK_TOKEN
+    )
+
+
 def summarise(
     rows: Sequence[MergedRow],
     neutral_cap: float = DEFAULT_NEUTRAL_CAP,
     audio: Optional[LabelFile] = None,
     text: Optional[LabelFile] = None,
+    rule: str = DEFAULT_RULE,
 ) -> Dict[str, Any]:
     """Aggregate the merged rows into the stats report.
 
@@ -588,12 +751,13 @@ def summarise(
         neutral_cap: The cap that was in force.
         audio: The audio labeller's file, for the join diagnostics.
         text: The text labeller's file, for the join diagnostics.
+        rule: The rule that produced the rows, recorded in the report.
 
     Returns:
-        A JSON-serialisable report.  The agreement rate and the confusion
-        matrix are computed from ``original_decision``, so the neutral cap --
-        which is a policy applied on top, not a labeller behaviour -- does not
-        move them.
+        A JSON-serialisable report.  The agreement rate and the confusion matrix
+        are computed from the raw labels rather than from the decisions, so
+        neither the neutral cap nor the choice of rule moves them: they describe
+        the *labellers*, not the policy applied on top of them.
     """
     decisions = Counter(row.decision for row in rows)
     distribution = Counter(row.emo_target for row in rows)
@@ -603,16 +767,19 @@ def summarise(
     # that could have agreed. Masked-by-construction pairs are excluded because
     # counting them as disagreements would make the rate a measure of the
     # auxiliary buckets' frequency instead of of labeller agreement.
-    comparable = [
-        row
-        for row in rows
-        if row.original_decision in ("agree", "disagree_masked")
-    ]
-    agreed = sum(1 for row in comparable if row.original_decision == "agree")
+    comparable = [row for row in rows if _both_sides_mapped(row)]
+    agreed = sum(
+        1
+        for row in comparable
+        if AUDIO_LABEL_TO_TOKEN[row.audio_label or ""]
+        == TEXT_LABEL_TO_TOKEN[row.text_label or ""]
+    )
 
     confusion: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for row in comparable:
-        if row.original_decision == "agree":
+        if AUDIO_LABEL_TO_TOKEN[row.audio_label or ""] == (
+            TEXT_LABEL_TO_TOKEN[row.text_label or ""]
+        ):
             continue
         # Subscript, never ``.get(..., MASK_TOKEN)``. Every row reaching here
         # already passed ``decide``'s membership check, so a KeyError is
@@ -627,6 +794,7 @@ def summarise(
     total = len(rows)
     neutral_capped = decisions.get("neutral_capped", 0)
     return {
+        "rule": rule,
         "total_keys": total,
         "decisions": {name: decisions.get(name, 0) for name in DECISIONS},
         "label_distribution": {
@@ -682,6 +850,7 @@ def format_summary(stats: Dict[str, Any]) -> str:
     total = stats["total_keys"]
     lines = [
         "emotion label merge",
+        f"  rule             : {stats.get('rule', DEFAULT_RULE)}",
         f"  clips            : {total}",
         f"  usable labels    : {stats['num_usable']} ({stats['usable_fraction']:.1%})",
     ]
@@ -789,6 +958,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="stats JSON destination (default: <out>.stats.json)",
     )
     parser.add_argument(
+        "--rule",
+        choices=RULES,
+        default=DEFAULT_RULE,
+        help=(
+            f"how to combine the two labellers (default: {DEFAULT_RULE}). "
+            "'agreement' adopts a label only where both labellers match -- this "
+            "builds the val consensus subset SER evaluation scores against, so "
+            "it stays the default. 'b1' is text-led with an audio neutral veto "
+            "and is the rule chosen for training labels"
+        ),
+    )
+    parser.add_argument(
         "--neutral-cap",
         type=float,
         default=DEFAULT_NEUTRAL_CAP,
@@ -881,13 +1062,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sample=args.sample,
             seed=args.seed,
             warn=sys.stderr,
+            rule=args.rule,
         )
     except KeyError as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
     write_rows(rows, args.out)
-    stats = summarise(rows, args.neutral_cap, audio, text)
+    stats = summarise(rows, args.neutral_cap, audio, text, rule=args.rule)
     stats_path = args.stats_out or args.out.with_suffix(args.out.suffix + ".stats.json")
     stats_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path.write_text(
