@@ -779,6 +779,26 @@ CKPT_SIZE_GIB="${CKPT_SIZE_GIB:-2.7}"
 # whatever you have confirmed for your account, and the warning goes quiet.
 TIME_CEILING_HOURS="${TIME_CEILING_HOURS:-8}"
 
+# --- guard: the repo's model class must be the one that actually trains ---
+# WITHOUT ++trust_remote_code=true, funasr loads its OWN built-in SenseVoiceSmall
+# instead of this repo's model.py.  Everything then runs, converges and exits 0
+# while every round-3 change is INERT: no sentinel mapping, no acc_emo, no
+# rich_loss_weight -- and token 24991 trains as a REAL EMOTION CLASS, which is
+# precisely the collapse this round exists to repair.  Nothing raises.
+#
+# Two checks guard it, and the second is the one that matters.  Asserting the
+# flag is on the command line tests the INPUT; this project has been bitten
+# repeatedly by verifying inputs and assuming outcomes.  model.py's constructor
+# logs the line below, and that line can only appear if the repo's class was
+# actually instantiated -- so finding it is direct evidence of the OUTCOME, and it
+# catches every route to the wrong class, not just a missing flag.
+MODEL_CLASS_LOG_MARKER="SenseVoiceSmall rich-loss config:"
+# How long to wait for that line before declaring the wrong class was loaded.
+# Generous: it must survive a cold NFS read of the checkpoint and a DDP rendezvous
+# on a busy node.  The post-run verification is authoritative regardless, so an
+# over-long timeout costs allocation time but never correctness.
+MODEL_CLASS_TIMEOUT="${MODEL_CLASS_TIMEOUT:-900}"
+
 # --- seed checkpoint and emotion-head knobs (opt-in; unset = the behaviour this
 #     script has always had) ---
 # All three are EMPTY by default and append nothing to the command when empty, so
@@ -2301,6 +2321,35 @@ if [ -n "${EMO_MASK_TOKEN_ID}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Guard: ++trust_remote_code=true must be on the command line
+# ---------------------------------------------------------------------------
+# Runs here rather than in the Python preflight because the preflight executes
+# well before CMD is assembled -- and the thing being checked is the assembled
+# command, not the configuration it came from.  It reports through check_fail like
+# every other check, so a real run exits and the EXIT trap records the refusal in
+# the outcome sentinel, while --dry-run downgrades it to a warning.
+#
+# Fatal, not a warning: without it funasr silently substitutes its own model class
+# and the entire reason for this run evaporates while the run still succeeds.
+cmd_has_trust_remote_code=0
+for cmd_arg in "${CMD[@]}"; do
+    if [ "${cmd_arg}" = "++trust_remote_code=true" ]; then
+        cmd_has_trust_remote_code=1
+        break
+    fi
+done
+if [ "${cmd_has_trust_remote_code}" -ne 1 ]; then
+    check_fail "$(printf '%s' \
+        "++trust_remote_code=true is missing from the training command. " \
+        "Without it funasr loads its OWN built-in SenseVoiceSmall instead of " \
+        "this repo's model.py, and the run SUCCEEDS while doing none of what it " \
+        "was submitted to do: no emotion-slot masking, no acc_emo, no " \
+        "rich_loss_weight, and token 24991 (<|SER|>) trained as a real emotion " \
+        "class -- the exact collapse this round exists to repair. Nothing raises " \
+        "and nothing in the log looks wrong. Restore the flag in the CMD array.")"
+fi
+
+# ---------------------------------------------------------------------------
 # OUTPUT_DIR concurrency lock
 # ---------------------------------------------------------------------------
 # Two runs sharing an OUTPUT_DIR is silent, total data loss.  Both write model.pt
@@ -2608,4 +2657,84 @@ info "launching:"
 print_command
 info ""
 
+# ---------------------------------------------------------------------------
+# Guard: prove the repo's model class was the one instantiated
+# ---------------------------------------------------------------------------
+# model.py's constructor logs MODEL_CLASS_LOG_MARKER with the resolved
+# emo_mask_token_id / rich_loss_weight / length_normalized_loss.  That line cannot
+# appear unless the repo's class was actually built, so its presence is evidence
+# of the OUTCOME rather than an inference from the command line -- it catches
+# every route to funasr's built-in class, not just a missing flag.
+#
+# TWO PARTS, AND ONLY ONE OF THEM IS LOAD-BEARING:
+#   * verify_model_class below runs AFTER training and is AUTHORITATIVE.  It
+#     cannot race, cannot be defeated by a slow start, and its failure travels the
+#     normal exit path, so the outcome sentinel reports SENSEVOICE_JOB_FAILED.
+#   * the watchdog is a pure optimisation that kills a doomed run early instead of
+#     letting it burn the whole allocation.  If it never fires, or is disabled, or
+#     misjudges, correctness is unaffected because the post-run check still runs.
+#
+# The watchdog identifies this run's processes by hydra_run_dir, which embeds
+# RUN_ID and so appears in no other job's command line.  That is what makes
+# pkill safe here: there is exactly one process tree carrying that string.
+model_class_watchdog() {
+    local waited=0
+    while [ "${waited}" -lt "${MODEL_CLASS_TIMEOUT}" ]; do
+        if [ -s "${log_file}" ] && grep -qF "${MODEL_CLASS_LOG_MARKER}" "${log_file}" 2>/dev/null; then
+            return 0
+        fi
+        sleep 5
+        waited=$(( waited + 5 ))
+    done
+    # Still nothing.  If the run already ended, leave it alone -- the post-run
+    # check will deliver the verdict on a log that is now complete.
+    pgrep -f "${hydra_run_dir}" >/dev/null 2>&1 || return 0
+    warn "$(printf '%s' \
+        "no '${MODEL_CLASS_LOG_MARKER}' line after ${MODEL_CLASS_TIMEOUT}s: " \
+        "funasr is probably training its OWN built-in SenseVoiceSmall instead of " \
+        "this repo's model.py, which makes the whole run inert. Stopping it now " \
+        "rather than spending the rest of the allocation on it.")"
+    pkill -TERM -f "${hydra_run_dir}" 2>/dev/null || true
+    return 0
+}
+
+model_class_watchdog &
+model_class_watchdog_pid=$!
+
 "${CMD[@]}" 2>&1 | tee "${log_file}"
+
+kill "${model_class_watchdog_pid}" 2>/dev/null || true
+wait "${model_class_watchdog_pid}" 2>/dev/null || true
+
+# Authoritative, and deliberately placed after the training pipeline: reaching
+# this line at all means training exited 0, so a missing marker is the difference
+# between "succeeded" and "succeeded at nothing".
+verify_model_class() {
+    local log="$1"
+    if [ ! -s "${log}" ]; then
+        die "training produced no log at ${log}, so there is no evidence which model class ran"
+    fi
+    if grep -qF "${MODEL_CLASS_LOG_MARKER}" "${log}" 2>/dev/null; then
+        info "model class: verified -- $(grep -F "${MODEL_CLASS_LOG_MARKER}" "${log}" | head -n 1)"
+        return 0
+    fi
+    die "$(printf '%s\n' \
+        "training finished but this repo's model.py was NEVER INSTANTIATED." \
+        "" \
+        "  expected in the log: ${MODEL_CLASS_LOG_MARKER}" \
+        "  log: ${log}" \
+        "" \
+        "model.py logs that line from its constructor, so its absence means funasr" \
+        "built its OWN SenseVoiceSmall instead. Everything this run was submitted" \
+        "to do was therefore INERT: no emotion-slot masking, no acc_emo, no" \
+        "rich_loss_weight -- and token 24991 (<|SER|>) was trained as a REAL" \
+        "EMOTION CLASS, which is the exact collapse this round exists to repair." \
+        "The checkpoints under ${OUTPUT_DIR} are NOT usable for round 3; the run" \
+        "converged and exited 0, so nothing else would have told you." \
+        "" \
+        "USUAL CAUSES: ++trust_remote_code=true missing or overridden; MODEL_DIR" \
+        "pointing at a directory whose configuration.json does not name the repo's" \
+        "class; a funasr upgrade changing how remote code is resolved.")"
+}
+
+verify_model_class "${log_file}"

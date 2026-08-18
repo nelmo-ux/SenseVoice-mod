@@ -168,6 +168,8 @@ def run_script(script, gpu_stub, env=None, dry_run=True, cwd=None):
         "SMOKE",
         "RESUME",
         "TIME_CEILING_HOURS",
+        "MODEL_CLASS_TIMEOUT",
+        "FAKE_TRAINER_LOG",
     ):
         full_env.pop(key, None)
     full_env.update(env or {})
@@ -614,6 +616,189 @@ def test_emo_target_distribution_is_reported_exactly(gpu_stub, manifests):
 
 
 # ---------------------------------------------------------------------------
+# Guard: the repo's model class must be the one that trains
+# ---------------------------------------------------------------------------
+# Without ++trust_remote_code=true funasr loads its own built-in SenseVoiceSmall,
+# every round-3 change is inert, token 24991 trains as a real emotion class, and
+# the run still exits 0.  Two checks guard it: one on the command line (input),
+# one on the training log (outcome).
+MODEL_CLASS_MARKER = "SenseVoiceSmall rich-loss config:"
+
+
+@pytest.fixture(scope="module")
+def trainer_stub_script(tmp_path_factory):
+    """The real script with ONLY the trainer invocation replaced.
+
+    Everything else -- preflight, the OUTPUT_DIR lock, the geometry record, the
+    exit trap and the outcome sentinel -- runs for real, so this exercises the
+    genuine failure path rather than a reimplementation of it.  The stub echoes
+    ``FAKE_TRAINER_LOG`` into the log file that the post-run check reads.
+    """
+    src = open(SCRIPT, encoding="utf-8").read()
+    for placeholder, value in (
+        ("<cluster-registry>", "reg.example.invalid"),
+        ("<project>", "proj"),
+        ("<user>", "someuser"),
+    ):
+        src = src.replace(placeholder, value)
+
+    launch = '"${CMD[@]}" 2>&1 | tee "${log_file}"'
+    assert src.count(launch) == 1, "launch line changed; update this fixture"
+    src = src.replace(launch, "printf '%s\\n' \"${FAKE_TRAINER_LOG:-}\" 2>&1 | tee \"${log_file}\"")
+
+    dest = tmp_path_factory.mktemp("stubbed") / "finetune_chunk_slurm.sh"
+    dest.write_text(src, encoding="utf-8")
+    dest.chmod(0o755)
+    return str(dest)
+
+
+@pytest.fixture(scope="module")
+def real_audio_corpus(tmp_path_factory):
+    """A tiny corpus with real WAVs, so preflight passes all the way to launch."""
+    sf = pytest.importorskip("soundfile")
+    numpy = pytest.importorskip("numpy")
+
+    d = tmp_path_factory.mktemp("corpus")
+    wav_dir = d / "wav"
+    wav_dir.mkdir()
+    rate = 16000
+    records = []
+    for i in range(8):
+        samples = int((2.0 + i * 0.25) * rate)
+        path = wav_dir / f"c{i}.wav"
+        tone = 0.05 * numpy.sin(2 * numpy.pi * 220 * numpy.arange(samples) / rate)
+        sf.write(path, tone.astype("float32"), rate, subtype="PCM_16")
+        records.append(
+            {
+                "key": f"c{i}",
+                "source": str(path),
+                "target": "xin chao cac ban",
+                # source_len is in 10 ms frames: 100 units per second.
+                "source_len": int(samples / rate * 100),
+                "target_len": 4,
+                "emo_target": EMO_SENTINEL if i < 2 else "<|HAPPY|>",
+                "event_target": "<|Speech|>",
+                "text_language": "<|vi|>",
+                "with_or_wo_itn": "<|woitn|>",
+            }
+        )
+    payload = "\n".join(json.dumps(r) for r in records) + "\n"
+    for name in ("train.jsonl", "val.jsonl"):
+        (d / name).write_text(payload, encoding="utf-8")
+    return {"train": str(d / "train.jsonl"), "val": str(d / "val.jsonl")}
+
+
+def test_missing_trust_remote_code_fails_the_command_check(gpu_stub, tmp_path):
+    """Removing the flag from the CMD array must be refused, not tolerated."""
+    src = open(SCRIPT, encoding="utf-8").read()
+    flag_line = '    "++trust_remote_code=true"\n'
+    assert src.count(flag_line) == 1, "flag line changed; update this test"
+    mutated = tmp_path / "notrust.sh"
+    mutated.write_text(src.replace(flag_line, ""), encoding="utf-8")
+    mutated.chmod(0o755)
+
+    result = run_script(str(mutated), gpu_stub)
+    # Located structurally -- the "Warning: " prefix comes from the reporting
+    # machinery, not the prose -- plus the flag token itself.  Matching a sentence
+    # fragment here would make a reworded message look like a broken guard.
+    warnings = [
+        ln
+        for ln in result.stdout.splitlines()
+        if ln.startswith("Warning: ") and "++trust_remote_code=true" in ln
+    ]
+    assert len(warnings) == 1, f"expected the guard to fire once, got {warnings}"
+
+    # The message has to explain the consequence, not just the condition. Pinned
+    # by the two stable nouns that consequence is about -- the class that would be
+    # silently substituted and the token that would be mis-trained -- so the
+    # wording stays editable while the substance stays required.
+    line = warnings[0]
+    assert "sensevoicesmall" in line.lower()
+    assert SER_TOKEN_ID in line
+
+
+def test_trust_remote_code_present_is_silent(gpu_stub):
+    result = run_script(SCRIPT, gpu_stub)
+    assert not [
+        ln
+        for ln in result.stdout.splitlines()
+        if ln.startswith("Warning: ") and "++trust_remote_code=true" in ln
+    ]
+
+
+def test_log_without_model_class_marker_fails_the_run(
+    trainer_stub_script, gpu_stub, real_audio_corpus, tmp_path
+):
+    """Training exits 0 but the repo's class never ran: that is a FAILED job."""
+    out = tmp_path / "out"
+    result = run_script(
+        trainer_stub_script,
+        gpu_stub,
+        dry_run=False,
+        env={
+            "MODEL_DIR": MODEL_DIR,
+            "TRAIN_JSONL": real_audio_corpus["train"],
+            "VAL_JSONL": real_audio_corpus["val"],
+            "OUTPUT_DIR": str(out),
+            "EMO_MASK_TOKEN_ID": SER_TOKEN_ID,
+            "MODEL_CLASS_TIMEOUT": "10",
+            "FAKE_TRAINER_LOG": "step 1 loss=3.2 acc=0.1\nstep 2 loss=2.9 acc=0.2",
+        },
+    )
+
+    assert result.returncode == 1, result.stdout
+    assert "preflight=passed" in result.stdout, "preflight must have passed for this to be meaningful"
+
+    # Pinned to stable anchors rather than sentences: the marker string is a
+    # contract with model.py's constructor, the token id is the thing that would
+    # be mis-trained, and OUTPUT_DIR names the checkpoints the operator must not
+    # trust. All three must survive any rewording of the message; the prose
+    # around them is free to improve.
+    assert MODEL_CLASS_MARKER in result.stdout
+    assert SER_TOKEN_ID in result.stdout
+    assert str(out) in result.stdout
+
+    assert "SENSEVOICE_JOB_FAILED rc=1" in result.stdout
+    assert "SENSEVOICE_JOB_OK" not in result.stdout
+    status = (out / ".job_status").read_text(encoding="utf-8")
+    assert "result=FAILURE" in status
+    assert "marker=SENSEVOICE_JOB_FAILED" in status
+
+
+def test_log_with_model_class_marker_passes(
+    trainer_stub_script, gpu_stub, real_audio_corpus, tmp_path
+):
+    out = tmp_path / "out"
+    result = run_script(
+        trainer_stub_script,
+        gpu_stub,
+        dry_run=False,
+        env={
+            "MODEL_DIR": MODEL_DIR,
+            "TRAIN_JSONL": real_audio_corpus["train"],
+            "VAL_JSONL": real_audio_corpus["val"],
+            "OUTPUT_DIR": str(out),
+            "EMO_MASK_TOKEN_ID": SER_TOKEN_ID,
+            "MODEL_CLASS_TIMEOUT": "10",
+            "FAKE_TRAINER_LOG": (
+                f"INFO {MODEL_CLASS_MARKER} emo_mask_token_id=24991, "
+                "rich_loss_weight=0.3, length_normalized_loss=True\n"
+                "step 1 loss=3.2 acc_emo=0.4"
+            ),
+        },
+    )
+
+    assert result.returncode == 0, result.stdout
+    # "model class:" is a status-line prefix like "wall clock:", not prose.
+    assert any(
+        ln.strip().startswith("model class:") for ln in result.stdout.splitlines()
+    ), result.stdout
+    assert "SENSEVOICE_JOB_OK rc=0" in result.stdout
+    status = (out / ".job_status").read_text(encoding="utf-8")
+    assert "result=SUCCESS" in status
+
+
+# ---------------------------------------------------------------------------
 # Wall-clock ceiling
 # ---------------------------------------------------------------------------
 def test_requested_walltime_over_ceiling_warns(gpu_stub):
@@ -632,11 +817,11 @@ def test_requested_walltime_over_ceiling_warns(gpu_stub):
     assert "note:" in line, "must be a note, not a fatal error"
     assert "--time=24:00:00" in line, "the request must be named"
     assert "8 h" in line, "the believed ceiling must be named"
-    # The consequence and the mitigation both have to be in the message.
-    assert "exit code is discarded" in line
+    # Mitigation and remedy, pinned to stable names rather than sentences: the
+    # chain script the operator is told to use, and the knob they set once they
+    # have confirmed the real ceiling. The prose explaining why is free to change.
     assert "submit_chunk_chain.sh" in line
-    # And it must be honest about what it did not check.
-    assert "cannot be read from inside the container" in line
+    assert "TIME_CEILING_HOURS" in line
 
     assert not any(
         "FAIL:" in ln and "WALL CLOCK" in ln for ln in result.stdout.splitlines()
