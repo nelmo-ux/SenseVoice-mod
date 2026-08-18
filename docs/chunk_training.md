@@ -979,6 +979,44 @@ Raising on an unknown class rather than defaulting to the mask is what made
 this cost three seconds of GPU. A fallback would have exited cleanly over
 550,000 clips having masked everything it did not recognise.
 
+### The rule that was chosen, and what it actually does
+
+Training labels come from **B1: text-led with an audio neutral veto**, NEUTRAL
+cap 0.5. Measured yield on the pilot's 5,000 clips: 3,546 usable, **70.92 %**.
+Agreement-only is kept for *evaluation* — the val consensus subset that SER
+accuracy is scored against is built with it, which is why it remains the
+default and why its output is pinned byte-identical by test.
+
+**The veto does not do what its name says.** It was approved on the theory
+that the audio labeller catches the text labeller's mistakes. Reading the
+cases it actually fires on, it catches something narrower and more specific:
+the text labeller's **semantic over-reading** — flat, level utterances that
+merely *describe* an emotional situation, which the text side scores as the
+emotion being described. That is a better justification than the one it was
+approved on, and a different one. Recorded here so the original rationale
+does not stand unchallenged.
+
+**B1 is closer to single-labeller text labelling than the name suggests.**
+The veto's ceiling is 1.64 % — the rate at which the audio labeller says
+`neutral` at all — and it fired on 19 of 5,000 clips. Yield is set almost
+entirely by text abstention (27.4 %) and the cap. The audio side holds a veto
+it can exercise on roughly one clip in sixty.
+
+Two known error modes, both left in deliberately:
+
+- **Laughter reads as sadness.** Where audio says `happy` on a laugh and text
+  reads the line as `sad`, B1 adopts `sad`. The veto cannot help: it fires
+  only from `audio=neutral`, so a confident audio *disagreement* has no route
+  to block anything. This is structural, not a tuning gap.
+- **`sexual` false positives cost coverage.** `sexual` is 19.6 % of text
+  labels and maps to the mask, so over-firing removes real supervision
+  silently. Worth watching in the full-corpus distribution.
+
+Neither is fixed by adjusting the merge. Both are carried by the acceptance
+gates instead — JVNV macro-F1 against base, and consensus-subset SER accuracy
+— which is where a bad labelling rule should surface. Choosing the gates as
+the defence rather than tightening the rule is the deliberate decision here.
+
 ### A second image, because vLLM and numpy cannot share one
 
 `docker/Dockerfile.textlabel` is separate from `Dockerfile.cluster` and will
