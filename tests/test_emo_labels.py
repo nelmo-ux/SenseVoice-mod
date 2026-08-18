@@ -875,7 +875,7 @@ def test_agreement_is_the_default_rule(merge):
     anything failing.
     """
     assert merge.DEFAULT_RULE == merge.RULE_AGREEMENT
-    assert set(merge.RULES) == {"agreement", "b1"}
+    assert set(merge.RULES) == {"agreement", "b1", "text_led"}
     row = merge.decide("k", audio_record("happy"), text_record("sad"))
     assert row.decision == "disagree_masked"  # agreement semantics, unasked
 
@@ -1027,6 +1027,115 @@ def test_the_two_rules_differ_exactly_where_expected(merge):
     ]
 
 
+# ------------------------------------- rule text_led: B1 with the veto retired
+
+
+def test_text_led_is_b1_without_the_veto(merge):
+    """The two rules differ on exactly one branch and nowhere else.
+
+    Pinned as an equivalence rather than a list of cases, so that any future
+    edit to the shared decision order has to apply to both rules or fail here.
+    """
+    pairs = [
+        ("happy", "happy"), ("surprised", "sad"), ("other", "angry"),
+        ("happy", "sexual"), ("neutral", "neutral"), ("unknown", "fearful"),
+    ]
+    audio = merge.LabelFile.from_labels(
+        {f"k{i:03d}": audio_record(a) for i, (a, _) in enumerate(pairs)}
+    )
+    text = merge.LabelFile.from_labels(
+        {f"k{i:03d}": text_record(t) for i, (_, t) in enumerate(pairs)}
+    )
+    b1 = merge.merge(audio, text, neutral_cap=1.0, rule=merge.RULE_B1)
+    tl = merge.merge(audio, text, neutral_cap=1.0, rule=merge.RULE_TEXT_LED)
+    # No veto-eligible pair here, so the two rules must agree exactly.
+    assert [r.to_json() for r in b1] == [r.to_json() for r in tl]
+
+
+def test_text_led_adopts_what_b1_vetoed(merge):
+    """The one divergence: a clip B1 masks, ``text_led`` labels from the text.
+
+    The veto was retired after a 104-clip inspection found roughly 8 of the
+    pilot's 19 vetoed clips masked wrongly -- 「わーい」 among them, plainly
+    happy, with the audio labeller calling neutral at up to 1.000. The signal
+    was a short-clip artefact (median 1.89 s vetoed against 4.74 s overall),
+    not a read on delivery.
+    """
+    row = merge.decide(
+        "k", audio_record("neutral", score=1.0), text_record("happy"), merge.RULE_TEXT_LED
+    )
+    assert row.emo_target == "<|HAPPY|>"
+    assert row.decision == "text_led"
+
+    vetoed = merge.decide(
+        "k", audio_record("neutral", score=1.0), text_record("happy"), merge.RULE_B1
+    )
+    assert vetoed.emo_target == merge.MASK_TOKEN
+    assert vetoed.decision == "audio_neutral_veto"
+
+
+def test_text_led_never_emits_the_veto_decision(merge):
+    """No input may produce ``audio_neutral_veto`` under ``text_led``.
+
+    The branch being gone is the entire content of the rule, so it is asserted
+    over the whole cross-product rather than on a representative case.
+    """
+    for audio_label in merge.AUDIO_LABEL_TO_TOKEN:
+        for text_label in merge.TEXT_LABEL_TO_TOKEN:
+            row = merge.decide(
+                "k", audio_record(audio_label), text_record(text_label), merge.RULE_TEXT_LED
+            )
+            assert row.decision != "audio_neutral_veto", (audio_label, text_label)
+
+
+def test_b1_is_retained_not_replaced(merge):
+    """B1 must remain selectable and behave exactly as it was measured.
+
+    It is the record of a rule that was measured, justified twice and refuted;
+    the pinned pilot counts are what made the refutation checkable. Deleting it
+    would delete the evidence.
+    """
+    assert merge.RULE_B1 in merge.RULES
+    assert set(merge.RULES) == {"agreement", "b1", "text_led"}
+    assert "audio_neutral_veto" in merge.DECISIONS
+    row = merge.decide("k", audio_record("neutral"), text_record("sad"), merge.RULE_B1)
+    assert row.decision == "audio_neutral_veto"
+
+
+def test_removing_the_veto_also_relaxes_the_neutral_cap(merge):
+    """Returning non-neutral labels raises the cap's allowance too.
+
+    The interaction that decides the acceptance number. The clips the veto
+    masked all had non-neutral text labels -- that is the veto condition -- so
+    returning them grows ``others``, and with ``cap=0.5`` the allowance is
+    ``floor(0.5 * others / 0.5) == others``. Each returned clip therefore admits
+    one previously-demoted neutral as well: the yield moves by **twice** the
+    veto count, not once.
+
+    On the pilot that is +38 rather than +19, which is the whole difference
+    between the two candidate acceptance figures (71.68% vs 71.30%).
+    """
+    # 10 veto-eligible clips, 20 non-neutral agreements, 40 neutrals.
+    labels_a = {f"v{i:03d}": audio_record("neutral", score=0.9) for i in range(10)}
+    labels_t = {f"v{i:03d}": text_record("happy") for i in range(10)}
+    labels_a.update({f"o{i:03d}": audio_record("sad", score=0.9) for i in range(20)})
+    labels_t.update({f"o{i:03d}": text_record("sad") for i in range(20)})
+    labels_a.update({f"n{i:03d}": audio_record("surprised", score=i / 100) for i in range(40)})
+    labels_t.update({f"n{i:03d}": text_record("neutral") for i in range(40)})
+    audio = merge.LabelFile.from_labels(labels_a)
+    text = merge.LabelFile.from_labels(labels_t)
+
+    def usable(rule):
+        rows = merge.merge(audio, text, neutral_cap=0.5, rule=rule)
+        return sum(1 for r in rows if r.emo_target != merge.MASK_TOKEN)
+
+    # B1: others=20, allowed=20, so 20 of 40 neutrals survive -> 40 usable.
+    assert usable(merge.RULE_B1) == 40
+    # text_led: others=30, allowed=30 -> 30 neutrals survive -> 60 usable.
+    # +20 for 10 returned clips, not +10.
+    assert usable(merge.RULE_TEXT_LED) == 60
+
+
 def test_agreement_rule_output_is_unchanged_by_the_b1_addition(merge):
     """``--rule agreement`` must be byte-identical to what it produced before.
 
@@ -1154,6 +1263,35 @@ PILOT_B1_VETO = 19
 #: the number that would move while every decision count stayed put.
 PILOT_B1_NEUTRAL_AFTER_CAP = PILOT_B1_USABLE // 2
 
+#: The same pilot under ``--rule text_led`` (B1 with the veto retired).
+#:
+#: Derived from the B1 counts above, then confirmed by running the rule. The
+#: derivation matters because a figure of **71.30% was in circulation and is
+#: wrong**: it comes from ``3546 + 19 = 3565``, which returns the 19 vetoed
+#: clips but forgets that they are *non-neutral* (that is the veto condition),
+#: so they raise the NEUTRAL cap's allowance by 19 as well and admit 19
+#: previously-demoted neutrals. The yield moves by twice the veto count.
+#:
+#:     others   1773 -> 1792   (+19 returned, all non-neutral)
+#:     allowed  1773 -> 1792   (floor(0.5 * others / 0.5) == others)
+#:     demoted    51 ->   32   (pre-cap neutrals 1824 unchanged)
+#:     usable   3546 -> 3584   (+38)
+#:
+#: ``agree`` and ``text_led`` individually are **not** derivable from the B1
+#: counts: which of the 19 un-demoted neutrals were ``agree`` rather than
+#: ``text_led`` depends on the audio scores. Their sum is pinned instead, and
+#: the split should be pinned exactly once a real ``text_led`` run reports it.
+PILOT_TL_USABLE = 3584
+PILOT_TL_NEUTRAL_AFTER_CAP = PILOT_TL_USABLE // 2
+PILOT_TL_DECISIONS = {
+    "audio_neutral_veto": 0,
+    "disagree_masked": 0,
+    "aux_masked": 1286,
+    "other_masked": 85,
+    "missing_masked": 13,
+    "neutral_capped": 32,
+}
+
 #: Derived, and asserted separately as a readable cross-check. The band is 0.05
 #: pp, not the 2 pp this test originally carried and not the 0.5 pp that was
 #: proposed to replace it. **Neither would work**: the veto moves the yield by
@@ -1239,16 +1377,114 @@ def test_b1_reproduces_the_pilot_yield():
         "the per-decision counts do not account for every clip: " + repr(decisions)
     )
 
+    _assert_neutral_fixed_point(merge, stats, PILOT_B1_NEUTRAL_AFTER_CAP)
+
+
+def _assert_neutral_fixed_point(merge, stats, expected):
+    """The cap's fixed point, asserted against real data."""
     assert (
-        stats["label_distribution"]["counts"][merge.NEUTRAL_TOKEN]
-        == PILOT_B1_NEUTRAL_AFTER_CAP
+        stats["label_distribution"]["counts"][merge.NEUTRAL_TOKEN] == expected
     ), (
         f"the cap left {stats['label_distribution']['counts'][merge.NEUTRAL_TOKEN]} "
-        f"<|NEUTRAL|> labels, not the {PILOT_B1_NEUTRAL_AFTER_CAP} its fixed point "
-        "requires. With cap=0.5 and the cap binding, surviving neutrals must "
-        "exactly equal the non-neutral count. A mismatch here with the decision "
-        "counts above intact points at the cap arithmetic, not the decision order."
+        f"<|NEUTRAL|> labels, not the {expected} its fixed point requires. With "
+        "cap=0.5 and the cap binding, surviving neutrals must exactly equal the "
+        "non-neutral count. A mismatch here with the decision counts intact "
+        "points at the cap arithmetic, not the decision order."
     )
+
+
+def test_text_led_reproduces_the_pilot_yield():
+    """``text_led`` over the pilot's label files must yield 3,584 / 71.68%.
+
+    **71.68%, not the 71.30% that was in circulation.** See
+    :data:`PILOT_TL_DECISIONS` for the derivation: the naive ``3546 + 19``
+    returns the vetoed clips but forgets they are non-neutral, so they also
+    raise the cap's allowance and admit 19 demoted neutrals. The yield moves by
+    twice the veto count.
+
+    If this run reports 3,565 instead, the cap is not re-solving after the
+    decision pass and that is a bug in :func:`apply_neutral_cap`'s
+    interaction with the rule, not a tolerance to widen.
+
+    Skipped unless both env vars point at the pilot files.
+    """
+    audio_path = os.environ.get(PILOT_AUDIO_ENV)
+    text_path = os.environ.get(PILOT_TEXT_ENV)
+    if not audio_path or not text_path:
+        pytest.skip(f"set {PILOT_AUDIO_ENV} and {PILOT_TEXT_ENV} to the pilot label files")
+    merge = _load("merge_emo_labels")
+    audio = merge.load_label_file(Path(audio_path))
+    text = merge.load_label_file(Path(text_path))
+    rows = merge.merge(
+        audio, text, neutral_cap=0.5, sample=PILOT_B1_TOTAL, seed=0,
+        rule=merge.RULE_TEXT_LED,
+    )
+    stats = merge.summarise(
+        rows, neutral_cap=0.5, audio=audio, text=text, rule=merge.RULE_TEXT_LED
+    )
+    decisions = stats["decisions"]
+
+    assert stats["total_keys"] == PILOT_B1_TOTAL
+
+    assert decisions.get("audio_neutral_veto", 0) == 0, (
+        "the audio neutral veto fired under --rule text_led, where the branch "
+        "is supposed to be gone. That is the entire content of this rule: "
+        + repr(decisions)
+    )
+
+    assert {name: decisions.get(name, 0) for name in PILOT_TL_DECISIONS} == (
+        PILOT_TL_DECISIONS
+    ), (
+        "the per-decision breakdown diverges from the derivation.\n"
+        f"  measured: {dict(sorted(decisions.items()))}\n"
+        f"  expected: {dict(sorted(PILOT_TL_DECISIONS.items()))}\n"
+        "neutral_capped is the one to check first: 32, not B1's 51, because "
+        "the 19 returned clips raise the cap's allowance."
+    )
+
+    # agree/text_led individually are not derivable from the B1 counts, so only
+    # their sum is pinned. Pin the split too once a real run reports it.
+    assert decisions["agree"] + decisions["text_led"] == PILOT_TL_USABLE
+    assert decisions["text_led"] > decisions["agree"], (
+        "text_led must dominate agree on a corpus where the acoustic labeller "
+        "is domain-shifted: " + repr(decisions)
+    )
+    assert sum(decisions.values()) == PILOT_B1_TOTAL
+
+    assert stats["num_usable"] == PILOT_TL_USABLE, (
+        f"text_led produced {stats['num_usable']} usable labels, not "
+        f"{PILOT_TL_USABLE}. If it reports {PILOT_B1_USABLE + PILOT_B1_VETO}, the "
+        "cap did not re-solve after the veto's clips returned -- see "
+        "test_removing_the_veto_also_relaxes_the_neutral_cap."
+    )
+    assert stats["usable_fraction"] == pytest.approx(
+        PILOT_TL_USABLE / PILOT_B1_TOTAL, abs=PILOT_B1_YIELD_TOLERANCE
+    )
+    _assert_neutral_fixed_point(merge, stats, PILOT_TL_NEUTRAL_AFTER_CAP)
+
+
+def test_text_led_yields_more_than_b1_on_the_pilot():
+    """The two acceptance numbers, compared on one run.
+
+    Pinned as a delta because that is the quantity the retirement decision
+    turns on, and because +38 rather than +19 is the specific thing the
+    superseded 71.30% figure got wrong.
+    """
+    audio_path = os.environ.get(PILOT_AUDIO_ENV)
+    text_path = os.environ.get(PILOT_TEXT_ENV)
+    if not audio_path or not text_path:
+        pytest.skip(f"set {PILOT_AUDIO_ENV} and {PILOT_TEXT_ENV} to the pilot label files")
+    merge = _load("merge_emo_labels")
+    audio = merge.load_label_file(Path(audio_path))
+    text = merge.load_label_file(Path(text_path))
+
+    def usable(rule):
+        rows = merge.merge(
+            audio, text, neutral_cap=0.5, sample=PILOT_B1_TOTAL, seed=0, rule=rule
+        )
+        return sum(1 for r in rows if r.emo_target != merge.MASK_TOKEN)
+
+    assert usable(merge.RULE_TEXT_LED) - usable(merge.RULE_B1) == 2 * PILOT_B1_VETO
 
 
 # ------------------------------------------------------------- cap validation

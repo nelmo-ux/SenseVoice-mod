@@ -7,11 +7,11 @@ them on ``key`` and decides, per clip, whether their agreement is strong enough
 to be used as supervision.  Its output is what
 ``prepare_vn_data.py --emo-labels`` reads to fill ``emo_target``.
 
-    # training labels (B1: text-led with an audio neutral veto)
+    # training labels (text_led: the text labeller assigns)
     .venv/bin/python scripts/merge_emo_labels.py \\
         --audio outputs/emo_audio.jsonl \\
         --text outputs/emo_text.jsonl \\
-        --rule b1 \\
+        --rule text_led \\
         --out data/vn/emo_labels.jsonl \\
         --stats-out outputs/emo_merge_stats.json
 
@@ -54,11 +54,16 @@ corrupt the thing the other produces.
     scored against a target set built by the very rule they came from, and the
     measurement would stop being independent.  Do not repoint the default.
 
-``b1`` (opt-in, the rule chosen for **training** labels)
+``b1`` (opt-in, **superseded**)
     Text-led with an audio *veto*.  The text labeller assigns; the audio
     labeller may only object, and only in one direction.  Measured yield on the
-    pilot: about 71% of clips carry a usable label, against agreement-only's
-    much lower coverage.
+    pilot: 70.92%.  Retained, with its exact pilot counts pinned in the tests,
+    because it is the record of a rule that was measured, justified twice and
+    then refuted -- see the veto's history below.  Do not use it for new labels.
+
+``text_led`` (opt-in, the rule now used for **training** labels)
+    ``b1`` with the veto branch removed; identical in every other respect.
+    Measured yield on the pilot: **71.68%** (3,584 of 5,000).
 
 Why B1 is shaped that way, so nobody re-derives it: emotion2vec+ large is
 domain-shifted on this corpus -- 32.1% ``surprised``, 24.0% ``happy``, 1.64%
@@ -69,15 +74,23 @@ genuinely were flat.  **A labeller can be worthless in one direction and
 informative in the other**, and B1 uses it only where it earned trust: it can
 say "this line is flat, do not label it as emotional", and nothing else.
 
-What the veto really does, corrected after manual inspection: it was approved on
-the theory that the audio labeller detects the text labeller's *errors*.  The
-inspected cases show something narrower and more interesting -- it detects the
-text labeller's **semantic over-reading**, flat level utterances that merely
-*describe* an emotional situation and which the text side scores as the emotion
-being described.  A transcript cannot distinguish describing an emotion from
-expressing one; a waveform can.  That is a better justification than the
-original, but it is a different one, and it predicts different things -- see the
-comment on the veto branch in :func:`_decide_b1`.
+The veto's three-stage history, kept because the shape of it is instructive:
+
+1. **Approved** on the theory that the audio labeller detects the text
+   labeller's *errors*.
+2. **Re-justified** after a first inspection as detecting the text labeller's
+   *semantic over-reading* -- flat utterances describing an emotional situation
+   rather than expressing one.
+3. **Refuted** by a 104-clip inspection: of the 19 vetoed clips, roughly 8 were
+   masked wrongly, with the audio labeller calling them ``neutral`` at up to
+   1.000 confidence over correct text labels (「わーい」, plainly ``happy``,
+   among them).  The ``audio=neutral`` signal is largely a **short-clip
+   artefact** -- median duration 1.89 s among vetoed clips against 4.74 s
+   overall -- and not a read on delivery at all.
+
+Two successive justifications for one mechanism, both post hoc, both wrong, is
+the pattern to notice: the branch kept being re-explained rather than
+re-measured.  Hence ``text_led``, which drops it.
 
 Note what B1 deliberately does *not* do: an audio label of ``other`` or
 ``unknown`` does not mask the clip.  Under B1 the audio side has no power to
@@ -280,10 +293,18 @@ AUX_TEXT_LABELS = frozenset({"embarrassed", "sexual"})
 #: subset that SER evaluation scores against, which is why it stays the default.
 RULE_AGREEMENT = "agreement"
 
-#: Text-led with an audio neutral veto; the rule chosen for training labels.
+#: Text-led with an audio neutral veto.  Superseded by :data:`RULE_TEXT_LED`
+#: after the veto was refuted, and kept because it is the rule the pilot
+#: measured and the tests pin: deleting it would delete the record.
 RULE_B1 = "b1"
 
-RULES: tuple[str, ...] = (RULE_AGREEMENT, RULE_B1)
+#: B1 with the veto removed -- the rule now used for training labels.  Named
+#: after its sole adopting decision, which is also called ``text_led``; the
+#: collision is deliberate, since with the veto gone the rule *is* "adopt the
+#: text label".
+RULE_TEXT_LED = "text_led"
+
+RULES: tuple[str, ...] = (RULE_AGREEMENT, RULE_B1, RULE_TEXT_LED)
 
 #: The default is ``agreement`` on purpose and should not be repointed -- see the
 #: module docstring.  B1 is opt-in so that a job which does not name a rule
@@ -461,19 +482,27 @@ def _decide_b1(
     text_token: str,
     text_label: str,
     base: Dict[str, Any],
+    veto: bool = True,
 ) -> MergedRow:
-    """The B1 branch: the text labeller assigns, the audio labeller may veto.
+    """The text-led family: the text labeller assigns, audio may only object.
 
     Split out rather than inlined because the asymmetry is the whole rule and is
     easy to "tidy" back into symmetry by accident.  The audio side appears here
-    exactly twice: once to veto, once to distinguish ``agree`` from ``text_led``
-    in the report.  It never assigns and it never masks.
+    at most twice: once to veto (``veto=True`` only), once to distinguish
+    ``agree`` from ``text_led`` in the report.  It never assigns and it never
+    masks.
+
+    ``veto=True`` is B1; ``veto=False`` is the ``text_led`` rule, which is B1
+    with the veto branch removed after the manual inspection retired it.  The
+    two share this function so that a change to the surrounding decision order
+    cannot silently apply to one and not the other.
 
     Args:
         audio_token: The audio label's token, possibly :data:`MASK_TOKEN`.
         text_token: The text label's token, possibly :data:`MASK_TOKEN`.
         text_label: The raw text class, for the aux/other attribution.
         base: The row fields shared with :func:`decide`.
+        veto: Whether the audio neutral veto is active.
 
     Returns:
         The decided row.
@@ -505,7 +534,18 @@ def _decide_b1(
     # text labeller's error rate, and improving the text prompt should shrink
     # it. Under the real one it tracks how much of the corpus is narration
     # rather than dialogue, and a better text prompt will not move it much.
-    if audio_token == NEUTRAL_TOKEN and text_token != NEUTRAL_TOKEN:
+    #
+    # RETIRED for the ``text_led`` rule (``veto=False``). A 104-clip manual
+    # inspection found roughly 8 of the pilot's 19 vetoed clips were masked
+    # wrongly -- the audio labeller called them neutral at up to 1.000
+    # confidence while the text label was correct, 「わーい」 among them. The
+    # audio-neutral signal is largely a SHORT-CLIP ARTEFACT: median duration
+    # 1.89 s among vetoed clips against 4.74 s overall. Both justifications the
+    # branch was approved on -- first "audio catches text errors", then "audio
+    # catches semantic over-reading" -- are refuted, so it is off by default in
+    # the rule now used for training labels. Kept here, and exercised by
+    # ``--rule b1``, because it is the record of what was measured.
+    if veto and audio_token == NEUTRAL_TOKEN and text_token != NEUTRAL_TOKEN:
         return MergedRow(emo_target=MASK_TOKEN, decision="audio_neutral_veto", **base)
 
     decision = "agree" if audio_token == text_token else "text_led"
@@ -529,6 +569,8 @@ def decide(
     3. Both map to the same token -> adopt it (``agree``).
     4. Otherwise mask (``disagree_masked``).  There is no confidence override,
        by measurement rather than by caution -- see the module docstring.
+
+    ``text_led`` is ``b1`` with step 3 removed; every other step is identical.
 
     ``b1``, in order:
 
@@ -585,8 +627,10 @@ def decide(
     audio_token = AUDIO_LABEL_TO_TOKEN[audio_label]
     text_token = TEXT_LABEL_TO_TOKEN[text_label]
 
-    if rule == RULE_B1:
-        return _decide_b1(audio_token, text_token, text_label, base)
+    if rule in (RULE_B1, RULE_TEXT_LED):
+        return _decide_b1(
+            audio_token, text_token, text_label, base, veto=(rule == RULE_B1)
+        )
 
     if audio_token == MASK_TOKEN or text_token == MASK_TOKEN:
         # When both sides abstain at once -- audio ``other``, text ``sexual`` --
@@ -1019,8 +1063,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             f"how to combine the two labellers (default: {DEFAULT_RULE}). "
             "'agreement' adopts a label only where both labellers match -- this "
             "builds the val consensus subset SER evaluation scores against, so "
-            "it stays the default. 'b1' is text-led with an audio neutral veto "
-            "and is the rule chosen for training labels"
+            "it stays the default. 'text_led' adopts the text label and is the "
+            "rule used for training labels. 'b1' is 'text_led' plus an audio "
+            "neutral veto that a manual inspection refuted -- superseded, kept "
+            "for reproducing the pilot"
         ),
     )
     parser.add_argument(
