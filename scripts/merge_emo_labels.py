@@ -69,21 +69,52 @@ genuinely were flat.  **A labeller can be worthless in one direction and
 informative in the other**, and B1 uses it only where it earned trust: it can
 say "this line is flat, do not label it as emotional", and nothing else.
 
+What the veto really does, corrected after manual inspection: it was approved on
+the theory that the audio labeller detects the text labeller's *errors*.  The
+inspected cases show something narrower and more interesting -- it detects the
+text labeller's **semantic over-reading**, flat level utterances that merely
+*describe* an emotional situation and which the text side scores as the emotion
+being described.  A transcript cannot distinguish describing an emotion from
+expressing one; a waveform can.  That is a better justification than the
+original, but it is a different one, and it predicts different things -- see the
+comment on the veto branch in :func:`_decide_b1`.
+
 Note what B1 deliberately does *not* do: an audio label of ``other`` or
 ``unknown`` does not mask the clip.  Under B1 the audio side has no power to
 assign and no power to abstain on the text's behalf -- only the veto.  That is
 the main place the two rules diverge beyond the veto itself.
 
-**How much the veto actually does.**  The veto can fire on at most the clips
-where the audio labeller said ``neutral``, which the pilot measured at 1.64%.
-So B1's yield is set almost entirely by the text labeller's abstention rate and
-the NEUTRAL cap, and the audio labeller moves it by under two points.  That is
-worth knowing before anyone spends a GPU-week on the acoustic pass for the sake
-of the training labels: it is a real but small effect, and the argument for
-keeping it rests on those clips being ones the text labeller gets confidently
-wrong, not on the count.  The acoustic pass is independently required for the
-``agreement`` rule, which the evaluation subset is built from, so this is a
-question about B1's marginal value and not about dropping the labeller.
+**Where the yield ceiling actually is.**  The pilot's per-decision breakdown
+over 5,000 clips, which ``tests/test_emo_labels.py`` pins exactly:
+
+======================  ======  =======================================
+decision                count   what it means
+======================  ======  =======================================
+``text_led``            2,988   text label adopted, audio disagreed
+``agree``                 558   text label adopted, audio corroborated
+``aux_masked``          1,286   text declined to use the seven
+``other_masked``           85   a labeller had no opinion
+``neutral_capped``         51   demoted by the NEUTRAL cap
+``audio_neutral_veto``     19   the veto fired
+``missing_masked``         13   one side never saw the clip
+======================  ======  =======================================
+
+3,546 usable, 70.92%.  Read the masking column: **``aux_masked`` is 25.7% of the
+corpus and dwarfs every other masking reason combined** (1,286 against 168).
+``sexual`` alone accounts for 19.6% of all text labels.
+
+So B1's yield is not limited by the veto, nor by the cap, nor by disagreement --
+it is limited almost entirely by the text labeller declining to place a clip in
+the seven emotions at all.  Anyone trying to raise coverage should start there
+and nowhere else: the other five masking reasons together cannot yield more than
+3.4 points even if every one of them were eliminated.
+
+The veto, by contrast, can fire on at most the clips where the audio labeller
+said ``neutral`` (1.64% of the corpus), and fired on 19.  It is kept because
+those 19 are clips the text labeller gets confidently wrong, not because of the
+count -- see :func:`_decide_b1` for what it actually detects.  Note also that
+the acoustic pass is independently required for the ``agreement`` rule that the
+evaluation subset is built from, so its cost is not B1's to justify.
 
 The NEUTRAL cap
 ---------------
@@ -235,6 +266,13 @@ TEXT_LABEL_TO_TOKEN: Dict[str, str] = {
 #: Text classes that are auxiliary buckets rather than a refusal.  Separated
 #: from ``other`` in the decision log so the pilot can tell "the model had no
 #: opinion" apart from "the model recognised a category we do not train".
+#:
+#: That separation turned out to matter more than expected: these two buckets
+#: mask 25.7% of the corpus between them, more than every other masking reason
+#: combined, and ``sexual`` alone is 19.6% of all text labels.  They are the
+#: single largest term in B1's coverage -- see the module docstring.  Had they
+#: been folded into ``other``, the pilot would have shown one undifferentiated
+#: mask bucket and the ceiling would have been invisible.
 AUX_TEXT_LABELS = frozenset({"embarrassed", "sexual"})
 
 #: The decisions :func:`decide` and :func:`apply_neutral_cap` may record.
@@ -451,6 +489,22 @@ def _decide_b1(
     # neutral direction: "this utterance is flat, do not call it emotional".
     # The reverse -- audio claiming an emotion over a text neutral -- is exactly
     # what the domain shift produces in bulk, and is not honoured.
+    #
+    # What it actually catches, from manual inspection of the pilot's vetoed
+    # clips: NOT "the text labeller made a mistake", which is the theory this
+    # branch was approved on. It catches the text labeller's *semantic
+    # over-reading* -- flat, level utterances that merely **describe** an
+    # emotional situation, which the text side scores as the emotion being
+    # described. "Then she started crying" read as <|SAD|>; the delivery is
+    # level narration. The transcript alone genuinely cannot distinguish
+    # describing an emotion from expressing one, and the waveform can, which is
+    # a better justification than the original one but a different one.
+    #
+    # It matters that this is written down, because the two theories predict
+    # different things. Under the original theory the veto should grow with the
+    # text labeller's error rate, and improving the text prompt should shrink
+    # it. Under the real one it tracks how much of the corpus is narration
+    # rather than dialogue, and a better text prompt will not move it much.
     if audio_token == NEUTRAL_TOKEN and text_token != NEUTRAL_TOKEN:
         return MergedRow(emo_target=MASK_TOKEN, decision="audio_neutral_veto", **base)
 

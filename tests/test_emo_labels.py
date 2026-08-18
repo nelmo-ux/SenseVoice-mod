@@ -1006,16 +1006,24 @@ def test_the_two_rules_differ_exactly_where_expected(merge):
         ("other", "angry"),  # agreement masks; B1 takes text
         ("neutral", "happy"),  # agreement masks; B1 vetoes -> still masked
         ("happy", "sexual"),  # both mask: text abstained
+        # Both neutral: the veto must NOT fire, or it would mask the very label
+        # it would have imposed. Included here as well as in its own test
+        # because dropping the `text_token != NEUTRAL` clause is otherwise the
+        # thinnest-guarded mutation in the rule -- a mutation sweep found it
+        # caught by exactly one assertion.
+        ("neutral", "neutral"),
     ]
     agreement, b1 = _both_rules(merge, pairs)
     assert [r.emo_target for r in agreement] == [
-        "<|HAPPY|>", merge.MASK_TOKEN, merge.MASK_TOKEN, merge.MASK_TOKEN, merge.MASK_TOKEN
+        "<|HAPPY|>", merge.MASK_TOKEN, merge.MASK_TOKEN, merge.MASK_TOKEN,
+        merge.MASK_TOKEN, "<|NEUTRAL|>",
     ]
     assert [r.emo_target for r in b1] == [
-        "<|HAPPY|>", "<|SAD|>", "<|ANGRY|>", merge.MASK_TOKEN, merge.MASK_TOKEN
+        "<|HAPPY|>", "<|SAD|>", "<|ANGRY|>", merge.MASK_TOKEN,
+        merge.MASK_TOKEN, "<|NEUTRAL|>",
     ]
     assert [r.decision for r in b1] == [
-        "agree", "text_led", "text_led", "audio_neutral_veto", "aux_masked"
+        "agree", "text_led", "text_led", "audio_neutral_veto", "aux_masked", "agree"
     ]
 
 
@@ -1110,18 +1118,65 @@ def test_b1_is_reachable_through_the_cli(merge, tmp_path):
 PILOT_AUDIO_ENV = "SENSEVOICE_EMO_PILOT_AUDIO"
 PILOT_TEXT_ENV = "SENSEVOICE_EMO_PILOT_TEXT"
 
-#: The yield the merge analysis reported for B1 with --neutral-cap 0.5 over
-#: 5,000 clips: about 71% of clips carrying a usable (non-mask) label.
-PILOT_B1_EXPECTED_YIELD = 0.71
-PILOT_B1_YIELD_TOLERANCE = 0.02
+#: The full per-decision breakdown measured by B1 with ``--neutral-cap 0.5``
+#: over the pilot's 5,000 clips, reproduced independently by a second
+#: implementation.
+#:
+#: Every branch gets its own tripwire.  Pinning only ``usable`` and ``veto``
+#: leaves a whole class of change invisible: a mutation that moves clips between
+#: two *masking* reasons -- say text abstention into missing, or veto into
+#: cap -- alters neither total, and would pass silently.
+#:
+#: ``disagree_masked`` is absent from the measurement and is asserted to be zero
+#: below.  That is not a formality: it is the agreement rule's decision, so any
+#: non-zero value means the agreement branch leaked into a B1 run.
+PILOT_B1_DECISIONS = {
+    "agree": 558,
+    "text_led": 2988,
+    "audio_neutral_veto": 19,
+    "aux_masked": 1286,
+    "other_masked": 85,
+    "missing_masked": 13,
+    "neutral_capped": 51,
+    "disagree_masked": 0,
+}
+
+PILOT_B1_TOTAL = 5000
+PILOT_B1_USABLE = 3546  # agree + text_led
+PILOT_B1_VETO = 19
+
+#: Derived, not measured: with ``cap=0.5`` and the cap actually binding (which
+#: ``neutral_capped=51 > 0`` establishes), :func:`apply_neutral_cap` keeps
+#: ``allowed = floor(0.5 * others / 0.5) = others``, so the surviving
+#: ``<|NEUTRAL|>`` count must equal the non-neutral count exactly -- 3546 / 2.
+#: Asserted because it ties the cap's fixed-point property to real data: if the
+#: cap were re-implemented as the tempting ``cap * current_total`` trim, this is
+#: the number that would move while every decision count stayed put.
+PILOT_B1_NEUTRAL_AFTER_CAP = PILOT_B1_USABLE // 2
+
+#: Derived, and asserted separately as a readable cross-check. The band is 0.05
+#: pp, not the 2 pp this test originally carried and not the 0.5 pp that was
+#: proposed to replace it. **Neither would work**: the veto moves the yield by
+#: 19/5000 = 0.38 pp, so a +/-0.5 pp band still passes with the veto branch
+#: deleted, and the assertion would go on certifying "text-led labelling with a
+#: neutral cap" while the one mechanism that distinguishes B1 was missing. Any
+#: band wide enough to absorb a real drift is wider than the effect being
+#: checked, which is why the exact counts above carry the test and this is only
+#: a legibility aid.
+PILOT_B1_YIELD_TOLERANCE = 0.0005
 
 
 def test_b1_reproduces_the_pilot_yield():
-    """B1 over the pilot's own label files must land at ~71% usable.
+    """B1 over the pilot's own label files must reproduce its measured counts.
 
     The acceptance check the rule was approved against. If this fails, the rule
-    implemented here is not the rule that was measured, and the number is not
+    implemented here is not the rule that was measured, and the numbers are not
     the thing to adjust -- report the discrepancy.
+
+    Pinned to exact counts against a specific pair of label files, in the same
+    spirit as the ``tokens.txt`` sha256 above: relabelling the pilot invalidates
+    these numbers by design, and the fix is then to re-measure and re-pin, not
+    to widen the tolerance.
 
     Skipped unless both env vars point at the pilot files, which do not live in
     the repo.
@@ -1134,14 +1189,65 @@ def test_b1_reproduces_the_pilot_yield():
     audio = merge.load_label_file(Path(audio_path))
     text = merge.load_label_file(Path(text_path))
     rows = merge.merge(
-        audio, text, neutral_cap=0.5, sample=5000, seed=0, rule=merge.RULE_B1
+        audio, text, neutral_cap=0.5, sample=PILOT_B1_TOTAL, seed=0, rule=merge.RULE_B1
     )
     stats = merge.summarise(rows, neutral_cap=0.5, audio=audio, text=text, rule=merge.RULE_B1)
+    decisions = stats["decisions"]
+
+    assert stats["total_keys"] == PILOT_B1_TOTAL, (
+        "the pilot sample is not 5,000 clips, so none of the counts below are "
+        "comparable with the measurement -- check the label files and --sample"
+    )
+
+    # First, because it is the assertion the others cannot make. The veto is
+    # B1's smallest-effect branch and the only one that distinguishes it from
+    # plain text-led labelling; a tolerance-based check cannot see it.
+    assert decisions["audio_neutral_veto"] == PILOT_B1_VETO, (
+        f"the audio neutral veto fired {decisions['audio_neutral_veto']} times, "
+        f"not the {PILOT_B1_VETO} measured on this pilot pair. The veto is what "
+        "makes this rule B1 rather than text-led-with-a-cap: if it is 0 the "
+        "branch is not firing at all, and any other number means the condition "
+        "or its ordering changed. Full decisions: " + repr(decisions)
+    )
+
+    assert stats["num_usable"] == PILOT_B1_USABLE, (
+        f"B1 produced {stats['num_usable']} usable labels, not the "
+        f"{PILOT_B1_USABLE} measured. The veto count above is correct, so the "
+        "divergence is elsewhere in the decision order -- compare the "
+        "per-decision counts against the pilot's: " + repr(decisions)
+    )
+
     assert stats["usable_fraction"] == pytest.approx(
-        PILOT_B1_EXPECTED_YIELD, abs=PILOT_B1_YIELD_TOLERANCE
+        PILOT_B1_USABLE / PILOT_B1_TOTAL, abs=PILOT_B1_YIELD_TOLERANCE
+    )
+
+    # Every branch, individually. A count check on totals alone is blind to any
+    # mutation that only relabels a decision or shuffles clips between two
+    # masking reasons -- both leave ``num_usable`` and the veto count untouched.
+    assert {name: decisions.get(name, 0) for name in PILOT_B1_DECISIONS} == (
+        PILOT_B1_DECISIONS
     ), (
-        f"B1 yielded {stats['usable_fraction']:.1%} against the pilot's "
-        f"{PILOT_B1_EXPECTED_YIELD:.0%}. Decisions: {stats['decisions']}"
+        "the per-decision breakdown diverges from the pilot's. Compare branch "
+        "by branch -- a pair of counts that moved by equal and opposite amounts "
+        "means clips changed masking reason without changing the yield, which "
+        "none of the assertions above can see.\n"
+        f"  measured: {dict(sorted(decisions.items()))}\n"
+        f"  expected: {dict(sorted(PILOT_B1_DECISIONS.items()))}"
+    )
+
+    assert sum(decisions.values()) == PILOT_B1_TOTAL, (
+        "the per-decision counts do not account for every clip: " + repr(decisions)
+    )
+
+    assert (
+        stats["label_distribution"]["counts"][merge.NEUTRAL_TOKEN]
+        == PILOT_B1_NEUTRAL_AFTER_CAP
+    ), (
+        f"the cap left {stats['label_distribution']['counts'][merge.NEUTRAL_TOKEN]} "
+        f"<|NEUTRAL|> labels, not the {PILOT_B1_NEUTRAL_AFTER_CAP} its fixed point "
+        "requires. With cap=0.5 and the cap binding, surviving neutrals must "
+        "exactly equal the non-neutral count. A mismatch here with the decision "
+        "counts above intact points at the cap arithmetic, not the decision order."
     )
 
 
