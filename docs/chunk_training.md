@@ -979,7 +979,69 @@ Raising on an unknown class rather than defaulting to the mask is what made
 this cost three seconds of GPU. A fallback would have exited cleanly over
 550,000 clips having masked everything it did not recognise.
 
-### The rule that was chosen, and what it actually does
+### The rule that was chosen, after two justifications failed
+
+Training labels come from **plain text-led** — the text label, with the
+NEUTRAL cap at 0.5 — and nothing from the audio side. Agreement-only is kept
+for *evaluation*: the val consensus subset that SER accuracy is scored
+against is built with it, which is why it stays the default and why its
+output is pinned byte-identical by test.
+
+The audio neutral veto was proposed, measured, justified twice, and retired.
+It is worth the space because the way it died is the useful part.
+
+- **First justification**: the audio labeller catches the text labeller's
+  errors. Refuted by reading the cases — that is not what it was doing.
+- **Second justification**: it catches the text labeller's *semantic
+  over-reading*, flat lines that merely describe an emotion. Better, and it
+  survived until a larger sample.
+- **What 104 inspected clips actually show**: of 19 vetoed clips, about **8
+  were wrongly masked**. `audio=neutral` is largely a **short-clip
+  artefact** — median duration 1.89 s among vetoed clips against 4.74 s
+  overall. 「わーい」, plainly `happy`, was deleted at audio confidence
+  1.000.
+
+So the mechanism removed correct labels more often than it removed wrong
+ones. It was retired rather than kept on the grounds that its effect was
+small — a mechanism with no surviving justification does not earn a place by
+being harmless. The B1 implementation and its pinned decision counts are kept
+in the tree as the record, because those exact counts are what made the
+refutation checkable.
+
+**Yield is limited by text abstention, not by anything else.** `aux_masked`
+is 25.7 % of the corpus, dwarfing every other masking reason combined, and
+`sexual` alone is 19.6 % of text labels. If yield ever needs to improve, that
+is the only term large enough to matter.
+
+### Two limitations accepted rather than fixed
+
+**Sexual content reaching `<|DISGUSTED|>` through agreement.** Both labellers
+independently land on `disgusted` for some sexual material, so it arrives via
+the `agree` path and the consensus gate cannot see it — agreement filters
+disagreement, and this is not a disagreement. No good automatic detector
+exists for it. The scale is limited, and JVNV's `<|DISGUSTED|>` row is the
+indirect monitor: base is blind to that class, so movement there is
+informative in both directions.
+
+**train and val differ in content.** val carries roughly twice the `angry`
+share and about half the `sexual` share of train. SER evaluation must
+therefore always report **per-class** figures alongside the aggregate: an
+`angry`-heavy val flatters or penalises a model depending on where its
+errors fall, and a single accuracy number hides it.
+
+### The pilot predicted the full corpus
+
+Worth recording as a methodological result rather than a footnote: the
+5,000-clip pilot predicted the full-corpus label distribution to **within
+1.35 percentage points** on every class. The full pass over 543,395 clips
+took 1.56 h for audio and 0.42 h for text.
+
+A 1 % sample was enough to settle labeller choice, rule choice, the
+confidence question, and both error modes. What it could *not* settle was
+anything requiring transcripts to be read — the veto's refutation needed 104
+clips looked at by eye, and no distribution statistic would have produced it.
+
+### What B1 was, and what it actually did
 
 Training labels come from **B1: text-led with an audio neutral veto**, NEUTRAL
 cap 0.5. Measured yield on the pilot's 5,000 clips: 3,546 usable, **70.92 %**.
